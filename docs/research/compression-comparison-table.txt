@@ -1,0 +1,244 @@
+================================================================================
+             ORACLE COMPRESSION COMPARISON TABLE
+      Exadata HCC vs Oracle 23c Free Edition Standard Compression
+================================================================================
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│                        COMPRESSION FEATURES MATRIX                         │
+└────────────────────────────────────────────────────────────────────────────┘
+
+╔══════════════════════════╦═══════════════╦════════════════╦════════════════╗
+║  Compression Type        ║  Exadata/ZFS  ║  Oracle 23c    ║  Used by       ║
+║                          ║               ║  Free Edition  ║  This Project  ║
+╠══════════════════════════╬═══════════════╬════════════════╬════════════════╣
+║ COMPRESS BASIC           ║      ✅       ║      ✅        ║      ✅        ║
+║ (Table - 2x)             ║               ║                ║                ║
+╠══════════════════════════╬═══════════════╬════════════════╬════════════════╣
+║ COMPRESS FOR OLTP        ║      ✅       ║      ✅        ║      ✅        ║
+║ (Table - 2.5x)           ║               ║                ║                ║
+╠══════════════════════════╬═══════════════╬════════════════╬════════════════╣
+║ COMPRESS ADVANCED LOW    ║      ✅       ║      ✅        ║      ✅        ║
+║ (Index)                  ║               ║                ║                ║
+╠══════════════════════════╬═══════════════╬════════════════╬════════════════╣
+║ COMPRESS ADVANCED HIGH   ║      ✅       ║      ✅        ║      ✅        ║
+║ (Index)                  ║               ║                ║                ║
+╠══════════════════════════╬═══════════════╬════════════════╬════════════════╣
+║ LOB Compression          ║      ✅       ║      ✅        ║      ✅        ║
+║ (LOW/MEDIUM/HIGH)        ║               ║                ║                ║
+╠══════════════════════════╬═══════════════╬════════════════╬════════════════╣
+║ COMPRESS FOR QUERY LOW   ║      ✅       ║      ❌        ║      ❌        ║
+║ (HCC - 6-10x)            ║               ║   Exadata Only ║   Not Used     ║
+╠══════════════════════════╬═══════════════╬════════════════╬════════════════╣
+║ COMPRESS FOR QUERY HIGH  ║      ✅       ║      ❌        ║      ❌        ║
+║ (HCC - 10-12x)           ║               ║   Exadata Only ║   Not Used     ║
+╠══════════════════════════╬═══════════════╬════════════════╬════════════════╣
+║ COMPRESS FOR ARCHIVE LOW ║      ✅       ║      ❌        ║      ❌        ║
+║ (HCC - 12-15x)           ║               ║   Exadata Only ║   Not Used     ║
+╠══════════════════════════╬═══════════════╬════════════════╬════════════════╣
+║ COMPRESS FOR ARCHIVE HIGH║      ✅       ║      ❌        ║      ❌        ║
+║ (HCC - 15-20x)           ║               ║   Exadata Only ║   Not Used     ║
+╚══════════════════════════╩═══════════════╩════════════════╩════════════════╝
+
+KEY: ✅ Available    ❌ Not Available
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│                        ORACLE API COMPATIBILITY                            │
+└────────────────────────────────────────────────────────────────────────────┘
+
+╔════════════════════════════════════╦═════════════╦══════════════════════════╗
+║  DBMS_COMPRESSION Constants        ║   Oracle    ║  Used by                 ║
+║                                    ║  23c Free   ║  This Project            ║
+╠════════════════════════════════════╬═════════════╬══════════════════════════╣
+║ comp_nocompress                    ║     ✅      ║     ✅ (used)            ║
+╠════════════════════════════════════╬═════════════╬══════════════════════════╣
+║ comp_basic                         ║     ✅      ║     ✅ (used)            ║
+╠════════════════════════════════════╬═════════════╬══════════════════════════╣
+║ comp_for_oltp                      ║     ✅      ║     ✅ (used)            ║
+╠════════════════════════════════════╬═════════════╬══════════════════════════╣
+║ comp_for_query_low                 ║     ❌      ║     ❌ (not used)        ║
+╠════════════════════════════════════╬═════════════╬══════════════════════════╣
+║ comp_for_query_high                ║     ❌      ║     ❌ (not used)        ║
+╠════════════════════════════════════╬═════════════╬══════════════════════════╣
+║ comp_for_archive_low               ║     ❌      ║     ❌ (not used)        ║
+╠════════════════════════════════════╬═════════════╬══════════════════════════╣
+║ comp_for_archive_high              ║     ❌      ║     ❌ (not used)        ║
+╠════════════════════════════════════╬═════════════╬══════════════════════════╣
+║ get_compression_ratio()            ║     ✅      ║     ✅ (used)            ║
+╚════════════════════════════════════╩═════════════╩══════════════════════════╝
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│                     EXPECTED COMPRESSION PERFORMANCE                       │
+└────────────────────────────────────────────────────────────────────────────┘
+
+╔═══════════════════════╦══════════════╦══════════════╦════════════════════╗
+║  Data Type            ║  BASIC       ║  OLTP        ║  HCC               ║
+║                       ║  (23c Free)  ║  (23c Free)  ║  (Exadata)         ║
+╠═══════════════════════╬══════════════╬══════════════╬════════════════════╣
+║ Numeric columns       ║  1.8 - 2.2x  ║  2.2 - 2.8x  ║  10-15x            ║
+╠═══════════════════════╬══════════════╬══════════════╬════════════════════╣
+║ VARCHAR2 (high card.) ║  1.5 - 2.0x  ║  1.8 - 2.3x  ║  3-8x              ║
+╠═══════════════════════╬══════════════╬══════════════╬════════════════════╣
+║ VARCHAR2 (low card.)  ║  2.0 - 3.0x  ║  2.5 - 3.5x  ║  12-20x            ║
+╠═══════════════════════╬══════════════╬══════════════╬════════════════════╣
+║ Date/Timestamp        ║  1.8 - 2.5x  ║  2.2 - 3.0x  ║  8-12x             ║
+╠═══════════════════════╬══════════════╬══════════════╬════════════════════╣
+║ LOB Data (SecureFiles)║  2.0 - 4.0x  ║     N/A      ║  5-15x             ║
+╠═══════════════════════╬══════════════╬══════════════╬════════════════════╣
+║ Typical Mixed Data    ║  2.0x avg    ║  2.5x avg    ║  6-20x avg         ║
+╚═══════════════════════╩══════════════╩══════════════╩════════════════════╝
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│                        CPU AND MEMORY OVERHEAD                             │
+└────────────────────────────────────────────────────────────────────────────┘
+
+╔═══════════════════════╦══════════════╦══════════════╦════════════════════╗
+║  Metric               ║  BASIC       ║  OLTP        ║  HCC               ║
+╠═══════════════════════╬══════════════╬══════════════╬════════════════════╣
+║ Compression CPU       ║   2-5%       ║   5-10%      ║  10-25% (QUERY)    ║
+║                       ║              ║              ║  25-40% (ARCHIVE)  ║
+╠═══════════════════════╬══════════════╬══════════════╬════════════════════╣
+║ Decompression CPU     ║   < 1%       ║   < 1%       ║  2-5%              ║
+╠═══════════════════════╬══════════════╬══════════════╬════════════════════╣
+║ Memory Overhead       ║  Minimal     ║  Low         ║  Moderate-High     ║
+╠═══════════════════════╬══════════════╬══════════════╬════════════════════╣
+║ DML Performance       ║  Near Native ║  Optimized   ║  Degraded          ║
+║                       ║              ║  for DML     ║  (not for OLTP)    ║
+╠═══════════════════════╬══════════════╬══════════════╬════════════════════╣
+║ Query Performance     ║  Native      ║  Native      ║  Fast (Smart Scan) ║
+╚═══════════════════════╩══════════════╩══════════════╩════════════════════╝
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│                    RECOMMENDED USE CASES                                   │
+└────────────────────────────────────────────────────────────────────────────┘
+
+╔═════════════════════════╦═════════════════════════════════════════════════╗
+║  Compression Type       ║  Recommended Use Case                           ║
+╠═════════════════════════╬═════════════════════════════════════════════════╣
+║ BASIC                   ║ • High-DML OLTP tables                          ║
+║ (Oracle 23c Free)       ║ • Hot data with frequent updates                ║
+║                         ║ • Balance of space/performance                  ║
+║                         ║ • Minimal CPU overhead                          ║
+╠═════════════════════════╬═════════════════════════════════════════════════╣
+║ OLTP                    ║ • Active OLTP workloads                         ║
+║ (Oracle 23c Free)       ║ • Warm data with moderate DML                   ║
+║                         ║ • Optimized for transactional queries           ║
+║                         ║ • Best compression in Free Edition              ║
+╠═════════════════════════╬═════════════════════════════════════════════════╣
+║ INDEX ADVANCED          ║ • Large B-tree indexes                          ║
+║ (Oracle 23c Free)       ║ • Frequently scanned indexes                    ║
+║                         ║ • Significant space savings                     ║
+╠═════════════════════════╬═════════════════════════════════════════════════╣
+║ LOB LOW/MEDIUM/HIGH     ║ • CLOB/BLOB columns                             ║
+║ (Oracle 23c Free)       ║ • Document storage                              ║
+║                         ║ • Large object data                             ║
+╠═════════════════════════╬═════════════════════════════════════════════════╣
+║ HCC QUERY LOW           ║ • Data warehouse fact tables                    ║
+║ (Exadata Only)          ║ • Frequent analytical queries                   ║
+║ NOT in Free Edition     ║ • Regular data loads                            ║
+╠═════════════════════════╬═════════════════════════════════════════════════╣
+║ HCC QUERY HIGH          ║ • Data warehouse (max compression)              ║
+║ (Exadata Only)          ║ • Historical partitions                         ║
+║ NOT in Free Edition     ║ • Infrequent data loads                         ║
+╠═════════════════════════╬═════════════════════════════════════════════════╣
+║ HCC ARCHIVE LOW/HIGH    ║ • Archival data (rarely accessed)               ║
+║ (Exadata Only)          ║ • Compliance/regulatory retention               ║
+║ NOT in Free Edition     ║ • Cold data storage                             ║
+╚═════════════════════════╩═════════════════════════════════════════════════╝
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│                MIGRATION PATH: Exadata HCC → Oracle 23c Free              │
+└────────────────────────────────────────────────────────────────────────────┘
+
+If migrating from Exadata to Oracle 23c Free, use this mapping:
+
+╔════════════════════════════╦════════════════════════════════════════════╗
+║  Current (Exadata)         ║  Target (Oracle 23c Free)                  ║
+╠════════════════════════════╬════════════════════════════════════════════╣
+║ COMPRESS BASIC             ║  → COMPRESS BASIC (same)                   ║
+╠════════════════════════════╬════════════════════════════════════════════╣
+║ COMPRESS FOR OLTP          ║  → COMPRESS FOR OLTP (same)                ║
+╠════════════════════════════╬════════════════════════════════════════════╣
+║ COMPRESS FOR QUERY LOW     ║  → COMPRESS FOR OLTP (best available)      ║
+╠════════════════════════════╬════════════════════════════════════════════╣
+║ COMPRESS FOR QUERY HIGH    ║  → COMPRESS FOR OLTP (best available)      ║
+╠════════════════════════════╬════════════════════════════════════════════╣
+║ COMPRESS FOR ARCHIVE LOW   ║  → COMPRESS FOR OLTP OR BASIC              ║
+║                            ║    (consider data access pattern)          ║
+╠════════════════════════════╬════════════════════════════════════════════╣
+║ COMPRESS FOR ARCHIVE HIGH  ║  → COMPRESS FOR OLTP OR BASIC              ║
+║                            ║    (consider data access pattern)          ║
+╚════════════════════════════╩════════════════════════════════════════════╝
+
+Expected Impact:
+  • Space savings reduced from 6-20x → 2-3x
+  • Query performance may improve (no HCC decompression overhead)
+  • DML performance significantly improved
+  • Lower CPU requirements
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│                        PROJECT COMPATIBILITY                               │
+└────────────────────────────────────────────────────────────────────────────┘
+
+HCC Compression Advisor Code Analysis:
+
+✅ sql/01_schema.sql         - Only uses BASIC/OLTP/ADV_LOW/ADV_HIGH
+✅ sql/03_advisor_pkg.sql    - Only uses comp_for_oltp constant
+✅ sql/04_executor_pkg.sql   - Only uses BASIC/OLTP compression types
+✅ All Views and Reports     - Compatible with Oracle 23c Free
+✅ REST API (ORDS)           - No special requirements
+✅ Streamlit Dashboard       - No database-specific requirements
+
+❌ NO HCC DEPENDENCIES FOUND IN CODE
+
+Result: ✅ 100% COMPATIBLE WITH ORACLE 23c FREE EDITION
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│                        QUICK REFERENCE                                     │
+└────────────────────────────────────────────────────────────────────────────┘
+
+Verify Oracle 23c Free Edition:
+  SELECT BANNER FROM V$VERSION WHERE BANNER LIKE 'Oracle%';
+
+Test BASIC Compression:
+  CREATE TABLE test AS SELECT * FROM all_objects;
+  ALTER TABLE test MOVE COMPRESS BASIC;
+
+Test OLTP Compression:
+  ALTER TABLE test MOVE COMPRESS FOR OLTP;
+
+Check Available Compression:
+  SELECT DISTINCT compression FROM dba_tables
+  WHERE owner = USER;
+
+Install HCC Compression Advisor:
+  @sql/install_full.sql
+
+Run Analysis:
+  EXEC PKG_COMPRESSION_ADVISOR.run_analysis(NULL, 2, 4);
+
+View Recommendations:
+  SELECT * FROM T_COMPRESSION_ANALYSIS
+  WHERE advisable_compression != 'NONE'
+  ORDER BY projected_savings_mb DESC;
+
+Execute Compression:
+  EXEC PKG_COMPRESSION_EXECUTOR.compress_table(
+    'MYSCHEMA', 'MYTABLE', 'OLTP', TRUE, FALSE
+  );
+
+================================================================================
+                            SUMMARY
+================================================================================
+
+✅ Oracle 23c Free Edition: Fully supports BASIC, OLTP, and Index compression
+❌ HCC Compression: Requires Exadata (not in Free Edition)
+✅ HCC Compression Advisor: 100% compatible with Oracle 23c Free Edition
+✅ Expected Savings: 2-3x compression (vs 6-20x with HCC)
+✅ Code Changes: NONE required
+✅ Performance: Excellent for transactional workloads
+
+================================================================================
+Document: compression-comparison-table.txt
+Version: 1.0
+Date: 2025-11-13
+================================================================================

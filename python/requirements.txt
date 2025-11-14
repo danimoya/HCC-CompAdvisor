@@ -1,0 +1,35 @@
+# Streamlit Dashboard Requirements
+# HCC Compression Advisor
+
+# Core Framework
+streamlit==1.31.0
+streamlit-option-menu==0.3.12
+
+# Database
+oracledb==2.0.1
+
+# API & HTTP
+requests==2.31.0
+urllib3==2.1.0
+
+# Data Processing
+pandas==2.2.0
+numpy==1.26.3
+
+# Visualization
+plotly==5.18.0
+altair==5.2.0
+
+# Excel Export
+openpyxl==3.1.2
+xlsxwriter==3.1.9
+
+# Environment & Configuration
+python-dotenv==1.0.1
+
+# SSL/Security
+pyOpenSSL==24.0.0
+cryptography==42.0.2
+
+# Utilities
+pytz==2024.1

@@ -1,0 +1,39 @@
+# Environment files with sensitive data
+.env
+
+# Docker volumes and data
+data/
+*.dbf
+*.log
+*.trc
+*.trm
+*.aud
+
+# Logs
+logs/
+*.log
+
+# Oracle-specific files
+oradiag_*
+audit_*
+
+# Docker build artifacts
+.dockerignore
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+*.backup

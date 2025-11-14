@@ -1,0 +1,152 @@
+# GitLab CI/CD Configuration for HCC Compression Advisor Tests
+# Place this in your repository root as .gitlab-ci.yml
+
+stages:
+  - install
+  - lint
+  - test
+  - performance
+  - report
+
+variables:
+  NODE_VERSION: "18"
+  MOCK_DATABASE: "true"
+
+# Cache node modules between jobs
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - tests/node_modules/
+    - tests/.npm/
+
+before_script:
+  - cd tests
+  - npm ci --cache .npm --prefer-offline
+
+# Install dependencies
+install:
+  stage: install
+  image: node:${NODE_VERSION}
+  script:
+    - npm ci
+  artifacts:
+    paths:
+      - tests/node_modules/
+    expire_in: 1 hour
+
+# Code quality
+lint:
+  stage: lint
+  image: node:${NODE_VERSION}
+  script:
+    - npm run lint
+  allow_failure: true
+
+# Unit tests
+test:unit:
+  stage: test
+  image: node:${NODE_VERSION}
+  script:
+    - npm run test:unit -- --coverage --ci
+  coverage: '/Lines\s*:\s*(\d+\.\d+)%/'
+  artifacts:
+    when: always
+    reports:
+      junit: coverage/junit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+    paths:
+      - coverage/
+    expire_in: 30 days
+
+# Integration tests
+test:integration:
+  stage: test
+  image: node:${NODE_VERSION}
+  script:
+    - npm run test:integration -- --coverage --ci
+  artifacts:
+    when: always
+    paths:
+      - coverage/
+    expire_in: 30 days
+
+# End-to-end tests
+test:e2e:
+  stage: test
+  image: node:${NODE_VERSION}
+  script:
+    - npm run test:e2e -- --coverage --ci
+  artifacts:
+    when: always
+    paths:
+      - coverage/
+    expire_in: 30 days
+
+# Security tests
+test:security:
+  stage: test
+  image: node:${NODE_VERSION}
+  script:
+    - npm run test:security -- --coverage --ci
+  artifacts:
+    when: always
+    paths:
+      - coverage/
+    expire_in: 30 days
+
+# Performance benchmarks
+performance:
+  stage: performance
+  image: node:${NODE_VERSION}
+  script:
+    - npm run test:performance -- --verbose | tee performance-results.txt
+  artifacts:
+    paths:
+      - tests/performance-results.txt
+    expire_in: 90 days
+  allow_failure: true
+
+# Coverage report
+coverage:
+  stage: report
+  image: node:${NODE_VERSION}
+  dependencies:
+    - test:unit
+    - test:integration
+    - test:e2e
+    - test:security
+  script:
+    - npm test -- --coverage --coverageReporters=text-lcov | tee coverage.lcov
+  coverage: '/Lines\s*:\s*(\d+\.\d+)%/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+    paths:
+      - coverage/
+    expire_in: 90 days
+
+# Test on multiple Node versions
+.test_template: &test_template
+  stage: test
+  script:
+    - npm run test:ci
+
+test:node14:
+  <<: *test_template
+  image: node:14
+
+test:node16:
+  <<: *test_template
+  image: node:16
+
+test:node18:
+  <<: *test_template
+  image: node:18
+
+test:node20:
+  <<: *test_template
+  image: node:20

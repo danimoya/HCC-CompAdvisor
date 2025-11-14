@@ -1,0 +1,33 @@
+{
+  "name": "hcc-compression-advisor",
+  "version": "1.0.0",
+  "description": "Oracle Hybrid Columnar Compression (HCC) Management and Advisory System",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "jest --coverage",
+    "lint": "eslint src/**/*.js",
+    "format": "prettier --write src/**/*.js"
+  },
+  "keywords": [
+    "oracle",
+    "hcc",
+    "compression",
+    "database",
+    "exadata",
+    "advisor"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "oracledb": "^6.0.0"
+  },
+  "devDependencies": {
+    "jest": "^29.0.0",
+    "eslint": "^8.0.0",
+    "prettier": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

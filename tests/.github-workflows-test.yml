@@ -1,0 +1,179 @@
+# GitHub Actions CI/CD Workflow for HCC Compression Advisor Tests
+# Save this as .github/workflows/test.yml in your repository
+
+name: Test Suite
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    # Run tests daily at 2 AM UTC
+    - cron: '0 2 * * *'
+
+jobs:
+  test:
+    name: Test on Node ${{ matrix.node-version }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [16.x, 18.x, 20.x]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Setup Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v3
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'npm'
+        cache-dependency-path: tests/package-lock.json
+
+    - name: Install dependencies
+      run: |
+        cd tests
+        npm ci
+
+    - name: Run linter
+      run: |
+        cd tests
+        npm run lint
+      continue-on-error: true
+
+    - name: Run unit tests
+      run: |
+        cd tests
+        npm run test:unit -- --coverage
+      env:
+        MOCK_DATABASE: true
+        CI: true
+
+    - name: Run integration tests
+      run: |
+        cd tests
+        npm run test:integration -- --coverage
+      env:
+        MOCK_DATABASE: true
+        CI: true
+
+    - name: Run e2e tests
+      run: |
+        cd tests
+        npm run test:e2e -- --coverage
+      env:
+        MOCK_DATABASE: true
+        CI: true
+
+    - name: Run performance tests
+      run: |
+        cd tests
+        npm run test:performance
+      env:
+        MOCK_DATABASE: true
+        CI: true
+
+    - name: Run security tests
+      run: |
+        cd tests
+        npm run test:security -- --coverage
+      env:
+        MOCK_DATABASE: true
+        CI: true
+
+    - name: Generate coverage report
+      run: |
+        cd tests
+        npm test -- --coverage --coverageReporters=text-lcov > coverage.lcov
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./tests/coverage.lcov
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: false
+
+    - name: Archive test results
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: test-results-${{ matrix.node-version }}
+        path: |
+          tests/coverage/
+          tests/*.log
+        retention-days: 30
+
+    - name: Check coverage thresholds
+      run: |
+        cd tests
+        npm test -- --coverage --coverageThreshold='{"global":{"branches":75,"functions":80,"lines":80,"statements":80}}'
+
+  lint:
+    name: Code Quality
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: 18.x
+
+    - name: Install dependencies
+      run: |
+        cd tests
+        npm ci
+
+    - name: Run ESLint
+      run: |
+        cd tests
+        npm run lint
+
+  performance:
+    name: Performance Benchmarks
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: 18.x
+
+    - name: Install dependencies
+      run: |
+        cd tests
+        npm ci
+
+    - name: Run performance benchmarks
+      run: |
+        cd tests
+        npm run test:performance -- --verbose > performance-results.txt
+
+    - name: Upload performance results
+      uses: actions/upload-artifact@v3
+      with:
+        name: performance-results
+        path: tests/performance-results.txt
+        retention-days: 90
+
+  notify:
+    name: Notify Results
+    runs-on: ubuntu-latest
+    needs: [test, lint, performance]
+    if: always()
+
+    steps:
+    - name: Test Results Summary
+      run: |
+        echo "Test Suite Completed"
+        echo "Test Job Status: ${{ needs.test.result }}"
+        echo "Lint Job Status: ${{ needs.lint.result }}"
+        echo "Performance Job Status: ${{ needs.performance.result }}"

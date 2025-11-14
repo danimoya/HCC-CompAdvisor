@@ -1,0 +1,32 @@
+# Testing Framework
+pytest>=7.4.0
+pytest-cov>=4.1.0
+pytest-mock>=3.12.0
+pytest-asyncio>=0.21.0
+pytest-timeout>=2.1.0
+
+# Mocking and Fixtures
+responses>=0.23.0
+faker>=19.0.0
+factory-boy>=3.3.0
+
+# Testing Utilities
+freezegun>=1.2.0
+hypothesis>=6.82.0
+
+# Code Quality
+pytest-pylint>=0.21.0
+pytest-flake8>=1.1.1
+black>=23.7.0
+isort>=5.12.0
+
+# Coverage Reports
+coverage[toml]>=7.2.0
+
+# Database Testing
+pytest-postgresql>=5.0.0
+sqlalchemy>=2.0.0
+
+# Streamlit Testing
+streamlit>=1.25.0
+selenium>=4.11.0

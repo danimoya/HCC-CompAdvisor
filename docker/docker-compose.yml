@@ -1,0 +1,151 @@
+version: '3.8'
+
+services:
+  # Oracle Database 23c Free Edition
+  oracle-db:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hcc-oracle-23c
+    hostname: oracle-db
+    restart: unless-stopped
+
+    # Port mappings
+    ports:
+      - "1521:1521"   # Oracle Database listener
+      - "5500:5500"   # Oracle Enterprise Manager Express
+      - "8080:8080"   # ORDS (Oracle REST Data Services)
+
+    # Environment variables from .env file
+    env_file:
+      - .env
+
+    environment:
+      # Oracle Database configuration
+      - ORACLE_PWD=${ORACLE_PWD:-Welcome123}
+      - ORACLE_CHARACTERSET=AL32UTF8
+      - ENABLE_ARCHIVELOG=false
+      - ENABLE_FORCE_LOGGING=false
+
+      # Compression Advisor configuration
+      - COMPRESSION_USER=${COMPRESSION_USER:-COMPRESSION_MGR}
+      - COMPRESSION_PWD=${COMPRESSION_PWD:-Compress123}
+      - COMPRESSION_TS=${COMPRESSION_TS:-SCRATCH_TS}
+
+      # ORDS configuration
+      - ORDS_PWD=${ORDS_PWD:-Welcome123}
+
+      # Performance tuning
+      - INIT_SGA_SIZE=2048
+      - INIT_PGA_SIZE=1024
+
+    # Volume mounts for persistence
+    volumes:
+      # Persistent database files
+      - oracle-data:/opt/oracle/oradata
+
+      # Initialization scripts (auto-run on first startup)
+      - ./init-scripts:/opt/oracle/scripts/startup
+
+      # Compression Advisor installation files
+      - ../install:/opt/oracle/compression_advisor/install:ro
+
+      # Diagnostic logs
+      - ./logs:/opt/oracle/oradata/logs
+
+      # Custom SQL scripts
+      - ./custom-scripts:/opt/oracle/scripts/custom:ro
+
+    # Shared memory configuration for Oracle SGA
+    shm_size: 2gb
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          cpus: '2'
+          memory: 4G
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "/opt/oracle/checkDBStatus.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+    networks:
+      - hcc-network
+
+  # Streamlit Dashboard (optional - for testing)
+  streamlit-dashboard:
+    image: python:3.11-slim
+    container_name: hcc-streamlit
+    hostname: streamlit
+    restart: unless-stopped
+
+    # Port mapping for Streamlit
+    ports:
+      - "8501:8501"
+
+    # Environment variables
+    environment:
+      - ORACLE_HOST=oracle-db
+      - ORACLE_PORT=1521
+      - ORACLE_SERVICE=FREEPDB1
+      - ORACLE_USER=${COMPRESSION_USER:-COMPRESSION_MGR}
+      - ORACLE_PASSWORD=${COMPRESSION_PWD:-Compress123}
+      - STREAMLIT_PASSWORD=${STREAMLIT_PASSWORD:-Dashboard123}
+
+    # Volume mounts
+    volumes:
+      - ../dashboard:/app:ro
+      - ./streamlit-logs:/logs
+
+    # Working directory
+    working_dir: /app
+
+    # Install dependencies and run Streamlit
+    command: >
+      bash -c "
+        pip install --no-cache-dir -r requirements.txt &&
+        streamlit run app.py --server.port=8501 --server.address=0.0.0.0
+      "
+
+    # Depends on Oracle Database
+    depends_on:
+      oracle-db:
+        condition: service_healthy
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+    networks:
+      - hcc-network
+
+# Named volumes for data persistence
+volumes:
+  oracle-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data
+
+# Custom network for container communication
+networks:
+  hcc-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
