@@ -29,7 +29,7 @@ Test suite for the HCC Compression Advisor system.
 ## Directory Structure
 
 ```
-/home/claude/Oracle-Database-Related/HCC-CompAdvisor/tests/
+tests/
 ├── unit/                                    # Unit tests (2 files, 112 tests)
 │   ├── compressionAnalyzer.test.js          # Analyzer logic tests (64 tests)
 │   └── compressionExecutor.test.js          # Executor logic tests (48 tests)
@@ -195,7 +195,7 @@ Test suite for the HCC Compression Advisor system.
 ### Quick Start
 
 ```bash
-cd /home/claude/Oracle-Database-Related/HCC-CompAdvisor/tests
+cd tests
 
 # Install dependencies
 npm install

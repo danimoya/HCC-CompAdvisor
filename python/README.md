@@ -25,10 +25,10 @@ A Streamlit dashboard for managing Oracle Hybrid Columnar Compression (HCC) with
 
 ### Setup
 
-1. **Clone or navigate to the project directory:**
+1. **Navigate to the project directory:**
 
 ```bash
-cd /home/claude/Oracle-Database-Related/HCC-CompAdvisor/python
+cd HCC-CompAdvisor/python
 ```
 
 2. **Create virtual environment:**

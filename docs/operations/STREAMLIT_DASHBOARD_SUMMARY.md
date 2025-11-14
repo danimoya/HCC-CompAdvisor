@@ -3,7 +3,7 @@
 **Project:** Oracle HCC Compression Advisor
 **Component:** Streamlit Web Dashboard
 **Date:** 2025-11-13
-**Location:** `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/python/`
+**Location:** `python/`
 
 ## 📦 Deliverables
 

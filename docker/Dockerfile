@@ -16,19 +16,12 @@ ENV ORACLE_BASE=/opt/oracle \
     COMPRESSION_TS=SCRATCH_TS \
     INSTALL_DIR=/opt/oracle/scripts/setup
 
-# Switch to root for package installation
+# Switch to root for directory creation
 USER root
 
-# Install required system packages
-RUN microdnf install -y \
-    vim \
-    wget \
-    unzip \
-    procps \
-    net-tools \
-    tar \
-    gzip \
-    && microdnf clean all
+# Note: Oracle Database Free container has minimal tools pre-installed
+# Additional packages can be installed if needed using:
+# RUN dnf install -y <package> && dnf clean all
 
 # Create directories for scripts and logs
 RUN mkdir -p ${INSTALL_DIR} \

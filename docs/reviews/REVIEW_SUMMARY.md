@@ -187,7 +187,7 @@ END LOOP;
 ## 📊 Detailed Findings
 
 ### Code Quality Review (22K)
-**File**: `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/docs/reviews/code-quality-review.md`
+**File**: `docs/reviews/code-quality-review.md`
 
 **Key Findings**:
 - Naming conventions: 7/10 (good, minor inconsistencies)
@@ -208,7 +208,7 @@ END LOOP;
 ---
 
 ### Security Audit (42K)
-**File**: `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/docs/reviews/security-audit.md`
+**File**: `docs/reviews/security-audit.md`
 
 **Key Findings**:
 - SQL injection: 🔴 CRITICAL (9/10 risk)
@@ -229,7 +229,7 @@ END LOOP;
 ---
 
 ### Performance Review (48K)
-**File**: `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/docs/reviews/performance-review.md`
+**File**: `docs/reviews/performance-review.md`
 
 **Key Findings**:
 - Query efficiency: 3.5/10 (N+1 queries, missing indexes)
@@ -256,7 +256,7 @@ END LOOP;
 ---
 
 ### Recommendations Document (34K)
-**File**: `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/docs/reviews/recommendations.md`
+**File**: `docs/reviews/recommendations.md`
 
 **Implementation Roadmap**:
 
@@ -484,7 +484,7 @@ GO-LIVE: End of Week 8 (minimum)
 
 ## 📚 Review Documents
 
-All detailed review documents are available in `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/docs/reviews/`:
+All detailed review documents are available in `docs/reviews/`:
 
 1. **code-quality-review.md** (22K) - Detailed code analysis
 2. **security-audit.md** (42K) - Comprehensive security assessment

@@ -33,8 +33,8 @@ This document outlines the comprehensive testing strategy for the HCC Compressio
 **Scope**: Individual functions and modules in isolation
 
 **Files**:
-- `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/tests/unit/compressionAnalyzer.test.js`
-- `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/tests/unit/compressionExecutor.test.js`
+- `tests/unit/compressionAnalyzer.test.js`
+- `tests/unit/compressionExecutor.test.js`
 
 **Coverage Areas**:
 
@@ -85,7 +85,7 @@ This document outlines the comprehensive testing strategy for the HCC Compressio
 **Scope**: Interaction between modules and database
 
 **Files**:
-- `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/tests/integration/databaseIntegration.test.js`
+- `tests/integration/databaseIntegration.test.js`
 
 **Coverage Areas**:
 
@@ -130,7 +130,7 @@ This document outlines the comprehensive testing strategy for the HCC Compressio
 **Scope**: Complete workflows from start to finish
 
 **Files**:
-- `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/tests/e2e/fullWorkflow.test.js`
+- `tests/e2e/fullWorkflow.test.js`
 
 **Coverage Areas**:
 
@@ -177,7 +177,7 @@ This document outlines the comprehensive testing strategy for the HCC Compressio
 **Scope**: System performance under load
 
 **Files**:
-- `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/tests/performance/benchmarks.test.js`
+- `tests/performance/benchmarks.test.js`
 
 **Coverage Areas**:
 
@@ -222,7 +222,7 @@ This document outlines the comprehensive testing strategy for the HCC Compressio
 **Scope**: Security controls and error handling
 
 **Files**:
-- `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/tests/security/securityTests.test.js`
+- `tests/security/securityTests.test.js`
 
 **Coverage Areas**:
 
@@ -285,7 +285,7 @@ This document outlines the comprehensive testing strategy for the HCC Compressio
 
 **Generate Coverage**:
 ```bash
-cd /home/claude/Oracle-Database-Related/HCC-CompAdvisor/tests
+cd tests
 npm test -- --coverage
 ```
 
@@ -303,7 +303,7 @@ open coverage/lcov-report/index.html
 
 ### Mock Data
 
-**Location**: `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/tests/fixtures/`
+**Location**: `tests/fixtures/`
 
 **Components**:
 1. **mockOracleMetadata.js**: Realistic Oracle data dictionary data
@@ -334,7 +334,7 @@ open coverage/lcov-report/index.html
 
 ### GitHub Actions
 
-**File**: `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/tests/.github-workflows-test.yml`
+**File**: `tests/.github-workflows-test.yml`
 
 **Pipeline**:
 1. Install dependencies
@@ -354,7 +354,7 @@ open coverage/lcov-report/index.html
 
 ### GitLab CI
 
-**File**: `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/tests/.gitlab-ci.yml`
+**File**: `tests/.gitlab-ci.yml`
 
 **Stages**:
 1. install: Dependencies

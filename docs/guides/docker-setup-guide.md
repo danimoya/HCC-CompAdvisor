@@ -46,7 +46,7 @@ docker login container-registry.oracle.com
 ### 3. Run Quick Start Script
 
 ```bash
-cd /home/claude/Oracle-Database-Related/HCC-CompAdvisor/docker
+cd docker
 
 # Run automated setup
 ./quick-start.sh
@@ -754,12 +754,12 @@ After successful Docker setup:
 2. **Load Sample Data**: Test compression on sample tables
 3. **Run Compression Analysis**: Use HCC advisor tools
 4. **Explore Dashboard**: View Streamlit UI at http://localhost:8501
-5. **Read Documentation**: Review `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/docs/`
+5. **Read Documentation**: Review `docs/`
 
 ## Additional Resources
 
 ### Documentation
-- [Docker README](/home/claude/Oracle-Database-Related/HCC-CompAdvisor/docker/README.md)
+- [Docker README](../docker/README.md)
 - [Oracle 23c Documentation](https://docs.oracle.com/en/database/oracle/oracle-database/23/)
 - [Docker Images Guide](https://github.com/oracle/docker-images/tree/main/OracleDatabase)
 - [Compression Guide](https://docs.oracle.com/en/database/oracle/oracle-database/23/admin/managing-compression.html)

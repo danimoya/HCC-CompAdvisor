@@ -7,7 +7,7 @@ Get up and running with the HCC Compression Advisor Streamlit Dashboard in minut
 ### Step 1: Install Dependencies
 
 ```bash
-cd /home/claude/Oracle-Database-Related/HCC-CompAdvisor/python
+cd HCC-CompAdvisor/python
 
 # Create and activate virtual environment
 python3 -m venv venv
@@ -118,7 +118,7 @@ Before you begin, ensure you have:
 If you haven't installed the HCC Advisor schema yet:
 
 ```bash
-cd /home/claude/Oracle-Database-Related/HCC-CompAdvisor/sql
+cd ../sql
 
 # Connect as SYSDBA
 sqlplus sys/password@XEPDB1 as sysdba

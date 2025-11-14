@@ -30,7 +30,7 @@ openssl version
 
 ```bash
 # Navigate to project directory
-cd /home/claude/Oracle-Database-Related/HCC-CompAdvisor/python
+cd HCC-CompAdvisor/python
 
 # Run start script (handles everything)
 ./start.sh
@@ -48,7 +48,7 @@ The start script will:
 #### Step 1: Create Virtual Environment
 
 ```bash
-cd /home/claude/Oracle-Database-Related/HCC-CompAdvisor/python
+cd HCC-CompAdvisor/python
 
 # Create virtual environment
 python3 -m venv venv
@@ -242,7 +242,7 @@ Ensure the HCC Advisor schema is installed:
 
 ```bash
 # Navigate to SQL directory
-cd /home/claude/Oracle-Database-Related/HCC-CompAdvisor/sql
+cd ../sql
 
 # Connect to database
 sqlplus sys/password@XEPDB1 as sysdba

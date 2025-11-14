@@ -115,9 +115,9 @@ Tests verify:
 
 ## Files Modified
 
-- `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/sql/04_executor_pkg.sql` - Main implementation
-- `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/tests/test_tablespace_preservation.sql` - Test suite
-- `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/docs/tablespace_preservation.md` - Full documentation
+- `sql/04_executor_pkg.sql` - Main implementation
+- `tests/test_tablespace_preservation.sql` - Test suite
+- `docs/operations/tablespace_preservation.md` - Full documentation
 
 ## Quick Syntax Reference
 

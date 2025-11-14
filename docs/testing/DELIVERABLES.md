@@ -237,7 +237,7 @@ Comprehensive testing infrastructure has been designed and implemented for the H
 
 ```bash
 # Navigate to tests directory
-cd /home/claude/Oracle-Database-Related/HCC-CompAdvisor/tests
+cd tests
 
 # Install Node.js dependencies
 npm install
@@ -296,7 +296,7 @@ npm test -- -t "should recommend OLTP"
 **GitHub Actions**:
 ```bash
 # Copy workflow file
-cp /home/claude/Oracle-Database-Related/HCC-CompAdvisor/tests/.github-workflows-test.yml .github/workflows/test.yml
+cp tests/.github-workflows-test.yml .github/workflows/test.yml
 
 # Commit and push
 git add .github/workflows/test.yml
@@ -307,7 +307,7 @@ git push
 **GitLab CI**:
 ```bash
 # Copy CI configuration
-cp /home/claude/Oracle-Database-Related/HCC-CompAdvisor/tests/.gitlab-ci.yml .gitlab-ci.yml
+cp tests/.gitlab-ci.yml .gitlab-ci.yml
 
 # Commit and push
 git add .gitlab-ci.yml

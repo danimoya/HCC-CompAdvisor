@@ -10,7 +10,7 @@ The HCC Compression Advisor now ensures that all compression operations preserve
 ## Affected Components
 
 ### 1. PKG_COMPRESSION_EXECUTOR Package
-**File:** `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/sql/04_executor_pkg.sql`
+**File:** `sql/04_executor_pkg.sql`
 
 All DDL generation functions have been updated to include tablespace preservation logic.
 
@@ -152,7 +152,7 @@ MODIFY LOB (column_name) (
 ## Testing
 
 ### Comprehensive Test Suite
-**File:** `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/tests/test_tablespace_preservation.sql`
+**File:** `tests/test_tablespace_preservation.sql`
 
 **Test Coverage:**
 1. **TEST 1:** Regular table tablespace preservation
@@ -164,7 +164,7 @@ MODIFY LOB (column_name) (
 ### Test Execution
 
 ```sql
-@/home/claude/Oracle-Database-Related/HCC-CompAdvisor/tests/test_tablespace_preservation.sql
+@tests/test_tablespace_preservation.sql
 ```
 
 **Expected Results:**
@@ -428,9 +428,9 @@ GROUP BY tablespace_name;
 - Oracle Database VLDB and Partitioning Guide: Partitioned Tables
 
 ### Internal Documentation
-- `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/README.md`
-- `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/sql/04_executor_pkg.sql`
-- `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/tests/test_tablespace_preservation.sql`
+- `README.md`
+- `sql/04_executor_pkg.sql`
+- `tests/test_tablespace_preservation.sql`
 
 ## Conclusion
 

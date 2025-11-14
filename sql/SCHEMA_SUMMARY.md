@@ -277,7 +277,7 @@ The script configures automatic statistics preferences:
 
 ## File Information
 
-- **Location**: `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/sql/01_schema.sql`
+- **Location**: `sql/01_schema.sql`
 - **Lines**: ~900
 - **Size**: ~82KB
 - **Version**: 1.0.0

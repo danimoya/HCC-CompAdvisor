@@ -48,10 +48,10 @@ Complete Docker environment for Oracle 23c Free with HCC Compression Advisor pre
 
 ## Quick Start
 
-### 1. Clone Repository
+### 1. Navigate to Project
 
 ```bash
-cd /home/claude/Oracle-Database-Related/HCC-CompAdvisor
+cd HCC-CompAdvisor
 ```
 
 ### 2. Login to Oracle Container Registry

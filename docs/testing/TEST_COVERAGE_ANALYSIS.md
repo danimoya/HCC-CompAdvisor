@@ -656,7 +656,7 @@ def test_execute_query_success(mock_connection):
 #### Priority 1 - utPLSQL Installation
 ```sql
 -- Install utPLSQL framework
--- Location: /home/claude/Oracle-Database-Related/HCC-CompAdvisor/sql/tests/
+-- Location: sql/tests/
 
 1. Download utPLSQL 3.1.13
 2. Install in test schema: COMPRESSION_TEST
@@ -906,7 +906,7 @@ Action Items:
 5. Add to CI/CD
 
 Commands:
-cd /home/claude/Oracle-Database-Related/HCC-CompAdvisor/tests
+cd tests
 npm install
 npm test
 npm run test:coverage

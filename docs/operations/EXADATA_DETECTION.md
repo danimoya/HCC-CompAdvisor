@@ -6,7 +6,7 @@ The Exadata auto-detection mechanism enables the HCC Compression Advisor to auto
 
 ## File Location
 
-`/home/claude/Oracle-Database-Related/HCC-CompAdvisor/sql/02b_exadata_detection.sql`
+`sql/02b_exadata_detection.sql`
 
 ## Key Features
 

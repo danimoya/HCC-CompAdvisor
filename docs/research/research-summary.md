@@ -6,7 +6,7 @@ Comprehensive research conducted on Oracle HCC (Hybrid Columnar Compression) for
 ## Key Research Deliverables
 
 ### 1. HCC Compression Types & Performance Analysis
-**Document**: `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/docs/research-hcc-compression-types.md`
+**Document**: `docs/research-hcc-compression-types.md`
 
 #### Compression Modes Identified
 
@@ -24,7 +24,7 @@ Comprehensive research conducted on Oracle HCC (Hybrid Columnar Compression) for
 - **Query Speed Hierarchy**: QUERY LOW (fastest) → QUERY HIGH → ARCHIVE LOW → ARCHIVE HIGH (slowest)
 
 ### 2. Candidate Identification Criteria
-**Document**: `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/docs/research-candidate-criteria.md`
+**Document**: `docs/research-candidate-criteria.md`
 
 #### Primary Identification Factors
 
@@ -67,7 +67,7 @@ Developed weighted scoring model (0-100 points):
 4. Log tables (immutable after creation)
 
 ### 3. Best Practices & Implementation Guidelines
-**Document**: `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/docs/research-best-practices.md`
+**Document**: `docs/research-best-practices.md`
 
 #### Critical Implementation Requirements
 
@@ -112,7 +112,7 @@ For maximum compression effectiveness:
 4. **Phase 4** (Ongoing): Continuous optimization
 
 ### 4. Oracle System Views & Metadata Analysis
-**Document**: `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/docs/research-oracle-system-views.md`
+**Document**: `docs/research-oracle-system-views.md`
 
 #### Essential Data Dictionary Views
 
@@ -281,7 +281,7 @@ For maximum compression effectiveness:
 
 ## Research Artifacts Location
 
-All research documents stored in: `/home/claude/Oracle-Database-Related/HCC-CompAdvisor/docs/`
+All research documents stored in: `docs/`
 
 - `research-hcc-compression-types.md` - Compression modes and performance
 - `research-candidate-criteria.md` - Identification methodology

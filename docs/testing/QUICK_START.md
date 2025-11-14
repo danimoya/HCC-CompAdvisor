@@ -5,7 +5,7 @@
 ### 1. Install Dependencies (1 minute)
 
 ```bash
-cd /home/claude/Oracle-Database-Related/HCC-CompAdvisor/tests
+cd tests
 npm install
 ```
 
