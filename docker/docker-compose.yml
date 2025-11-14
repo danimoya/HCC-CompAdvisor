@@ -14,7 +14,7 @@ services:
     ports:
       - "1521:1521"   # Oracle Database listener
       - "5500:5500"   # Oracle Enterprise Manager Express
-      - "8080:8080"   # ORDS (Oracle REST Data Services)
+      - "8081:8080"   # ORDS (Oracle REST Data Services)
 
     # Environment variables from .env file
     env_file:

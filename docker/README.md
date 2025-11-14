@@ -160,7 +160,7 @@ Scripts are executed alphabetically after main installation.
 |---------|--------------|---------------|-------------|
 | Oracle Database | 1521 | 1521 | TNS Listener |
 | Enterprise Manager | 5500 | 5500 | EM Express Web UI |
-| ORDS | 8080 | 8080 | REST Data Services |
+| ORDS | 8080 | 8081 | REST Data Services |
 | Streamlit | 8501 | 8501 | Dashboard UI |
 
 ### Accessing Services
@@ -181,7 +181,12 @@ Scripts are executed alphabetically after main installation.
    Password: Welcome123
    ```
 
-3. **Streamlit Dashboard**:
+3. **ORDS REST Services**:
+   ```
+   http://localhost:8081/ords/
+   ```
+
+4. **Streamlit Dashboard**:
    ```
    http://localhost:8501
    Password: Dashboard123
