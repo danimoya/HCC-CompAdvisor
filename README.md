@@ -107,29 +107,31 @@ cd python && ./start.sh
 
 ## 📊 Oracle 23c Free Compression Support
 
-| Compression Type | Tables | Indexes | Available in 23c Free |
-|------------------|--------|---------|----------------------|
-| BASIC | ✅ | ❌ | ✅ Yes |
-| OLTP | ✅ | ❌ | ✅ Yes |
-| ADVANCED LOW | ❌ | ✅ | ✅ Yes |
-| ADVANCED HIGH | ❌ | ✅ | ✅ Yes |
-| QUERY LOW/HIGH | ✅ | ❌ | ❌ No (Exadata only) |
-| ARCHIVE LOW/HIGH | ✅ | ❌ | ❌ No (Exadata only) |
+| Compression Type | Tables | Indexes | Available in 23c Free | Available on Exadata |
+|------------------|--------|---------|----------------------|----------------------|
+| BASIC | ✅ | ❌ | ✅ Yes | ✅ Yes |
+| OLTP | ✅ | ❌ | ✅ Yes | ✅ Yes |
+| ADVANCED LOW | ❌ | ✅ | ✅ Yes | ✅ Yes |
+| ADVANCED HIGH | ❌ | ✅ | ✅ Yes | ✅ Yes |
+| QUERY LOW (HCC) | ✅ | ❌ | ❌ No | ✅ Yes (Exadata only) |
+| QUERY HIGH (HCC) | ✅ | ❌ | ❌ No | ✅ Yes (Exadata only) |
+| ARCHIVE LOW (HCC) | ✅ | ❌ | ❌ No | ✅ Yes (Exadata only) |
+| ARCHIVE HIGH (HCC) | ✅ | ❌ | ❌ No | ✅ Yes (Exadata only) |
 
-**Note**: HCC (Hybrid Columnar Compression) is only available on Exadata. Oracle 23c Free uses standard Row Store Compression.
+**Note**: HCC (Hybrid Columnar Compression) consists of 4 types: QUERY LOW/HIGH and ARCHIVE LOW/HIGH, all of which are Exadata-only features. Oracle 23c Free uses standard Row Store Compression (BASIC, OLTP) and Advanced Compression (ADVANCED LOW/HIGH for indexes).
 
 ## 📖 Documentation
 
 ### Core Documentation
-- **[Installation Guide](docs/INSTALLATION.md)** - Setup instructions
-- **[User Guide](docs/USER_GUIDE.md)** - How to use the system
-- **[API Reference](docs/API_REFERENCE.md)** - REST API documentation
-- **[Strategy Guide](docs/STRATEGY_GUIDE.md)** - Compression strategy details
+- **[Installation Guide](docs/guides/INSTALLATION.md)** - Setup instructions
+- **[User Guide](docs/guides/USER_GUIDE.md)** - How to use the system
+- **[API Reference](docs/reference/API_REFERENCE.md)** - REST API documentation
+- **[Strategy Guide](docs/reference/STRATEGY_GUIDE.md)** - Compression strategy details
 
 ### Technical Documentation
-- **[System Architecture](docs/IMPLEMENTATION_ANALYSIS.md)** - Architecture overview
-- **[Docker Setup Guide](docs/docker-setup-guide.md)** - Docker environment
-- **[Streamlit Dashboard](docs/STREAMLIT_DASHBOARD_SUMMARY.md)** - Dashboard features
+- **[System Architecture](docs/architecture/system-architecture.md)** - Architecture overview
+- **[Docker Setup Guide](docs/guides/docker-setup-guide.md)** - Docker environment
+- **[Operations Runbook](docs/reference/operations-runbook.md)** - Operational procedures and troubleshooting
 
 ## 🔌 REST API Endpoints
 
