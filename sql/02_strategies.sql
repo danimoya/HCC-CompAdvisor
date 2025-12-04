@@ -70,10 +70,10 @@ COMMIT;
 -- STRATEGY RULES: HIGH_PERFORMANCE
 -- ---------------------------------------------------------------------------
 -- Philosophy: Compression only where it won't impact performance
--- - Hot data (>70): Use OLTP compression (minimal overhead)
--- - Warm data (40-70): OLTP for tables, ADV_LOW for indexes
--- - Cold data (<40): Leave uncompressed or use OLTP if read-only
--- - Write-heavy objects (>50% DML): Avoid compression or use OLTP only
+-- - Hot data (>70): Use OLTP compression (minimal overhead, frequent access needs speed)
+-- - Warm data (40-70): OLTP for tables, ADV_LOW for indexes (balanced compression)
+-- - Cold data (<40): Use BASIC for tables, ADVANCED LOW for indexes (rare access = safe to compress for space savings)
+-- - Write-heavy objects (>50% DML): Avoid heavy compression, use OLTP only to minimize overhead
 -- ---------------------------------------------------------------------------
 
 PROMPT Inserting HIGH_PERFORMANCE strategy rules...
@@ -178,7 +178,7 @@ INSERT INTO T_STRATEGY_RULES (
     'Warm tables with light writes: Safe to use OLTP for moderate space savings'
 );
 
--- Rule 5: Cold tables - No compression (performance priority)
+-- Rule 5: Cold tables - BASIC compression (low access = safe to compress)
 INSERT INTO T_STRATEGY_RULES (
     RULE_ID,
     STRATEGY_ID,
@@ -198,9 +198,9 @@ INSERT INTO T_STRATEGY_RULES (
     40,
     0,
     1.0,
-    'NOCOMPRESS',
+    'BASIC',
     5,
-    'Cold tables: Leave uncompressed to avoid CPU overhead on infrequent access'
+    'Cold tables: BASIC compression ideal for rarely accessed data - CPU overhead negligible, space savings significant'
 );
 
 -- Rule 6: Hot indexes - ADVANCED LOW (minimal overhead)
@@ -253,7 +253,7 @@ INSERT INTO T_STRATEGY_RULES (
     'Warm indexes: Safe compression level for moderately accessed indexes'
 );
 
--- Rule 8: Cold indexes - No compression
+-- Rule 8: Cold indexes - ADVANCED LOW (excellent space savings for rare access)
 INSERT INTO T_STRATEGY_RULES (
     RULE_ID,
     STRATEGY_ID,
@@ -273,9 +273,9 @@ INSERT INTO T_STRATEGY_RULES (
     30,
     0,
     1.0,
-    'NOCOMPRESS',
+    'ADVANCED LOW',
     8,
-    'Cold indexes: Avoid compression overhead for rarely used indexes'
+    'Cold indexes: ADVANCED LOW compression provides excellent space savings with minimal CPU impact on rare access patterns'
 );
 
 -- Rule 9: LOBs - No compression (Oracle 23c Free limitation)
