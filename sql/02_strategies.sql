@@ -24,12 +24,14 @@
 PROMPT Inserting compression strategies...
 
 INSERT INTO T_COMPRESSION_STRATEGIES (
+    STRATEGY_ID,
     STRATEGY_NAME,
     DESCRIPTION,
     CATEGORY,
     ACTIVE_FLAG,
     CREATED_BY
 ) VALUES (
+    1,
     'HIGH_PERFORMANCE',
     'Minimal compression overhead for transactional workloads. OLTP for write-heavy tables, HCC QUERY HIGH for frequently accessed read-only data, HCC ARCHIVE LOW for inactive tables. Best for: OLTP systems, real-time analytics, mixed read/write workloads.',
     'PERFORMANCE',
@@ -38,12 +40,14 @@ INSERT INTO T_COMPRESSION_STRATEGIES (
 );
 
 INSERT INTO T_COMPRESSION_STRATEGIES (
+    STRATEGY_ID,
     STRATEGY_NAME,
     DESCRIPTION,
     CATEGORY,
     ACTIVE_FLAG,
     CREATED_BY
 ) VALUES (
+    2,
     'BALANCED',
     'Optimal space savings and performance balance. OLTP for write-heavy tables, HCC QUERY LOW for frequently accessed data, HCC ARCHIVE HIGH for inactive/cold tables. Best for: General-purpose databases, mixed read-heavy and read-only workloads, balanced update patterns.',
     'BALANCED',
@@ -52,12 +56,14 @@ INSERT INTO T_COMPRESSION_STRATEGIES (
 );
 
 INSERT INTO T_COMPRESSION_STRATEGIES (
+    STRATEGY_ID,
     STRATEGY_NAME,
     DESCRIPTION,
     CATEGORY,
     ACTIVE_FLAG,
     CREATED_BY
 ) VALUES (
+    3,
     'MAXIMUM_COMPRESSION',
     'Maximum space savings with HCC ARCHIVE HIGH compression. OLTP only for write-heavy tables, HCC ARCHIVE HIGH for all read-only and inactive data. Best for: Data warehouses, analytics systems, archive data, read-heavy workloads, cost-sensitive storage environments.',
     'SPACE',
