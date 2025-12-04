@@ -1,7 +1,7 @@
 -- ===========================================================================
 -- File: 02_strategies.sql
 -- Description: Predefined compression strategies for Exadata HCC CompAdvisor
--- Version: 2.1.0
+-- Version: 3.0.0
 -- Platform: Oracle Exadata (HCC - Hybrid Columnar Compression)
 -- ===========================================================================
 -- HCC COMPRESSION TYPES:
@@ -22,6 +22,10 @@
 -- ---------------------------------------------------------------------------
 
 PROMPT Inserting compression strategies...
+
+-- Clear existing data (truncate rules first due to foreign key)
+TRUNCATE TABLE T_STRATEGY_RULES;
+TRUNCATE TABLE T_COMPRESSION_STRATEGIES;
 
 INSERT INTO T_COMPRESSION_STRATEGIES (
     STRATEGY_ID,
@@ -106,7 +110,7 @@ INSERT INTO T_STRATEGY_RULES (
     1.0,
     'OLTP',
     1,
-    'Hot tables with heavy writes: Use OLTP for minimal overhead while maintaining some space savings'
+    'Hot tables with heavy writes: Use OLTP for minimal overhead while maintaining compression'
 );
 
 -- Rule 2: Hot tables with light writes - HCC QUERY HIGH
@@ -159,7 +163,7 @@ INSERT INTO T_STRATEGY_RULES (
     'Warm tables with heavy writes: OLTP minimizes write overhead while providing compression'
 );
 
--- Rule 4: Warm tables with light writes - OLTP compression
+-- Rule 4: Warm tables with light writes - HCC QUERY LOW
 INSERT INTO T_STRATEGY_RULES (
     RULE_ID,
     STRATEGY_ID,
@@ -179,9 +183,9 @@ INSERT INTO T_STRATEGY_RULES (
     70,
     0,
     0.5,
-    'OLTP',
+    'QUERY LOW',
     4,
-    'Warm tables with light writes: Safe to use OLTP for moderate space savings'
+    'Warm tables with light writes: HCC QUERY LOW for good compression on moderately accessed data'
 );
 
 -- Rule 5: Cold tables - HCC ARCHIVE LOW
@@ -209,7 +213,7 @@ INSERT INTO T_STRATEGY_RULES (
     'Inactive/cold tables with rare access: HCC ARCHIVE LOW for maximum space savings with minimal performance impact'
 );
 
--- Rule 6: Hot indexes - ADVANCED LOW (minimal overhead)
+-- Rule 6: Hot indexes - HCC QUERY HIGH
 INSERT INTO T_STRATEGY_RULES (
     RULE_ID,
     STRATEGY_ID,
@@ -229,12 +233,12 @@ INSERT INTO T_STRATEGY_RULES (
     100,
     0,
     1.0,
-    'ADVANCED LOW',
+    'QUERY HIGH',
     6,
-    'Hot indexes: ADVANCED LOW provides good compression with minimal query impact'
+    'Hot indexes: HCC QUERY HIGH provides good compression with excellent query performance'
 );
 
--- Rule 7: Warm indexes - ADVANCED LOW
+-- Rule 7: Warm indexes - HCC QUERY LOW
 INSERT INTO T_STRATEGY_RULES (
     RULE_ID,
     STRATEGY_ID,
@@ -254,9 +258,9 @@ INSERT INTO T_STRATEGY_RULES (
     60,
     0,
     1.0,
-    'ADVANCED LOW',
+    'QUERY LOW',
     7,
-    'Warm indexes: Safe compression level for moderately accessed indexes'
+    'Warm indexes: HCC QUERY LOW provides balanced compression for moderately accessed indexes'
 );
 
 -- Rule 8: Cold indexes - HCC ARCHIVE LOW
@@ -284,7 +288,7 @@ INSERT INTO T_STRATEGY_RULES (
     'Rarely used indexes with minimal access: HCC ARCHIVE LOW for excellent space savings'
 );
 
--- Rule 9: LOBs - HCC compression supported (SecureFiles)
+-- Rule 9: LOBs - No compression
 INSERT INTO T_STRATEGY_RULES (
     RULE_ID,
     STRATEGY_ID,
@@ -306,16 +310,16 @@ INSERT INTO T_STRATEGY_RULES (
     1.0,
     'NOCOMPRESS',
     9,
-    'LOBs: Deferred to Oracle''s default SecureFile compression in 23c Free'
+    'LOBs: Deferred to Oracle''s default SecureFile compression in Exadata'
 );
 
 -- ---------------------------------------------------------------------------
 -- STRATEGY RULES: BALANCED
 -- ---------------------------------------------------------------------------
 -- Philosophy: Optimize for both space and performance
--- - Hot data (>70): OLTP compression
--- - Warm data (30-70): BASIC compression (good ratio, acceptable overhead)
--- - Cold data (<30): BASIC compression (maximize space savings)
+-- - Hot data (>70): OLTP compression (write-heavy) or QUERY HIGH (read-heavy)
+-- - Warm data (40-70): OLTP (write-heavy) or QUERY LOW (read-heavy)
+-- - Cold data (<40): ARCHIVE HIGH (maximize space savings)
 -- - Consider write patterns: Higher compression for read-heavy workloads
 -- ---------------------------------------------------------------------------
 
@@ -346,7 +350,7 @@ INSERT INTO T_STRATEGY_RULES (
     'Hot write-heavy tables: OLTP balances write performance and compression'
 );
 
--- Rule 11: Hot tables with light writes - OLTP
+-- Rule 11: Hot tables with light writes - HCC QUERY HIGH
 INSERT INTO T_STRATEGY_RULES (
     RULE_ID,
     STRATEGY_ID,
@@ -366,12 +370,12 @@ INSERT INTO T_STRATEGY_RULES (
     100,
     0,
     0.5,
-    'OLTP',
+    'QUERY HIGH',
     11,
-    'Hot read-heavy tables: OLTP provides good compression for frequently queried data'
+    'Hot read-heavy tables: HCC QUERY HIGH provides excellent compression for frequently queried data'
 );
 
--- Rule 12: Warm tables with heavy writes - BASIC
+-- Rule 12: Warm tables with heavy writes - OLTP
 INSERT INTO T_STRATEGY_RULES (
     RULE_ID,
     STRATEGY_ID,
@@ -387,16 +391,16 @@ INSERT INTO T_STRATEGY_RULES (
     SEQ_STRATEGY_RULES.NEXTVAL,
     2,
     'TABLE',
-    30,
+    40,
     70,
     0.5,
     1.0,
-    'BASIC',
+    'OLTP',
     12,
-    'Warm write-heavy tables: BASIC compression acceptable for moderate update frequency'
+    'Warm write-heavy tables: OLTP compression maintains write performance'
 );
 
--- Rule 13: Warm tables with light writes - BASIC
+-- Rule 13: Warm tables with light writes - HCC QUERY LOW
 INSERT INTO T_STRATEGY_RULES (
     RULE_ID,
     STRATEGY_ID,
@@ -412,16 +416,16 @@ INSERT INTO T_STRATEGY_RULES (
     SEQ_STRATEGY_RULES.NEXTVAL,
     2,
     'TABLE',
-    30,
+    40,
     70,
     0,
     0.5,
-    'BASIC',
+    'QUERY LOW',
     13,
-    'Warm read-heavy tables: BASIC provides good space savings with acceptable read overhead'
+    'Warm read-heavy tables: HCC QUERY LOW provides good space savings with acceptable read overhead'
 );
 
--- Rule 14: Cold tables - BASIC compression
+-- Rule 14: Cold tables - HCC ARCHIVE HIGH
 INSERT INTO T_STRATEGY_RULES (
     RULE_ID,
     STRATEGY_ID,
@@ -438,15 +442,15 @@ INSERT INTO T_STRATEGY_RULES (
     2,
     'TABLE',
     0,
-    30,
+    40,
     0,
     1.0,
-    'BASIC',
+    'ARCHIVE HIGH',
     14,
-    'Cold tables: BASIC compression maximizes space savings for infrequently accessed data'
+    'Cold tables: HCC ARCHIVE HIGH maximizes space savings for infrequently accessed data'
 );
 
--- Rule 15: Hot indexes - ADVANCED LOW
+-- Rule 15: Hot indexes - HCC QUERY HIGH
 INSERT INTO T_STRATEGY_RULES (
     RULE_ID,
     STRATEGY_ID,
@@ -466,12 +470,12 @@ INSERT INTO T_STRATEGY_RULES (
     100,
     0,
     1.0,
-    'ADVANCED LOW',
+    'QUERY HIGH',
     15,
-    'Hot indexes: ADVANCED LOW balances compression and query performance'
+    'Hot indexes: HCC QUERY HIGH balances compression and query performance'
 );
 
--- Rule 16: Warm indexes - ADVANCED LOW
+-- Rule 16: Warm indexes - HCC QUERY LOW
 INSERT INTO T_STRATEGY_RULES (
     RULE_ID,
     STRATEGY_ID,
@@ -491,12 +495,12 @@ INSERT INTO T_STRATEGY_RULES (
     60,
     0,
     1.0,
-    'ADVANCED LOW',
+    'QUERY LOW',
     16,
-    'Warm indexes: Good compression ratio for moderately used indexes'
+    'Warm indexes: HCC QUERY LOW provides good compression ratio for moderately used indexes'
 );
 
--- Rule 17: Cold indexes - ADVANCED LOW
+-- Rule 17: Cold indexes - HCC ARCHIVE HIGH
 INSERT INTO T_STRATEGY_RULES (
     RULE_ID,
     STRATEGY_ID,
@@ -516,9 +520,9 @@ INSERT INTO T_STRATEGY_RULES (
     30,
     0,
     1.0,
-    'ADVANCED LOW',
+    'ARCHIVE HIGH',
     17,
-    'Cold indexes: Compress for space savings on rarely accessed indexes'
+    'Cold indexes: HCC ARCHIVE HIGH maximizes space recovery for rarely accessed indexes'
 );
 
 -- Rule 18: LOBs - No compression
@@ -543,7 +547,7 @@ INSERT INTO T_STRATEGY_RULES (
     1.0,
     'NOCOMPRESS',
     18,
-    'LOBs: Rely on SecureFile automatic compression in Oracle 23c Free'
+    'LOBs: Rely on SecureFile automatic compression in Exadata'
 );
 
 -- ---------------------------------------------------------------------------
@@ -551,9 +555,9 @@ INSERT INTO T_STRATEGY_RULES (
 -- ---------------------------------------------------------------------------
 -- Philosophy: Maximize space savings, acceptable performance trade-off
 -- - Very hot data (>80): OLTP (maintain usability)
--- - Hot data (40-80): BASIC compression
--- - Cold data (<=40): BASIC compression
--- - Indexes: Use ADVANCED HIGH for better compression ratios
+-- - Hot data (40-80): QUERY HIGH for read-heavy, OLTP for write-heavy
+-- - Cold data (<=40): ARCHIVE HIGH (maximize space savings)
+-- - Indexes: Use HCC ARCHIVE HIGH for better compression ratios
 -- - Prioritize space over CPU overhead
 -- ---------------------------------------------------------------------------
 
@@ -584,7 +588,7 @@ INSERT INTO T_STRATEGY_RULES (
     'Very hot write-heavy tables: OLTP prevents severe write degradation'
 );
 
--- Rule 20: Very hot tables with light writes - OLTP
+-- Rule 20: Very hot tables with light writes - HCC QUERY HIGH
 INSERT INTO T_STRATEGY_RULES (
     RULE_ID,
     STRATEGY_ID,
@@ -604,12 +608,12 @@ INSERT INTO T_STRATEGY_RULES (
     100,
     0,
     0.5,
-    'OLTP',
+    'QUERY HIGH',
     20,
-    'Very hot read-heavy tables: OLTP maintains query performance while compressing'
+    'Very hot read-heavy tables: HCC QUERY HIGH maintains query performance while compressing'
 );
 
--- Rule 21: Hot tables with heavy writes - BASIC
+-- Rule 21: Hot tables with heavy writes - OLTP
 INSERT INTO T_STRATEGY_RULES (
     RULE_ID,
     STRATEGY_ID,
@@ -629,12 +633,12 @@ INSERT INTO T_STRATEGY_RULES (
     80,
     0.5,
     1.0,
-    'BASIC',
+    'OLTP',
     21,
-    'Hot write-heavy tables: BASIC compression for better space savings'
+    'Hot write-heavy tables: OLTP compression for better space savings'
 );
 
--- Rule 22: Hot tables with light writes - BASIC
+-- Rule 22: Hot tables with light writes - HCC QUERY HIGH
 INSERT INTO T_STRATEGY_RULES (
     RULE_ID,
     STRATEGY_ID,
@@ -654,12 +658,12 @@ INSERT INTO T_STRATEGY_RULES (
     80,
     0,
     0.5,
-    'BASIC',
+    'QUERY HIGH',
     22,
-    'Hot read-heavy tables: BASIC provides good compression for active data'
+    'Hot read-heavy tables: HCC QUERY HIGH provides excellent compression for active data'
 );
 
--- Rule 23: Cold tables - BASIC compression
+-- Rule 23: Cold tables - HCC ARCHIVE HIGH
 INSERT INTO T_STRATEGY_RULES (
     RULE_ID,
     STRATEGY_ID,
@@ -679,12 +683,12 @@ INSERT INTO T_STRATEGY_RULES (
     40,
     0,
     1.0,
-    'BASIC',
+    'ARCHIVE HIGH',
     23,
-    'Cold tables: Always compress with BASIC for maximum space savings'
+    'Cold tables: Always use HCC ARCHIVE HIGH for maximum space savings'
 );
 
--- Rule 24: Hot indexes - ADVANCED HIGH
+-- Rule 24: Hot indexes - HCC QUERY HIGH
 INSERT INTO T_STRATEGY_RULES (
     RULE_ID,
     STRATEGY_ID,
@@ -704,12 +708,12 @@ INSERT INTO T_STRATEGY_RULES (
     100,
     0,
     1.0,
-    'ADVANCED HIGH',
+    'QUERY HIGH',
     24,
-    'Hot indexes: ADVANCED HIGH for maximum index compression'
+    'Hot indexes: HCC QUERY HIGH for maximum index compression'
 );
 
--- Rule 25: Warm indexes - ADVANCED LOW
+-- Rule 25: Warm indexes - HCC QUERY HIGH
 INSERT INTO T_STRATEGY_RULES (
     RULE_ID,
     STRATEGY_ID,
@@ -729,12 +733,12 @@ INSERT INTO T_STRATEGY_RULES (
     60,
     0,
     1.0,
-    'ADVANCED LOW',
+    'QUERY HIGH',
     25,
-    'Warm indexes: ADVANCED LOW provides good space savings'
+    'Warm indexes: HCC QUERY HIGH provides excellent space savings'
 );
 
--- Rule 26: Cold indexes - ADVANCED LOW
+-- Rule 26: Cold indexes - HCC ARCHIVE HIGH
 INSERT INTO T_STRATEGY_RULES (
     RULE_ID,
     STRATEGY_ID,
@@ -754,9 +758,9 @@ INSERT INTO T_STRATEGY_RULES (
     30,
     0,
     1.0,
-    'ADVANCED LOW',
+    'ARCHIVE HIGH',
     26,
-    'Cold indexes: Compress all indexes for maximum space recovery'
+    'Cold indexes: Compress all indexes with HCC ARCHIVE HIGH for maximum space recovery'
 );
 
 -- Rule 27: LOBs - No compression
@@ -781,7 +785,7 @@ INSERT INTO T_STRATEGY_RULES (
     1.0,
     'NOCOMPRESS',
     27,
-    'LOBs: Oracle 23c Free handles LOB compression automatically via SecureFile'
+    'LOBs: Oracle Exadata handles LOB compression automatically via SecureFile'
 );
 
 COMMIT;
@@ -807,6 +811,7 @@ PROMPT Strategy Rules Count:
 PROMPT =====================
 
 SELECT
+    s.STRATEGY_ID,
     s.STRATEGY_NAME,
     COUNT(r.RULE_ID) AS RULE_COUNT,
     COUNT(CASE WHEN r.OBJECT_TYPE = 'TABLE' THEN 1 END) AS TABLE_RULES,
@@ -814,7 +819,7 @@ SELECT
     COUNT(CASE WHEN r.OBJECT_TYPE = 'LOB' THEN 1 END) AS LOB_RULES
 FROM T_COMPRESSION_STRATEGIES s
 LEFT JOIN T_STRATEGY_RULES r ON s.STRATEGY_ID = r.STRATEGY_ID
-GROUP BY s.STRATEGY_NAME
+GROUP BY s.STRATEGY_ID, s.STRATEGY_NAME
 ORDER BY s.STRATEGY_ID;
 
 PROMPT
@@ -838,9 +843,9 @@ PROMPT
 PROMPT Strategy setup complete!
 PROMPT =======================
 PROMPT 3 strategies configured with 27 total rules
-PROMPT - HIGH_PERFORMANCE: 9 rules (minimal compression overhead)
-PROMPT - BALANCED: 9 rules (optimal space/performance balance)
-PROMPT - MAXIMUM_COMPRESSION: 9 rules (aggressive space savings)
+PROMPT - HIGH_PERFORMANCE: 9 rules (OLTP, QUERY HIGH, ARCHIVE LOW)
+PROMPT - BALANCED: 9 rules (OLTP, QUERY HIGH/LOW, ARCHIVE HIGH)
+PROMPT - MAXIMUM_COMPRESSION: 9 rules (OLTP, QUERY HIGH, ARCHIVE HIGH)
 PROMPT
 
 -- ===========================================================================
