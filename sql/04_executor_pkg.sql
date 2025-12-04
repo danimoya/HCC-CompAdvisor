@@ -20,33 +20,28 @@
 -- PACKAGE SPECIFICATION
 --------------------------------------------------------------------------------
 CREATE OR REPLACE PACKAGE PKG_COMPRESSION_EXECUTOR AS
-
   -- Constants for compression types (Standard Platform)
   C_COMPRESS_BASIC     CONSTANT VARCHAR2(30) := 'BASIC';
   C_COMPRESS_OLTP      CONSTANT VARCHAR2(30) := 'OLTP';
   C_COMPRESS_ADV_LOW   CONSTANT VARCHAR2(30) := 'ADV_LOW';
   C_COMPRESS_ADV_HIGH  CONSTANT VARCHAR2(30) := 'ADV_HIGH';
   C_NOCOMPRESS         CONSTANT VARCHAR2(30) := 'NOCOMPRESS';
-
   -- Constants for HCC compression types (Exadata Platform)
   C_COMPRESS_QUERY_LOW   CONSTANT VARCHAR2(30) := 'QUERY_LOW';
   C_COMPRESS_QUERY_HIGH  CONSTANT VARCHAR2(30) := 'QUERY_HIGH';
   C_COMPRESS_ARCHIVE_LOW CONSTANT VARCHAR2(30) := 'ARCHIVE_LOW';
   C_COMPRESS_ARCHIVE_HIGH CONSTANT VARCHAR2(30) := 'ARCHIVE_HIGH';
-
   -- Exception codes
   E_OBJECT_NOT_FOUND   EXCEPTION;
   E_INVALID_COMPRESSION_TYPE EXCEPTION;
   E_OBJECT_LOCKED      EXCEPTION;
   E_INSUFFICIENT_SPACE EXCEPTION;
   E_DEPENDENCY_EXISTS  EXCEPTION;
-
   PRAGMA EXCEPTION_INIT(E_OBJECT_NOT_FOUND, -20001);
   PRAGMA EXCEPTION_INIT(E_INVALID_COMPRESSION_TYPE, -20002);
   PRAGMA EXCEPTION_INIT(E_OBJECT_LOCKED, -20003);
   PRAGMA EXCEPTION_INIT(E_INSUFFICIENT_SPACE, -20004);
   PRAGMA EXCEPTION_INIT(E_DEPENDENCY_EXISTS, -20005);
-
   /**
    * Compress a table with comprehensive safety checks
    * Supports both standard (BASIC, OLTP, ADV_LOW/HIGH) and HCC (QUERY/ARCHIVE LOW/HIGH) types
@@ -65,7 +60,6 @@ CREATE OR REPLACE PACKAGE PKG_COMPRESSION_EXECUTOR AS
     p_online IN BOOLEAN DEFAULT TRUE,
     p_dry_run IN BOOLEAN DEFAULT FALSE
   );
-
   /**
    * Compress an index with validation
    * Supports Advanced compression (ADV_LOW, ADV_HIGH) on standard platforms
@@ -83,7 +77,6 @@ CREATE OR REPLACE PACKAGE PKG_COMPRESSION_EXECUTOR AS
     p_compression_type IN VARCHAR2,
     p_online IN BOOLEAN DEFAULT TRUE
   );
-
   /**
    * Compress a table partition preserving tablespace
    *
@@ -100,7 +93,6 @@ CREATE OR REPLACE PACKAGE PKG_COMPRESSION_EXECUTOR AS
     p_compression_type IN VARCHAR2,
     p_online IN BOOLEAN DEFAULT TRUE
   );
-
   /**
    * Compress all partitions of a table preserving tablespaces
    *
@@ -115,7 +107,6 @@ CREATE OR REPLACE PACKAGE PKG_COMPRESSION_EXECUTOR AS
     p_compression_type IN VARCHAR2,
     p_online IN BOOLEAN DEFAULT TRUE
   );
-
   /**
    * Compress LOBs preserving tablespace
    *
@@ -130,7 +121,6 @@ CREATE OR REPLACE PACKAGE PKG_COMPRESSION_EXECUTOR AS
     p_column_name IN VARCHAR2,
     p_compression_type IN VARCHAR2
   );
-
   /**
    * Execute compression recommendations based on strategy
    *
@@ -143,7 +133,6 @@ CREATE OR REPLACE PACKAGE PKG_COMPRESSION_EXECUTOR AS
     p_max_tables IN NUMBER DEFAULT 10,
     p_max_size_gb IN NUMBER DEFAULT 100
   );
-
   /**
    * Rollback compression to original state
    *
@@ -152,7 +141,6 @@ CREATE OR REPLACE PACKAGE PKG_COMPRESSION_EXECUTOR AS
   PROCEDURE rollback_compression(
     p_history_id IN NUMBER
   );
-
   /**
    * Get compression operation status
    *
@@ -162,7 +150,6 @@ CREATE OR REPLACE PACKAGE PKG_COMPRESSION_EXECUTOR AS
   FUNCTION get_compression_status(
     p_history_id IN NUMBER
   ) RETURN VARCHAR2;
-
   /**
    * Validate object before compression
    *
@@ -176,7 +163,6 @@ CREATE OR REPLACE PACKAGE PKG_COMPRESSION_EXECUTOR AS
     p_object_name IN VARCHAR2,
     p_object_type IN VARCHAR2
   ) RETURN BOOLEAN;
-
   /**
    * Get estimated compression ratio
    *
@@ -190,7 +176,6 @@ CREATE OR REPLACE PACKAGE PKG_COMPRESSION_EXECUTOR AS
     p_table_name IN VARCHAR2,
     p_compression_type IN VARCHAR2
   ) RETURN NUMBER;
-
 END PKG_COMPRESSION_EXECUTOR;
 /
 
@@ -198,9 +183,7 @@ END PKG_COMPRESSION_EXECUTOR;
 -- PACKAGE BODY
 --------------------------------------------------------------------------------
 CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
-
   -- Private helper procedures
-
   /**
    * Log execution message
    */
@@ -213,7 +196,6 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
     DBMS_OUTPUT.PUT_LINE('[' || p_level || '] ' || TO_CHAR(SYSTIMESTAMP, 'YYYY-MM-DD HH24:MI:SS.FF3') || ' - ' || p_message);
     COMMIT;
   END log_message;
-
   /**
    * Check if object is locked
    */
@@ -230,10 +212,8 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
     WHERE o.OWNER = p_owner
       AND o.OBJECT_NAME = p_object_name
       AND l.LOCKED_MODE > 0;
-
     RETURN v_locked > 0;
   END is_object_locked;
-
   /**
    * Get current segment size in bytes
    */
@@ -250,13 +230,11 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
     WHERE owner = p_owner
       AND segment_name = p_segment_name
       AND segment_type = p_segment_type;
-
     RETURN v_bytes;
   EXCEPTION
     WHEN NO_DATA_FOUND THEN
       RETURN 0;
   END get_segment_size;
-
   /**
    * Get compression clause for DDL
    * Supports both standard (BASIC, OLTP, ADV_LOW/HIGH) and HCC types (QUERY/ARCHIVE LOW/HIGH)
@@ -291,7 +269,6 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
         RAISE_APPLICATION_ERROR(-20002, 'Invalid compression type: ' || p_compression_type);
     END CASE;
   END get_compression_clause;
-
   /**
    * Check tablespace free space
    */
@@ -305,11 +282,9 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
     INTO v_free_bytes
     FROM DBA_FREE_SPACE
     WHERE tablespace_name = p_tablespace_name;
-
     -- Require at least 2x the current size for safety
     RETURN v_free_bytes >= (p_required_bytes * 2);
   END has_sufficient_space;
-
   /**
    * Rebuild indexes for a table
    * CRITICAL: Preserves original tablespace for each index
@@ -323,7 +298,6 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
     v_tablespace_name VARCHAR2(128);
   BEGIN
     log_message('Rebuilding indexes for ' || p_owner || '.' || p_table_name);
-
     FOR idx IN (
       SELECT i.index_name, i.tablespace_name
       FROM DBA_INDEXES i
@@ -332,17 +306,14 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
         AND i.index_type NOT IN ('LOB', 'IOT - TOP')
     ) LOOP
       v_ddl := 'ALTER INDEX ' || p_owner || '.' || idx.index_name || ' REBUILD';
-
       -- CRITICAL: Preserve original index tablespace
       IF idx.tablespace_name IS NOT NULL THEN
         v_ddl := v_ddl || ' TABLESPACE ' || idx.tablespace_name;
         log_message('Preserving index tablespace: ' || idx.tablespace_name || ' for ' || idx.index_name);
       END IF;
-
       IF p_online THEN
         v_ddl := v_ddl || ' ONLINE';
       END IF;
-
       BEGIN
         EXECUTE IMMEDIATE v_ddl;
         log_message('Rebuilt index: ' || idx.index_name);
@@ -352,7 +323,6 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
       END;
     END LOOP;
   END rebuild_table_indexes;
-
   /**
    * Gather table statistics
    */
@@ -362,7 +332,6 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
   ) IS
   BEGIN
     log_message('Gathering statistics for ' || p_owner || '.' || p_table_name);
-
     DBMS_STATS.GATHER_TABLE_STATS(
       ownname => p_owner,
       tabname => p_table_name,
@@ -371,15 +340,12 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
       degree => DBMS_STATS.AUTO_DEGREE,
       cascade => TRUE
     );
-
     log_message('Statistics gathered successfully');
   EXCEPTION
     WHEN OTHERS THEN
       log_message('Warning: Failed to gather statistics: ' || SQLERRM, 'WARN');
   END gather_stats;
-
   -- Public procedures implementation
-
   /**
    * Validate object before compression
    */
@@ -399,16 +365,13 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
     WHERE owner = p_owner
       AND object_name = p_object_name
       AND object_type = p_object_type;
-
     IF v_exists = 0 THEN
       RAISE_APPLICATION_ERROR(-20001, 'Object not found: ' || p_owner || '.' || p_object_name);
     END IF;
-
     -- Check if object is locked
     IF is_object_locked(p_owner, p_object_name) THEN
       RAISE_APPLICATION_ERROR(-20003, 'Object is locked: ' || p_owner || '.' || p_object_name);
     END IF;
-
     -- Check tablespace space for tables
     IF p_object_type = 'TABLE' THEN
       SELECT tablespace_name
@@ -416,20 +379,16 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
       FROM DBA_TABLES
       WHERE owner = p_owner
         AND table_name = p_object_name;
-
       v_size_bytes := get_segment_size(p_owner, p_object_name, 'TABLE');
-
       IF NOT has_sufficient_space(v_tablespace_name, v_size_bytes) THEN
         RAISE_APPLICATION_ERROR(-20004, 'Insufficient tablespace space for: ' || p_owner || '.' || p_object_name);
       END IF;
     END IF;
-
     RETURN TRUE;
   EXCEPTION
     WHEN NO_DATA_FOUND THEN
       RAISE_APPLICATION_ERROR(-20001, 'Object metadata not found: ' || p_owner || '.' || p_object_name);
   END validate_object;
-
   /**
    * Estimate compression ratio
    */
@@ -452,10 +411,8 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
       ELSE
         v_ratio := 1.5;  -- Conservative default
     END CASE;
-
     RETURN v_ratio;
   END estimate_compression_ratio;
-
   /**
    * Compress a table
    * CRITICAL: Preserves original tablespace during compression operations
@@ -482,12 +439,10 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
     log_message('Table: ' || p_owner || '.' || p_table_name);
     log_message('Compression Type: ' || p_compression_type);
     log_message('Dry Run: ' || CASE WHEN p_dry_run THEN 'YES' ELSE 'NO' END);
-
     -- Validate object
     IF NOT validate_object(p_owner, p_table_name, 'TABLE') THEN
       RETURN;
     END IF;
-
     -- Get current state including tablespace and table type
     -- CRITICAL: Query tablespace to preserve it during MOVE operation
     SELECT NVL(compression, 'DISABLED'),
@@ -501,47 +456,37 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
     FROM DBA_TABLES
     WHERE owner = p_owner
       AND table_name = p_table_name;
-
     v_size_before := get_segment_size(p_owner, p_table_name, 'TABLE');
-
     log_message('Current compression: ' || v_current_compression);
     log_message('Current tablespace: ' || NVL(v_tablespace_name, 'NULL'));
     log_message('Table type: ' || CASE WHEN v_iot_type IS NOT NULL THEN 'IOT'
                                        WHEN v_partitioned = 'YES' THEN 'PARTITIONED'
                                        ELSE 'REGULAR' END);
     log_message('Current size: ' || ROUND(v_size_before / 1024 / 1024, 2) || ' MB');
-
     -- Get compression clause
     v_compression_clause := get_compression_clause(p_compression_type);
-
     -- Build DDL with TABLESPACE preservation
     -- For non-partitioned tables, include TABLESPACE clause to preserve location
     IF v_partitioned = 'NO' THEN
       v_ddl := 'ALTER TABLE ' || p_owner || '.' || p_table_name || ' MOVE ' || v_compression_clause;
-
       -- CRITICAL: Add TABLESPACE clause to preserve original tablespace
       IF v_tablespace_name IS NOT NULL THEN
         v_ddl := v_ddl || ' TABLESPACE ' || v_tablespace_name;
         log_message('Preserving tablespace: ' || v_tablespace_name);
       END IF;
-
     ELSE
       -- For partitioned tables, use different approach
       log_message('WARNING: Partitioned table detected. Use compress_partition for individual partitions.');
       v_ddl := 'ALTER TABLE ' || p_owner || '.' || p_table_name || ' MOVE ' || v_compression_clause;
     END IF;
-
     IF p_online AND p_compression_type IN (C_COMPRESS_BASIC, C_COMPRESS_OLTP) THEN
       v_ddl := v_ddl || ' ONLINE';
     END IF;
-
     log_message('DDL: ' || v_ddl);
-
     IF p_dry_run THEN
       log_message('DRY RUN - DDL generated but not executed');
       RETURN;
     END IF;
-
     -- Create history record
     INSERT INTO T_COMPRESSION_HISTORY (
       owner, object_name, object_type,
@@ -554,24 +499,18 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
       v_size_before, 'COMPRESS',
       USER, v_ddl
     ) RETURNING history_id INTO v_history_id;
-
     COMMIT;
-
     -- Execute DDL
     BEGIN
       log_message('Executing compression...');
       EXECUTE IMMEDIATE v_ddl;
       log_message('Table compressed successfully');
-
       -- Rebuild indexes
       rebuild_table_indexes(p_owner, p_table_name, p_online);
-
       -- Gather statistics
       gather_stats(p_owner, p_table_name);
-
       -- Get new size
       v_size_after := get_segment_size(p_owner, p_table_name, 'TABLE');
-
       -- Update history
       UPDATE T_COMPRESSION_HISTORY
       SET size_after_bytes = v_size_after,
@@ -581,14 +520,11 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
           end_time = SYSTIMESTAMP,
           execution_time_seconds = EXTRACT(SECOND FROM (SYSTIMESTAMP - start_time))
       WHERE history_id = v_history_id;
-
       COMMIT;
-
       log_message('New size: ' || ROUND(v_size_after / 1024 / 1024, 2) || ' MB');
       log_message('Space saved: ' || ROUND((v_size_before - v_size_after) / 1024 / 1024, 2) || ' MB');
       log_message('Compression ratio: ' || ROUND(v_size_before / NULLIF(v_size_after, 0), 2) || ':1');
       log_message('=== Compression completed successfully ===');
-
     EXCEPTION
       WHEN OTHERS THEN
         -- Update history with error
@@ -597,19 +533,15 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
             error_message = SUBSTR(SQLERRM, 1, 4000),
             end_time = SYSTIMESTAMP
         WHERE history_id = v_history_id;
-
         COMMIT;
-
         log_message('ERROR: ' || SQLERRM, 'ERROR');
         RAISE;
     END;
-
   EXCEPTION
     WHEN OTHERS THEN
       log_message('FATAL ERROR: ' || SQLERRM, 'ERROR');
       RAISE;
   END compress_table;
-
   /**
    * Compress an index
    */
@@ -628,7 +560,6 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
     log_message('=== Starting index compression ===');
     log_message('Index: ' || p_owner || '.' || p_index_name);
     log_message('Compression Type: ' || p_compression_type);
-
     -- Validate compression type for indexes
     -- Supports: ADV_LOW, ADV_HIGH (standard), QUERY_LOW, QUERY_HIGH (HCC), NOCOMPRESS
     -- Note: ARCHIVE_LOW/HIGH are not supported for indexes
@@ -640,27 +571,20 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
       RAISE_APPLICATION_ERROR(-20002,
         'Invalid index compression type. Use ADV_LOW, ADV_HIGH, QUERY_LOW, QUERY_HIGH, or NOCOMPRESS');
     END IF;
-
     -- Validate object
     IF NOT validate_object(p_owner, p_index_name, 'INDEX') THEN
       RETURN;
     END IF;
-
     v_size_before := get_segment_size(p_owner, p_index_name, 'INDEX');
     log_message('Current size: ' || ROUND(v_size_before / 1024 / 1024, 2) || ' MB');
-
     -- Get compression clause
     v_compression_clause := get_compression_clause(p_compression_type);
-
     -- Build DDL
     v_ddl := 'ALTER INDEX ' || p_owner || '.' || p_index_name || ' REBUILD ' || v_compression_clause;
-
     IF p_online THEN
       v_ddl := v_ddl || ' ONLINE';
     END IF;
-
     log_message('DDL: ' || v_ddl);
-
     -- Create history record
     INSERT INTO T_COMPRESSION_HISTORY (
       owner, object_name, object_type,
@@ -671,17 +595,13 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
       p_compression_type, v_size_before,
       'COMPRESS', USER, v_ddl
     ) RETURNING history_id INTO v_history_id;
-
     COMMIT;
-
     -- Execute DDL
     BEGIN
       log_message('Executing compression...');
       EXECUTE IMMEDIATE v_ddl;
       log_message('Index compressed successfully');
-
       v_size_after := get_segment_size(p_owner, p_index_name, 'INDEX');
-
       -- Update history
       UPDATE T_COMPRESSION_HISTORY
       SET size_after_bytes = v_size_after,
@@ -690,12 +610,9 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
           status = 'SUCCESS',
           end_time = SYSTIMESTAMP
       WHERE history_id = v_history_id;
-
       COMMIT;
-
       log_message('New size: ' || ROUND(v_size_after / 1024 / 1024, 2) || ' MB');
       log_message('=== Index compression completed successfully ===');
-
     EXCEPTION
       WHEN OTHERS THEN
         UPDATE T_COMPRESSION_HISTORY
@@ -703,15 +620,11 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
             error_message = SUBSTR(SQLERRM, 1, 4000),
             end_time = SYSTIMESTAMP
         WHERE history_id = v_history_id;
-
         COMMIT;
-
         log_message('ERROR: ' || SQLERRM, 'ERROR');
         RAISE;
     END;
-
   END compress_index;
-
   /**
    * Compress a table partition preserving tablespace
    * CRITICAL: Preserves the partition's original tablespace
@@ -733,7 +646,6 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
     log_message('=== Starting partition compression ===');
     log_message('Partition: ' || p_owner || '.' || p_table_name || '.' || p_partition_name);
     log_message('Compression Type: ' || p_compression_type);
-
     -- Query partition tablespace to preserve it
     -- CRITICAL: Each partition may be in a different tablespace
     BEGIN
@@ -747,32 +659,24 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
       WHEN NO_DATA_FOUND THEN
         RAISE_APPLICATION_ERROR(-20001, 'Partition not found: ' || p_owner || '.' || p_table_name || '.' || p_partition_name);
     END;
-
     log_message('Current partition tablespace: ' || NVL(v_tablespace_name, 'NULL'));
-
     v_size_before := get_segment_size(p_owner, p_table_name || ':' || p_partition_name, 'TABLE PARTITION');
     log_message('Current size: ' || ROUND(v_size_before / 1024 / 1024, 2) || ' MB');
-
     -- Get compression clause
     v_compression_clause := get_compression_clause(p_compression_type);
-
     -- Build DDL with TABLESPACE preservation
     -- CRITICAL: Include TABLESPACE clause to preserve partition location
     v_ddl := 'ALTER TABLE ' || p_owner || '.' || p_table_name ||
              ' MOVE PARTITION ' || p_partition_name ||
              ' ' || v_compression_clause;
-
     IF v_tablespace_name IS NOT NULL THEN
       v_ddl := v_ddl || ' TABLESPACE ' || v_tablespace_name;
       log_message('Preserving partition tablespace: ' || v_tablespace_name);
     END IF;
-
     IF p_online AND p_compression_type IN (C_COMPRESS_BASIC, C_COMPRESS_OLTP) THEN
       v_ddl := v_ddl || ' ONLINE';
     END IF;
-
     log_message('DDL: ' || v_ddl);
-
     -- Create history record
     INSERT INTO T_COMPRESSION_HISTORY (
       owner, object_name, object_type,
@@ -783,15 +687,12 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
       p_compression_type, v_size_before,
       'COMPRESS', USER, v_ddl
     ) RETURNING history_id INTO v_history_id;
-
     COMMIT;
-
     -- Execute DDL
     BEGIN
       log_message('Executing partition compression...');
       EXECUTE IMMEDIATE v_ddl;
       log_message('Partition compressed successfully');
-
       -- Rebuild partition indexes
       FOR idx IN (
         SELECT i.index_name, i.tablespace_name
@@ -802,12 +703,10 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
         BEGIN
           v_ddl := 'ALTER INDEX ' || p_owner || '.' || idx.index_name ||
                    ' REBUILD PARTITION ' || p_partition_name;
-
           -- Preserve index partition tablespace
           IF idx.tablespace_name IS NOT NULL THEN
             v_ddl := v_ddl || ' TABLESPACE ' || idx.tablespace_name;
           END IF;
-
           EXECUTE IMMEDIATE v_ddl;
           log_message('Rebuilt index partition: ' || idx.index_name || '.' || p_partition_name);
         EXCEPTION
@@ -815,9 +714,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
             log_message('Warning: Failed to rebuild index partition: ' || SQLERRM, 'WARN');
         END;
       END LOOP;
-
       v_size_after := get_segment_size(p_owner, p_table_name || ':' || p_partition_name, 'TABLE PARTITION');
-
       -- Update history
       UPDATE T_COMPRESSION_HISTORY
       SET size_after_bytes = v_size_after,
@@ -826,12 +723,9 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
           status = 'SUCCESS',
           end_time = SYSTIMESTAMP
       WHERE history_id = v_history_id;
-
       COMMIT;
-
       log_message('New size: ' || ROUND(v_size_after / 1024 / 1024, 2) || ' MB');
       log_message('=== Partition compression completed ===');
-
     EXCEPTION
       WHEN OTHERS THEN
         UPDATE T_COMPRESSION_HISTORY
@@ -844,7 +738,6 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
         RAISE;
     END;
   END compress_partition;
-
   /**
    * Compress all partitions of a table preserving tablespaces
    * CRITICAL: Each partition's tablespace is individually preserved
@@ -862,7 +755,6 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
     log_message('=== Starting batch partition compression ===');
     log_message('Table: ' || p_owner || '.' || p_table_name);
     log_message('Compression Type: ' || p_compression_type);
-
     -- Process each partition individually to preserve its tablespace
     FOR part IN (
       SELECT partition_name, tablespace_name
@@ -874,7 +766,6 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
       v_partition_count := v_partition_count + 1;
       log_message('Processing partition ' || v_partition_count || ': ' || part.partition_name ||
                   ' (tablespace: ' || NVL(part.tablespace_name, 'NULL') || ')');
-
       BEGIN
         compress_partition(
           p_owner => p_owner,
@@ -891,13 +782,11 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
           -- Continue with next partition
       END;
     END LOOP;
-
     log_message('=== Batch partition compression completed ===');
     log_message('Total partitions: ' || v_partition_count);
     log_message('Successful: ' || v_success_count);
     log_message('Failed: ' || v_fail_count);
   END compress_all_partitions;
-
   /**
    * Compress LOB segments preserving tablespace
    * CRITICAL: Preserves LOB segment tablespace
@@ -919,7 +808,6 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
     log_message('=== Starting LOB compression ===');
     log_message('LOB: ' || p_owner || '.' || p_table_name || '.' || p_column_name);
     log_message('Compression Type: ' || p_compression_type);
-
     -- Query LOB segment information including tablespace
     -- CRITICAL: LOBs may be stored in different tablespaces than the base table
     BEGIN
@@ -933,13 +821,10 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
       WHEN NO_DATA_FOUND THEN
         RAISE_APPLICATION_ERROR(-20001, 'LOB column not found: ' || p_owner || '.' || p_table_name || '.' || p_column_name);
     END;
-
     log_message('LOB segment: ' || v_lob_segment_name);
     log_message('LOB tablespace: ' || NVL(v_lob_tablespace, 'NULL'));
-
     v_size_before := get_segment_size(p_owner, v_lob_segment_name, 'LOBSEGMENT');
     log_message('Current LOB size: ' || ROUND(v_size_before / 1024 / 1024, 2) || ' MB');
-
     -- Get compression clause for LOBs
     v_compression_clause := CASE UPPER(p_compression_type)
       WHEN 'HIGH' THEN 'COMPRESS HIGH'
@@ -948,21 +833,16 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
       WHEN 'NOCOMPRESS' THEN 'NOCOMPRESS'
       ELSE 'COMPRESS MEDIUM'
     END CASE;
-
     -- Build DDL to modify LOB storage with tablespace preservation
     -- CRITICAL: Include TABLESPACE clause to preserve LOB location
     v_ddl := 'ALTER TABLE ' || p_owner || '.' || p_table_name ||
              ' MODIFY LOB (' || p_column_name || ') (' || v_compression_clause;
-
     IF v_lob_tablespace IS NOT NULL THEN
       v_ddl := v_ddl || ' TABLESPACE ' || v_lob_tablespace;
       log_message('Preserving LOB tablespace: ' || v_lob_tablespace);
     END IF;
-
     v_ddl := v_ddl || ')';
-
     log_message('DDL: ' || v_ddl);
-
     -- Create history record
     INSERT INTO T_COMPRESSION_HISTORY (
       owner, object_name, object_type,
@@ -973,18 +853,14 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
       p_compression_type, v_size_before,
       'COMPRESS', USER, v_ddl
     ) RETURNING history_id INTO v_history_id;
-
     COMMIT;
-
     -- Execute DDL
     BEGIN
       log_message('Executing LOB compression...');
       EXECUTE IMMEDIATE v_ddl;
       log_message('LOB compressed successfully');
-
       -- Note: LOB compression may require moving data, check new size
       v_size_after := get_segment_size(p_owner, v_lob_segment_name, 'LOBSEGMENT');
-
       -- Update history
       UPDATE T_COMPRESSION_HISTORY
       SET size_after_bytes = v_size_after,
@@ -993,12 +869,9 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
           status = 'SUCCESS',
           end_time = SYSTIMESTAMP
       WHERE history_id = v_history_id;
-
       COMMIT;
-
       log_message('New LOB size: ' || ROUND(v_size_after / 1024 / 1024, 2) || ' MB');
       log_message('=== LOB compression completed ===');
-
     EXCEPTION
       WHEN OTHERS THEN
         UPDATE T_COMPRESSION_HISTORY
@@ -1011,7 +884,6 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
         RAISE;
     END;
   END compress_lob;
-
   /**
    * Execute recommendations
    */
@@ -1028,7 +900,6 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
     log_message('Strategy ID: ' || p_strategy_id);
     log_message('Max tables: ' || p_max_tables);
     log_message('Max size: ' || p_max_size_gb || ' GB');
-
     -- Process table recommendations
     FOR rec IN (
       SELECT r.owner, r.table_name, r.recommended_compression,
@@ -1044,7 +915,6 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
     ) LOOP
       EXIT WHEN v_tables_processed >= p_max_tables;
       EXIT WHEN v_total_size_gb >= v_max_size_bytes;
-
       BEGIN
         compress_table(
           p_owner => rec.owner,
@@ -1053,23 +923,18 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
           p_online => TRUE,
           p_dry_run => FALSE
         );
-
         v_tables_processed := v_tables_processed + 1;
         v_total_size_gb := v_total_size_gb + rec.size_bytes;
-
       EXCEPTION
         WHEN OTHERS THEN
           log_message('Failed to compress ' || rec.owner || '.' || rec.table_name || ': ' || SQLERRM, 'ERROR');
           -- Continue with next table
       END;
     END LOOP;
-
     log_message('=== Batch execution completed ===');
     log_message('Tables processed: ' || v_tables_processed);
     log_message('Total size processed: ' || ROUND(v_total_size_gb / 1024 / 1024 / 1024, 2) || ' GB');
-
   END execute_recommendations;
-
   /**
    * Rollback compression
    */
@@ -1084,16 +949,13 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
   BEGIN
     log_message('=== Starting compression rollback ===');
     log_message('History ID: ' || p_history_id);
-
     -- Get original compression state
     SELECT owner, object_name, object_type, compression_before
     INTO v_owner, v_object_name, v_object_type, v_compression_before
     FROM T_COMPRESSION_HISTORY
     WHERE history_id = p_history_id;
-
     log_message('Rolling back: ' || v_owner || '.' || v_object_name);
     log_message('Restoring compression: ' || v_compression_before);
-
     IF v_object_type = 'TABLE' THEN
       compress_table(
         p_owner => v_owner,
@@ -1110,16 +972,12 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
         p_online => TRUE
       );
     END IF;
-
     -- Mark as rolled back
     UPDATE T_COMPRESSION_HISTORY
     SET status = 'ROLLED_BACK'
     WHERE history_id = p_history_id;
-
     COMMIT;
-
     log_message('=== Rollback completed successfully ===');
-
   EXCEPTION
     WHEN NO_DATA_FOUND THEN
       RAISE_APPLICATION_ERROR(-20001, 'History record not found: ' || p_history_id);
@@ -1127,7 +985,6 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
       log_message('ERROR during rollback: ' || SQLERRM, 'ERROR');
       RAISE;
   END rollback_compression;
-
   /**
    * Get compression status
    */
@@ -1140,13 +997,11 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
     INTO v_status
     FROM T_COMPRESSION_HISTORY
     WHERE history_id = p_history_id;
-
     RETURN v_status;
   EXCEPTION
     WHEN NO_DATA_FOUND THEN
       RETURN 'NOT_FOUND';
   END get_compression_status;
-
 END PKG_COMPRESSION_EXECUTOR;
 /
 

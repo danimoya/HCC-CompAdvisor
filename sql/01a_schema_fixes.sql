@@ -188,37 +188,29 @@ SELECT
     RULE_ID,
     STRATEGY_ID,
     OBJECT_TYPE,
-
     -- Original column names
     HOTNESS_MIN,
     HOTNESS_MAX,
     DML_RATIO_THRESHOLD,
-
     -- Alias columns for 02_strategies.sql compatibility
     HOTNESS_MIN AS MIN_HOTNESS_SCORE,
     HOTNESS_MAX AS MAX_HOTNESS_SCORE,
     MIN_WRITE_RATIO,
     MAX_WRITE_RATIO,
-
     -- Other columns
     COMPRESSION_TYPE,
     PRIORITY,
     ENABLED_FLAG,
     RULE_DESCRIPTION
 FROM T_STRATEGY_RULES;
-
 COMMENT ON VIEW V_STRATEGY_RULES IS
 'Compatibility view for T_STRATEGY_RULES providing column name aliases (MIN_HOTNESS_SCORE/MAX_HOTNESS_SCORE)';
-
 DBMS_OUTPUT.PUT_LINE('✓ View V_STRATEGY_RULES created for column name compatibility');
-
 -- ============================================================================
 -- SECTION 5: CREATE SYNONYM FOR TABLE NAME COMPATIBILITY
 -- ============================================================================
-
 PROMPT
 PROMPT Creating table name synonym for backward compatibility...
-
 DECLARE
     v_synonym_exists NUMBER;
 BEGIN
@@ -227,11 +219,9 @@ BEGIN
     INTO v_synonym_exists
     FROM user_synonyms
     WHERE synonym_name = 'T_STRATEGIES';
-
     IF v_synonym_exists = 0 THEN
         -- Create the synonym
         EXECUTE IMMEDIATE 'CREATE SYNONYM T_STRATEGIES FOR T_COMPRESSION_STRATEGIES';
-
         DBMS_OUTPUT.PUT_LINE('✓ Synonym T_STRATEGIES created for T_COMPRESSION_STRATEGIES');
     ELSE
         DBMS_OUTPUT.PUT_LINE('  Synonym T_STRATEGIES already exists - skipping');

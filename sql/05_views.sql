@@ -40,7 +40,6 @@ WHERE
 ORDER BY
     r.potential_savings_mb DESC,
     r.savings_pct DESC;
-
 COMMENT ON TABLE v_compression_candidates IS 'All objects with actionable compression recommendations, prioritized by potential space savings';
 -- ============================================================================
 -- View: V_COMPRESSION_SUMMARY
@@ -76,7 +75,6 @@ GROUP BY
     r.object_type
 ORDER BY
     total_potential_savings_mb DESC;
-
 COMMENT ON TABLE v_compression_summary IS 'Aggregated compression statistics by owner and object type';
 -- ============================================================================
 -- View: V_COMPRESSION_HISTORY
@@ -109,7 +107,6 @@ FROM
     hcc_execution_history h
 ORDER BY
     h.start_time DESC;
-
 COMMENT ON TABLE v_compression_history IS 'Historical record of all compression execution operations';
 -- ============================================================================
 -- View: V_HOT_OBJECTS
@@ -141,7 +138,6 @@ WHERE
 ORDER BY
     r.hotness_score DESC,
     r.current_size_mb DESC;
-
 COMMENT ON TABLE v_hot_objects IS 'Write-intensive objects with high hotness scores requiring OLTP or no compression';
 -- ============================================================================
 -- View: V_COLD_OBJECTS
@@ -175,7 +171,6 @@ WHERE
 ORDER BY
     r.potential_savings_mb DESC,
     r.hotness_score ASC;
-
 COMMENT ON TABLE v_cold_objects IS 'Rarely accessed objects with low hotness scores, ideal candidates for aggressive compression';
 -- ============================================================================
 -- View: V_COMPRESSION_EFFECTIVENESS
@@ -206,7 +201,6 @@ GROUP BY
     h.object_type
 ORDER BY
     total_space_saved_mb DESC;
-
 COMMENT ON TABLE v_compression_effectiveness IS 'Performance metrics and effectiveness analysis of compression executions';
 -- ============================================================================
 -- View: V_STRATEGY_RECOMMENDATIONS
@@ -252,7 +246,6 @@ HAVING
     COUNT(DISTINCT strategy_name) > 1  -- Only show objects analyzed by multiple strategies
 ORDER BY
     MAX(current_size_mb) DESC;
-
 COMMENT ON TABLE v_strategy_recommendations IS 'Comparison of compression recommendations across different analysis strategies';
 -- ============================================================================
 -- View: V_SPACE_ANALYSIS
@@ -303,7 +296,6 @@ GROUP BY
     f.used_space_mb
 ORDER BY
     potential_savings_mb DESC;
-
 COMMENT ON TABLE v_space_analysis IS 'Space usage and potential savings analysis by tablespace';
 -- ============================================================================
 -- View: V_EXECUTION_QUEUE
@@ -361,7 +353,6 @@ WHERE
 ORDER BY
     r.potential_savings_mb DESC,
     r.savings_pct DESC;
-
 COMMENT ON TABLE v_execution_queue IS 'Prioritized queue of compression operations ready for execution';
 -- ============================================================================
 -- View: V_ADVISOR_SUMMARY
@@ -407,7 +398,6 @@ SELECT
      FROM hcc_analysis_runs
      WHERE run_id = (SELECT MAX(run_id) FROM hcc_analysis_runs)) AS last_strategy_used
 FROM DUAL;
-
 COMMENT ON TABLE v_advisor_summary IS 'Executive dashboard summary with key metrics and statistics';
 -- ============================================================================
 -- View: V_COMPRESSION_ANALYSIS_WITH_AGE
@@ -464,13 +454,11 @@ SELECT
     last_updated
 FROM
     t_compression_analysis;
-
 COMMENT ON TABLE v_compression_analysis_with_age IS 'T_COMPRESSION_ANALYSIS with calculated DATA_AGE_DAYS (days since LAST_ANALYZED)';
 -- ============================================================================
 -- Grant SELECT privileges on views to PUBLIC or specific role
 -- ============================================================================
 PROMPT Granting SELECT privileges on views...
-
 GRANT SELECT ON v_compression_candidates TO PUBLIC;
 GRANT SELECT ON v_compression_summary TO PUBLIC;
 GRANT SELECT ON v_compression_history TO PUBLIC;
@@ -482,12 +470,10 @@ GRANT SELECT ON v_strategy_recommendations TO PUBLIC;
 GRANT SELECT ON v_space_analysis TO PUBLIC;
 GRANT SELECT ON v_execution_queue TO PUBLIC;
 GRANT SELECT ON v_advisor_summary TO PUBLIC;
-
 -- ============================================================================
 -- Create synonyms for easier access
 -- ============================================================================
 PROMPT Creating public synonyms...
-
 CREATE OR REPLACE PUBLIC SYNONYM v_compression_candidates FOR v_compression_candidates;
 CREATE OR REPLACE PUBLIC SYNONYM v_compression_summary FOR v_compression_summary;
 CREATE OR REPLACE PUBLIC SYNONYM v_compression_history FOR v_compression_history;
@@ -499,7 +485,6 @@ CREATE OR REPLACE PUBLIC SYNONYM v_strategy_recommendations FOR v_strategy_recom
 CREATE OR REPLACE PUBLIC SYNONYM v_space_analysis FOR v_space_analysis;
 CREATE OR REPLACE PUBLIC SYNONYM v_execution_queue FOR v_execution_queue;
 CREATE OR REPLACE PUBLIC SYNONYM v_advisor_summary FOR v_advisor_summary;
-
 -- ============================================================================
 -- Verification Query
 -- ============================================================================
@@ -508,7 +493,6 @@ PROMPT =========================================================================
 PROMPT View Creation Summary
 PROMPT ============================================================================
 PROMPT
-
 SELECT
     view_name,
     text_length,
@@ -530,7 +514,6 @@ WHERE
     view_name LIKE 'V\_%' ESCAPE '\'
 ORDER BY
     view_name;
-
 PROMPT
 PROMPT ============================================================================
 PROMPT Compression Advisor Views Created Successfully

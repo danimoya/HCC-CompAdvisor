@@ -100,17 +100,14 @@ CREATE TABLE T_COMPRESSION_STRATEGIES (
         HOTNESS_THRESHOLD_WARM < HOTNESS_THRESHOLD_HOT
     )
 );
-
 COMMENT ON TABLE T_COMPRESSION_STRATEGIES IS 'Compression recommendation strategies and threshold configurations';
 COMMENT ON COLUMN T_COMPRESSION_STRATEGIES.HOTNESS_THRESHOLD_HOT IS 'Score >= this value = HOT (minimal compression)';
 COMMENT ON COLUMN T_COMPRESSION_STRATEGIES.HOTNESS_THRESHOLD_WARM IS 'Score >= this value = WARM (OLTP compression)';
 COMMENT ON COLUMN T_COMPRESSION_STRATEGIES.HOTNESS_THRESHOLD_COOL IS 'Score >= this value = COOL (ADV_LOW compression)';
-
 -- Ensure only one default strategy exists
 CREATE UNIQUE INDEX UNQ_DEFAULT_STRATEGY ON T_COMPRESSION_STRATEGIES(
     CASE WHEN IS_DEFAULT = 'Y' THEN 'DEFAULT' END
 );
-
 -- ----------------------------------------------------------------------------
 -- Table: T_STRATEGY_RULES
 -- Purpose: Detailed rules for compression type selection by strategy
@@ -146,18 +143,13 @@ CREATE TABLE T_STRATEGY_RULES (
         HOTNESS_MIN >= 0 AND HOTNESS_MAX <= 100 AND HOTNESS_MIN <= HOTNESS_MAX
     )
 );
-
 COMMENT ON TABLE T_STRATEGY_RULES IS 'Detailed rules for compression type selection within each strategy';
-
 CREATE INDEX IDX_STRATEGY_RULES_STRATEGY ON T_STRATEGY_RULES(STRATEGY_ID, PRIORITY DESC);
-
 -- ============================================================================
 -- SECTION 2: ANALYSIS RESULT TABLES
 -- ============================================================================
-
 PROMPT
 PROMPT Creating analysis result tables...
-
 -- ----------------------------------------------------------------------------
 -- Table: T_COMPRESSION_ANALYSIS
 -- Purpose: Primary table for table/IOT compression analysis results
@@ -275,37 +267,29 @@ CREATE TABLE T_COMPRESSION_ANALYSIS (
         (ADV_HIGH_RATIO IS NULL OR ADV_HIGH_RATIO >= 0.5)
     )
 );
-
 COMMENT ON TABLE T_COMPRESSION_ANALYSIS IS 'Compression analysis results for tables and IOTs (Oracle 23c Free)';
 COMMENT ON COLUMN T_COMPRESSION_ANALYSIS.BASIC_RATIO IS 'Compression ratio for COMPRESS BASIC';
 COMMENT ON COLUMN T_COMPRESSION_ANALYSIS.OLTP_RATIO IS 'Compression ratio for COMPRESS ADVANCED (OLTP)';
 COMMENT ON COLUMN T_COMPRESSION_ANALYSIS.ADV_LOW_RATIO IS 'Compression ratio for COMPRESS FOR QUERY LOW (requires license)';
 COMMENT ON COLUMN T_COMPRESSION_ANALYSIS.ADV_HIGH_RATIO IS 'Compression ratio for COMPRESS FOR QUERY HIGH (requires license)';
-
 -- Indexes for Performance
 CREATE INDEX IDX_COMP_ANALYSIS_OBJECT ON T_COMPRESSION_ANALYSIS(
     OWNER, OBJECT_NAME
 );
-
 CREATE INDEX IDX_COMP_ANALYSIS_HOTNESS ON T_COMPRESSION_ANALYSIS(
     HOTNESS_SCORE
 );
-
 CREATE INDEX IDX_COMP_ANALYSIS_RUN ON T_COMPRESSION_ANALYSIS(
     ADVISOR_RUN_ID, ANALYSIS_DATE DESC
 );
-
 CREATE INDEX IDX_COMP_ANALYSIS_RECOMMENDATION ON T_COMPRESSION_ANALYSIS(
     ADVISABLE_COMPRESSION
 );
-
 CREATE BITMAP INDEX IDX_COMP_ANALYSIS_TYPE_BMP ON T_COMPRESSION_ANALYSIS(
     ADVISABLE_COMPRESSION
 );
-
 -- Removed: HOTNESS_CATEGORY is a virtual generated column and cannot be indexed in Oracle
 -- Filtering by hotness_category should use HOTNESS_SCORE ranges via views instead
-
 -- ----------------------------------------------------------------------------
 -- Table: T_INDEX_COMPRESSION_ANALYSIS
 -- Purpose: Index compression analysis results
@@ -361,17 +345,13 @@ CREATE TABLE T_INDEX_COMPRESSION_ANALYSIS (
         ADVISABLE_COMPRESSION IN ('NONE', 'PREFIX', 'ADVANCED_LOW', 'ADVANCED_HIGH')
     )
 );
-
 COMMENT ON TABLE T_INDEX_COMPRESSION_ANALYSIS IS 'Index compression analysis results';
-
 CREATE INDEX IDX_INDEX_COMP_NAME ON T_INDEX_COMPRESSION_ANALYSIS(
     INDEX_OWNER, INDEX_NAME
 );
-
 CREATE INDEX IDX_INDEX_COMP_TABLE ON T_INDEX_COMPRESSION_ANALYSIS(
     TABLE_OWNER, TABLE_NAME
 );
-
 -- ----------------------------------------------------------------------------
 -- Table: T_LOB_COMPRESSION_ANALYSIS
 -- Purpose: LOB (CLOB/BLOB) compression analysis results (SecureFiles only)
@@ -431,20 +411,15 @@ CREATE TABLE T_LOB_COMPRESSION_ANALYSIS (
     ),
     CONSTRAINT CHK_LOB_SECUREFILE CHECK (SECUREFILE IN ('YES', 'NO'))
 );
-
 COMMENT ON TABLE T_LOB_COMPRESSION_ANALYSIS IS 'LOB compression analysis results (SecureFiles only)';
-
 CREATE INDEX IDX_LOB_COMP_TABLE ON T_LOB_COMPRESSION_ANALYSIS(
     TABLE_OWNER, TABLE_NAME, COLUMN_NAME
 );
-
 -- ============================================================================
 -- SECTION 3: EXECUTION HISTORY TABLES
 -- ============================================================================
-
 PROMPT
 PROMPT Creating execution history tables...
-
 -- ----------------------------------------------------------------------------
 -- Table: T_COMPRESSION_HISTORY
 -- Purpose: Complete audit trail of all compression execution operations
@@ -555,37 +530,28 @@ CREATE TABLE T_COMPRESSION_HISTORY (
         ROLLBACK_POSSIBLE IN ('Y', 'N')
     )
 );
-
 COMMENT ON TABLE T_COMPRESSION_HISTORY IS 'Complete audit trail of compression execution operations';
-
 -- Indexes
 CREATE UNIQUE INDEX UNQ_HISTORY_EXECUTION ON T_COMPRESSION_HISTORY(
     EXECUTION_ID
 ) WHERE EXECUTION_ID IS NOT NULL;
-
 CREATE INDEX IDX_HISTORY_OBJECT ON T_COMPRESSION_HISTORY(
     OWNER, OBJECT_NAME, START_TIME DESC
 );
-
 CREATE INDEX IDX_HISTORY_STATUS ON T_COMPRESSION_HISTORY(
     OPERATION_STATUS, START_TIME DESC
 );
-
 CREATE INDEX IDX_HISTORY_COMPRESSION_TYPE ON T_COMPRESSION_HISTORY(
     COMPRESSION_TYPE_APPLIED, OPERATION_STATUS
 );
-
 CREATE BITMAP INDEX IDX_HISTORY_STATUS_BMP ON T_COMPRESSION_HISTORY(
     OPERATION_STATUS
 );
-
 -- ============================================================================
 -- SECTION 4: ADVISOR RUN TRACKING
 -- ============================================================================
-
 PROMPT
 PROMPT Creating advisor run tracking tables...
-
 -- ----------------------------------------------------------------------------
 -- Table: T_ADVISOR_RUN
 -- Purpose: Track analysis execution sessions and metadata
@@ -660,56 +626,43 @@ CREATE TABLE T_ADVISOR_RUN (
         INCLUDE_PARTITIONS IN ('Y', 'N')
     )
 );
-
 COMMENT ON TABLE T_ADVISOR_RUN IS 'Analysis execution sessions and metadata';
-
 -- Indexes
 CREATE INDEX IDX_ADVISOR_RUN_TIME ON T_ADVISOR_RUN(
     START_TIME DESC, RUN_STATUS
 );
-
 CREATE INDEX IDX_ADVISOR_RUN_SCHEMA ON T_ADVISOR_RUN(
     SCHEMA_FILTER, START_TIME DESC
 );
-
 CREATE BITMAP INDEX IDX_ADVISOR_RUN_STATUS_BMP ON T_ADVISOR_RUN(
     RUN_STATUS
 );
-
 -- ============================================================================
 -- SECTION 5: FOREIGN KEY CONSTRAINTS (Deferred for circular dependencies)
 -- ============================================================================
-
 PROMPT
 PROMPT Adding foreign key constraints...
-
 ALTER TABLE T_COMPRESSION_ANALYSIS
 ADD CONSTRAINT FK_ANALYSIS_RUN
 FOREIGN KEY (ADVISOR_RUN_ID) REFERENCES T_ADVISOR_RUN(RUN_ID)
 ON DELETE CASCADE;
-
 ALTER TABLE T_INDEX_COMPRESSION_ANALYSIS
 ADD CONSTRAINT FK_INDEX_ANALYSIS_RUN
 FOREIGN KEY (ADVISOR_RUN_ID) REFERENCES T_ADVISOR_RUN(RUN_ID)
 ON DELETE CASCADE;
-
 ALTER TABLE T_LOB_COMPRESSION_ANALYSIS
 ADD CONSTRAINT FK_LOB_ANALYSIS_RUN
 FOREIGN KEY (ADVISOR_RUN_ID) REFERENCES T_ADVISOR_RUN(RUN_ID)
 ON DELETE CASCADE;
-
 ALTER TABLE T_COMPRESSION_HISTORY
 ADD CONSTRAINT FK_HISTORY_ANALYSIS
 FOREIGN KEY (ANALYSIS_ID) REFERENCES T_COMPRESSION_ANALYSIS(ANALYSIS_ID)
 ON DELETE SET NULL;
-
 -- ============================================================================
 -- SECTION 6: SEQUENCES
 -- ============================================================================
-
 PROMPT
 PROMPT Creating sequences...
-
 DECLARE
     v_sequence_exists NUMBER;
 BEGIN
@@ -718,12 +671,10 @@ BEGIN
     INTO v_sequence_exists
     FROM user_sequences
     WHERE sequence_name = 'SEQ_EXECUTION_ID';
-
     IF v_sequence_exists = 0 THEN
         -- Create the sequence
         EXECUTE IMMEDIATE 'CREATE SEQUENCE SEQ_EXECUTION_ID START WITH 1 INCREMENT BY 1 CACHE 20 NOCYCLE';
         DBMS_OUTPUT.PUT_LINE('✓ Sequence SEQ_EXECUTION_ID created successfully');
-
         -- Add comment
         EXECUTE IMMEDIATE 'COMMENT ON SEQUENCE SEQ_EXECUTION_ID IS ''Unique identifier for compression execution batches''';
     ELSE

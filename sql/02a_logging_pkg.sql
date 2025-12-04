@@ -137,7 +137,6 @@ PROMPT
 PROMPT Creating PKG_COMPRESSION_LOG package specification...
 
 CREATE OR REPLACE PACKAGE pkg_compression_log AS
-
   /***************************************************************************
    * Package: PKG_COMPRESSION_LOG
    * Description: Centralized logging infrastructure for compression advisor
@@ -152,24 +151,19 @@ CREATE OR REPLACE PACKAGE pkg_compression_log AS
    *   - Performance metrics integration
    *   - Automatic log retention management
    ***************************************************************************/
-
   -- Package version
   c_version CONSTANT VARCHAR2(10) := '1.0.0';
-
   -- Log levels (integer for performance comparison)
   c_level_debug   CONSTANT PLS_INTEGER := 10;
   c_level_info    CONSTANT PLS_INTEGER := 20;
   c_level_warning CONSTANT PLS_INTEGER := 30;
   c_level_error   CONSTANT PLS_INTEGER := 40;
   c_level_fatal   CONSTANT PLS_INTEGER := 50;
-
   -- Global log level threshold (set via set_log_level)
   g_log_level PLS_INTEGER := c_level_info;  -- Default: INFO and above
-
   -- ========================================================================
   -- Core Logging Procedures
   -- ========================================================================
-
   /**
    * Log DEBUG level message
    * Use for: Detailed diagnostic information, variable values, flow control
@@ -193,7 +187,6 @@ CREATE OR REPLACE PACKAGE pkg_compression_log AS
     p_advisor_run_id IN NUMBER DEFAULT NULL,
     p_analysis_id   IN NUMBER DEFAULT NULL
   );
-
   /**
    * Log INFO level message
    * Use for: Normal operation messages, successful completions, milestones
@@ -217,7 +210,6 @@ CREATE OR REPLACE PACKAGE pkg_compression_log AS
     p_advisor_run_id IN NUMBER DEFAULT NULL,
     p_analysis_id   IN NUMBER DEFAULT NULL
   );
-
   /**
    * Log WARNING level message
    * Use for: Unexpected conditions that don't prevent operation, deprecations
@@ -241,7 +233,6 @@ CREATE OR REPLACE PACKAGE pkg_compression_log AS
     p_advisor_run_id IN NUMBER DEFAULT NULL,
     p_analysis_id   IN NUMBER DEFAULT NULL
   );
-
   /**
    * Log ERROR level message
    * Use for: Error conditions, exceptions, operation failures
@@ -267,7 +258,6 @@ CREATE OR REPLACE PACKAGE pkg_compression_log AS
     p_advisor_run_id IN NUMBER DEFAULT NULL,
     p_analysis_id   IN NUMBER DEFAULT NULL
   );
-
   /**
    * Log FATAL level message
    * Use for: Critical system failures, unrecoverable errors
@@ -287,11 +277,9 @@ CREATE OR REPLACE PACKAGE pkg_compression_log AS
     p_object_owner  IN VARCHAR2 DEFAULT NULL,
     p_object_name   IN VARCHAR2 DEFAULT NULL
   );
-
   -- ========================================================================
   -- Configuration Procedures
   -- ========================================================================
-
   /**
    * Set the global log level threshold
    * Only messages at or above this level will be logged
@@ -299,18 +287,15 @@ CREATE OR REPLACE PACKAGE pkg_compression_log AS
    * @param p_level Log level (DEBUG=10, INFO=20, WARNING=30, ERROR=40, FATAL=50)
    */
   PROCEDURE set_log_level(p_level IN PLS_INTEGER);
-
   /**
    * Get the current log level threshold
    *
    * @return Current log level
    */
   FUNCTION get_log_level RETURN PLS_INTEGER;
-
   -- ========================================================================
   -- Maintenance Procedures
   -- ========================================================================
-
   /**
    * Purge old log entries
    *
@@ -322,7 +307,6 @@ CREATE OR REPLACE PACKAGE pkg_compression_log AS
     p_retention_days IN NUMBER DEFAULT 90,
     p_log_level      IN VARCHAR2 DEFAULT NULL
   ) RETURN NUMBER;
-
   /**
    * Get log statistics
    *
@@ -330,7 +314,6 @@ CREATE OR REPLACE PACKAGE pkg_compression_log AS
    * @return Cursor with statistics
    */
   FUNCTION get_log_stats(p_days IN NUMBER DEFAULT 7) RETURN SYS_REFCURSOR;
-
   /**
    * Archive old logs to archive table
    *
@@ -338,7 +321,6 @@ CREATE OR REPLACE PACKAGE pkg_compression_log AS
    * @return Number of rows archived
    */
   FUNCTION archive_logs(p_archive_days IN NUMBER DEFAULT 30) RETURN NUMBER;
-
 END pkg_compression_log;
 /
 
@@ -350,11 +332,9 @@ PROMPT
 PROMPT Creating PKG_COMPRESSION_LOG package body...
 
 CREATE OR REPLACE PACKAGE BODY pkg_compression_log AS
-
   /***************************************************************************
    * Private Procedures and Functions
    ***************************************************************************/
-
   /**
    * Internal procedure to write log entry with full context capture
    * Uses autonomous transaction to ensure logging survives rollbacks
@@ -374,7 +354,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_log AS
     p_execution_id  IN NUMBER DEFAULT NULL
   ) IS
     PRAGMA AUTONOMOUS_TRANSACTION;
-
     v_session_id       NUMBER;
     v_session_user     VARCHAR2(128);
     v_os_user          VARCHAR2(128);
@@ -387,7 +366,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_log AS
     v_program_name     VARCHAR2(64);
     v_error_backtrace  VARCHAR2(4000);
     v_call_stack       VARCHAR2(4000);
-
   BEGIN
     -- Capture session context
     BEGIN
@@ -419,7 +397,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_log AS
         -- If context capture fails, continue with NULLs
         NULL;
     END;
-
     -- Capture error backtrace if error
     IF p_error_code IS NOT NULL THEN
       BEGIN
@@ -431,7 +408,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_log AS
           v_call_stack := NULL;
       END;
     END IF;
-
     -- Insert log entry
     INSERT INTO T_COMPRESSION_LOG (
       LOG_LEVEL,
@@ -486,21 +462,17 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_log AS
       p_analysis_id,
       p_execution_id
     );
-
     -- Commit the autonomous transaction
     COMMIT;
-
   EXCEPTION
     WHEN OTHERS THEN
       -- If logging fails, rollback and silently continue
       -- We don't want logging failures to break the application
       ROLLBACK;
   END write_log;
-
   /***************************************************************************
    * Public Procedures Implementation
    ***************************************************************************/
-
   -- ========================================================================
   -- log_debug: Debug level logging
   -- ========================================================================
@@ -530,7 +502,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_log AS
       );
     END IF;
   END log_debug;
-
   -- ========================================================================
   -- log_info: Info level logging
   -- ========================================================================
@@ -560,7 +531,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_log AS
       );
     END IF;
   END log_info;
-
   -- ========================================================================
   -- log_warning: Warning level logging
   -- ========================================================================
@@ -590,7 +560,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_log AS
       );
     END IF;
   END log_warning;
-
   -- ========================================================================
   -- log_error: Error level logging with error details
   -- ========================================================================
@@ -625,7 +594,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_log AS
         v_error_code := SQLCODE;
         v_error_msg := SQLERRM;
       END IF;
-
       write_log(
         p_log_level     => 'ERROR',
         p_package       => p_package,
@@ -641,7 +609,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_log AS
       );
     END IF;
   END log_error;
-
   -- ========================================================================
   -- log_fatal: Fatal level logging
   -- ========================================================================
@@ -665,7 +632,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_log AS
       v_error_code := SQLCODE;
       v_error_msg := SQLERRM;
     END IF;
-
     write_log(
       p_log_level     => 'FATAL',
       p_package       => p_package,
@@ -677,11 +643,9 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_log AS
       p_object_name   => p_object_name
     );
   END log_fatal;
-
   -- ========================================================================
   -- Configuration Procedures
   -- ========================================================================
-
   PROCEDURE set_log_level(p_level IN PLS_INTEGER) IS
   BEGIN
     IF p_level BETWEEN c_level_debug AND c_level_fatal THEN
@@ -698,16 +662,13 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_log AS
       );
     END IF;
   END set_log_level;
-
   FUNCTION get_log_level RETURN PLS_INTEGER IS
   BEGIN
     RETURN g_log_level;
   END get_log_level;
-
   -- ========================================================================
   -- Maintenance Procedures
   -- ========================================================================
-
   FUNCTION purge_logs(
     p_retention_days IN NUMBER DEFAULT 90,
     p_log_level      IN VARCHAR2 DEFAULT NULL
@@ -723,24 +684,20 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_log AS
       DELETE FROM T_COMPRESSION_LOG
       WHERE LOG_DATE < SYSDATE - p_retention_days;
     END IF;
-
     v_rows_deleted := SQL%ROWCOUNT;
     COMMIT;
-
     log_info(
       'PKG_COMPRESSION_LOG',
       'purge_logs',
       'Purged ' || v_rows_deleted || ' log entries older than ' ||
       p_retention_days || ' days'
     );
-
     RETURN v_rows_deleted;
   EXCEPTION
     WHEN OTHERS THEN
       ROLLBACK;
       RAISE;
   END purge_logs;
-
   FUNCTION get_log_stats(p_days IN NUMBER DEFAULT 7) RETURN SYS_REFCURSOR IS
     v_cursor SYS_REFCURSOR;
   BEGIN
@@ -764,10 +721,8 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_log AS
           WHEN 'INFO' THEN 4
           WHEN 'DEBUG' THEN 5
         END;
-
     RETURN v_cursor;
   END get_log_stats;
-
   FUNCTION archive_logs(p_archive_days IN NUMBER DEFAULT 30) RETURN NUMBER IS
     PRAGMA AUTONOMOUS_TRANSACTION;
     v_rows_archived NUMBER := 0;
@@ -779,39 +734,31 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_log AS
       SELECT COUNT(*) INTO v_count
       FROM user_tables
       WHERE table_name = 'T_COMPRESSION_LOG_ARCHIVE';
-
       IF v_count = 0 THEN
         EXECUTE IMMEDIATE 'CREATE TABLE T_COMPRESSION_LOG_ARCHIVE AS SELECT * FROM T_COMPRESSION_LOG WHERE 1=0';
       END IF;
     END;
-
     -- Archive old logs
     INSERT INTO T_COMPRESSION_LOG_ARCHIVE
     SELECT * FROM T_COMPRESSION_LOG
     WHERE LOG_DATE < SYSDATE - p_archive_days;
-
     v_rows_archived := SQL%ROWCOUNT;
-
     -- Delete archived logs from main table
     DELETE FROM T_COMPRESSION_LOG
     WHERE LOG_DATE < SYSDATE - p_archive_days;
-
     COMMIT;
-
     log_info(
       'PKG_COMPRESSION_LOG',
       'archive_logs',
       'Archived ' || v_rows_archived || ' log entries older than ' ||
       p_archive_days || ' days'
     );
-
     RETURN v_rows_archived;
   EXCEPTION
     WHEN OTHERS THEN
       ROLLBACK;
       RAISE;
   END archive_logs;
-
 END pkg_compression_log;
 /
 

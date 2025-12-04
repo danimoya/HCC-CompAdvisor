@@ -14,19 +14,15 @@
 -- ============================================================================
 
 CREATE OR REPLACE PACKAGE pkg_compression_advisor AS
-
   -- Package version
   c_version CONSTANT VARCHAR2(10) := '1.0.0';
-
   -- Analysis strategies
   c_strategy_aggressive CONSTANT NUMBER := 1;
   c_strategy_balanced CONSTANT NUMBER := 2;
   c_strategy_conservative CONSTANT NUMBER := 3;
-
   -- ========================================================================
   -- Main Analysis Procedures
   -- ========================================================================
-
   /**
    * Run comprehensive compression analysis for schema(s)
    * @param p_owner Schema owner (NULL = all non-system schemas)
@@ -38,7 +34,6 @@ CREATE OR REPLACE PACKAGE pkg_compression_advisor AS
     p_strategy_id IN NUMBER DEFAULT 2,
     p_parallel_degree IN NUMBER DEFAULT 4
   );
-
   /**
    * Analyze compression potential for a specific table
    * @param p_owner Schema owner
@@ -50,7 +45,6 @@ CREATE OR REPLACE PACKAGE pkg_compression_advisor AS
     p_table_name IN VARCHAR2,
     p_strategy_id IN NUMBER DEFAULT 2
   );
-
   /**
    * Analyze compression potential for a specific index
    * @param p_owner Schema owner
@@ -62,7 +56,6 @@ CREATE OR REPLACE PACKAGE pkg_compression_advisor AS
     p_index_name IN VARCHAR2,
     p_strategy_id IN NUMBER DEFAULT 2
   );
-
   /**
    * Analyze compression potential for a specific LOB column
    * @param p_owner Schema owner
@@ -76,11 +69,9 @@ CREATE OR REPLACE PACKAGE pkg_compression_advisor AS
     p_column_name IN VARCHAR2,
     p_strategy_id IN NUMBER DEFAULT 2
   );
-
   -- ========================================================================
   -- Recommendation and Reporting Functions
   -- ========================================================================
-
   /**
    * Get compression recommendations based on analysis
    * @param p_strategy_id Filter by strategy
@@ -91,7 +82,6 @@ CREATE OR REPLACE PACKAGE pkg_compression_advisor AS
     p_strategy_id IN NUMBER DEFAULT 2,
     p_min_savings_pct IN NUMBER DEFAULT 20
   ) RETURN SYS_REFCURSOR;
-
   /**
    * Generate DDL statements for applying compression
    * @param p_recommendation_id Specific recommendation ID (NULL = all)
@@ -100,7 +90,6 @@ CREATE OR REPLACE PACKAGE pkg_compression_advisor AS
   FUNCTION generate_ddl(
     p_recommendation_id IN NUMBER DEFAULT NULL
   ) RETURN SYS_REFCURSOR;
-
   /**
    * Calculate potential space savings across all recommendations
    * @param p_strategy_id Filter by strategy
@@ -109,11 +98,9 @@ CREATE OR REPLACE PACKAGE pkg_compression_advisor AS
   FUNCTION calculate_total_savings(
     p_strategy_id IN NUMBER DEFAULT NULL
   ) RETURN NUMBER;
-
   -- ========================================================================
   -- Utility Procedures
   -- ========================================================================
-
   /**
    * Clear old analysis results
    * @param p_days_old Number of days to retain (default 30)
@@ -121,7 +108,6 @@ CREATE OR REPLACE PACKAGE pkg_compression_advisor AS
   PROCEDURE cleanup_old_results(
     p_days_old IN NUMBER DEFAULT 30
   );
-
   /**
    * Reset analysis for specific object
    * @param p_owner Schema owner
@@ -133,32 +119,24 @@ CREATE OR REPLACE PACKAGE pkg_compression_advisor AS
     p_object_name IN VARCHAR2,
     p_object_type IN VARCHAR2
   );
-
 END pkg_compression_advisor;
 /
 
 CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
-
   -- ========================================================================
   -- Private Types and Variables
   -- ========================================================================
-
   TYPE t_strategy_rules IS TABLE OF t_strategy_rules%ROWTYPE
     INDEX BY PLS_INTEGER;
-
   g_strategy_rules t_strategy_rules;
   g_rules_loaded BOOLEAN := FALSE;
-
   TYPE t_partition_list IS TABLE OF VARCHAR2(128);
-
   -- Compression type mappings for Oracle 23c Free
   TYPE t_compression_map IS TABLE OF VARCHAR2(30) INDEX BY VARCHAR2(30);
   g_compression_map t_compression_map;
-
   -- ========================================================================
   -- Private Utility Functions
   -- ========================================================================
-
   /**
    * Initialize compression type mappings
    * Note: Actual compression type selection is platform-aware via PKG_EXADATA_DETECTION
@@ -173,23 +151,19 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
     g_compression_map('BASIC') := 'COMPRESS BASIC';
     g_compression_map('OLTP') := 'COMPRESS FOR OLTP';
     g_compression_map('ADVANCED') := 'COMPRESS FOR OLTP';
-
     -- Index compression mappings
     g_compression_map('INDEX_ADVANCED_LOW') := 'COMPRESS ADVANCED LOW';
     g_compression_map('INDEX_ADVANCED_HIGH') := 'COMPRESS ADVANCED HIGH';
-
     -- LOB compression mappings
     g_compression_map('LOB_LOW') := 'COMPRESS LOW';
     g_compression_map('LOB_MEDIUM') := 'COMPRESS MEDIUM';
     g_compression_map('LOB_HIGH') := 'COMPRESS HIGH';
-
     -- HCC COMPRESSION TYPES (Exadata - enabled via PKG_EXADATA_DETECTION):
     -- - QUERY_LOW: COMPRESS FOR QUERY LOW
     -- - QUERY_HIGH: COMPRESS FOR QUERY HIGH
     -- - ARCHIVE_LOW: COMPRESS FOR ARCHIVE LOW
     -- - ARCHIVE_HIGH: COMPRESS FOR ARCHIVE HIGH
   END init_compression_map;
-
   /**
    * Load strategy rules from configuration table
    */
@@ -199,10 +173,8 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
     IF g_rules_loaded THEN
       RETURN;
     END IF;
-
     -- Clear existing rules
     g_strategy_rules.DELETE;
-
     -- Load all strategy rules
     FOR rec IN (
       SELECT *
@@ -213,16 +185,13 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
       v_count := v_count + 1;
       g_strategy_rules(v_count) := rec;
     END LOOP;
-
     g_rules_loaded := TRUE;
-
     pkg_compression_log.log_info(
       'PKG_COMPRESSION_ADVISOR',
       'load_strategy_rules',
       'Loaded ' || v_count || ' strategy rules'
     );
   END load_strategy_rules;
-
   /**
    * Check if schema should be excluded from analysis
    */
@@ -238,7 +207,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
            OR p_owner LIKE 'ORACLE%'
            OR p_owner LIKE 'FLOWS_%';
   END is_excluded_schema;
-
   /**
    * Calculate DML hotness score based on recent activity
    */
@@ -254,7 +222,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
   BEGIN
     -- Flush monitoring info to get latest stats
     DBMS_STATS.flush_database_monitoring_info;
-
     -- Get DML statistics
     BEGIN
       SELECT
@@ -270,16 +237,13 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
       WHEN NO_DATA_FOUND THEN
         RETURN 0; -- No DML activity
     END;
-
     -- Calculate total DML operations
     v_total_dml := v_inserts + v_updates + v_deletes;
-
     -- Logarithmic scoring (0-100 scale)
     -- 0 DML = 0, 1000 DML = 50, 1M DML = 100
     IF v_total_dml > 0 THEN
       v_score := LEAST(100, (LOG(10, v_total_dml + 1) / LOG(10, 1000000)) * 100);
     END IF;
-
     RETURN ROUND(v_score, 2);
   EXCEPTION
     WHEN OTHERS THEN
@@ -291,7 +255,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
       );
       RETURN 0;
   END calculate_hotness_score;
-
   /**
    * Calculate segment access score from V$SEGMENT_STATISTICS
    */
@@ -313,20 +276,16 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
     WHERE owner = p_owner
       AND object_name = p_object_name
       AND object_type = p_object_type;
-
     v_total_reads := v_logical_reads + v_physical_reads;
-
     -- Logarithmic scoring (0-100 scale)
     IF v_total_reads > 0 THEN
       v_score := LEAST(100, (LOG(10, v_total_reads + 1) / LOG(10, 100000000)) * 100);
     END IF;
-
     RETURN ROUND(v_score, 2);
   EXCEPTION
     WHEN OTHERS THEN
       RETURN 0;
   END calculate_access_score;
-
   /**
    * Test compression ratio for table
    */
@@ -355,13 +314,11 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
     WHERE owner = p_owner
       AND segment_name = p_table_name
       AND NVL(partition_name, 'X') = NVL(p_partition_name, 'X');
-
     -- Get scratch tablespace
     SELECT default_tablespace
     INTO v_scratch_tbs
     FROM dba_users
     WHERE username = p_owner;
-
     -- Test BASIC compression
     BEGIN
       DBMS_COMPRESSION.get_compression_ratio(
@@ -377,7 +334,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
         cmp_ratio => v_cmp_ratio,
         comptype_str => v_comptype_str
       );
-
       x_basic_ratio := v_cmp_ratio;
       x_basic_size := ROUND(x_current_size / NULLIF(v_cmp_ratio, 0), 2);
     EXCEPTION
@@ -385,7 +341,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
         x_basic_ratio := 1;
         x_basic_size := x_current_size;
     END;
-
     -- Test OLTP compression (Advanced in Oracle Free)
     BEGIN
       DBMS_COMPRESSION.get_compression_ratio(
@@ -401,7 +356,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
         cmp_ratio => v_cmp_ratio,
         comptype_str => v_comptype_str
       );
-
       x_oltp_ratio := v_cmp_ratio;
       x_oltp_size := ROUND(x_current_size / NULLIF(v_cmp_ratio, 0), 2);
     EXCEPTION
@@ -409,7 +363,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
         x_oltp_ratio := 1;
         x_oltp_size := x_current_size;
     END;
-
   EXCEPTION
     WHEN OTHERS THEN
       x_current_size := 0;
@@ -417,7 +370,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
       x_oltp_size := 0;
       x_basic_ratio := 1;
       x_oltp_ratio := 1;
-
       pkg_compression_log.log_error(
         'PKG_COMPRESSION_ADVISOR',
         'test_table_compression',
@@ -425,7 +377,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
         SQLERRM
       );
   END test_table_compression;
-
   /**
    * Evaluate strategy rules and determine recommendation
    */
@@ -441,26 +392,22 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
     v_rule_matched BOOLEAN := FALSE;
   BEGIN
     load_strategy_rules;
-
     -- Evaluate rules in order
     FOR i IN 1..g_strategy_rules.COUNT LOOP
       IF g_strategy_rules(i).strategy_id = p_strategy_id
          AND g_strategy_rules(i).object_type = p_object_type THEN
-
         -- Check if rule conditions match
         IF (g_strategy_rules(i).min_size_mb IS NULL OR p_size_mb >= g_strategy_rules(i).min_size_mb)
            AND (g_strategy_rules(i).max_size_mb IS NULL OR p_size_mb <= g_strategy_rules(i).max_size_mb)
            AND (g_strategy_rules(i).min_hotness_score IS NULL OR p_hotness_score >= g_strategy_rules(i).min_hotness_score)
            AND (g_strategy_rules(i).max_hotness_score IS NULL OR p_hotness_score <= g_strategy_rules(i).max_hotness_score)
            AND (g_strategy_rules(i).min_compression_ratio IS NULL OR p_compression_ratio >= g_strategy_rules(i).min_compression_ratio) THEN
-
           v_recommended_compression := g_strategy_rules(i).recommended_compression;
           v_rule_matched := TRUE;
           EXIT;
         END IF;
       END IF;
     END LOOP;
-
     -- Default recommendation if no rule matched
     IF NOT v_rule_matched THEN
       CASE p_object_type
@@ -486,10 +433,8 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
           v_recommended_compression := 'NONE';
       END CASE;
     END IF;
-
     RETURN v_recommended_compression;
   END evaluate_strategy_rules;
-
   /**
    * Generate rationale for recommendation
    */
@@ -504,7 +449,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
     v_rationale VARCHAR2(4000);
   BEGIN
     v_rationale := 'Size: ' || ROUND(p_size_mb, 2) || ' MB; ';
-
     IF p_hotness_score > 0 THEN
       v_rationale := v_rationale || 'Hotness: ' || p_hotness_score || '/100 ';
       IF p_hotness_score > 70 THEN
@@ -515,16 +459,13 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
         v_rationale := v_rationale || '(Low DML); ';
       END IF;
     END IF;
-
     IF p_access_score > 0 THEN
       v_rationale := v_rationale || 'Access: ' || p_access_score || '/100 ';
       IF p_access_score > 70 THEN
         v_rationale := v_rationale || '(Frequently accessed); ';
       END IF;
     END IF;
-
     v_rationale := v_rationale || 'Compression ratio: ' || ROUND(p_compression_ratio, 2) || ':1; ';
-
     -- Add recommendation explanation
     CASE p_recommended_compression
       WHEN 'NONE' THEN
@@ -542,14 +483,11 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
       ELSE
         v_rationale := v_rationale || 'Compression type: ' || p_recommended_compression;
     END CASE;
-
     RETURN SUBSTR(v_rationale, 1, 4000);
   END generate_rationale;
-
   -- ========================================================================
   -- Main Analysis Procedures Implementation
   -- ========================================================================
-
   PROCEDURE analyze_table(
     p_owner IN VARCHAR2,
     p_table_name IN VARCHAR2,
@@ -578,7 +516,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
       'analyze_table',
       'Analyzing table ' || p_owner || '.' || p_table_name
     );
-
     -- Get current compression
     BEGIN
       SELECT compress_for
@@ -596,18 +533,15 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
         );
         RETURN;
     END;
-
     -- Calculate scores
     v_hotness_score := calculate_hotness_score(p_owner, p_table_name);
     v_access_score := calculate_access_score(p_owner, p_table_name, 'TABLE');
-
     -- Check if table is partitioned
     SELECT COUNT(*)
     INTO v_partition_count
     FROM dba_tab_partitions
     WHERE table_owner = p_owner
       AND table_name = p_table_name;
-
     IF v_partition_count > 0 THEN
       -- Analyze each partition separately
       SELECT partition_name
@@ -615,7 +549,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
       FROM dba_tab_partitions
       WHERE table_owner = p_owner
         AND table_name = p_table_name;
-
       FOR i IN 1..v_partitions.COUNT LOOP
         -- Test compression for partition
         test_table_compression(
@@ -623,7 +556,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
           v_current_size, v_basic_size, v_oltp_size,
           v_basic_ratio, v_oltp_ratio
         );
-
         -- Determine best compression
         IF v_oltp_ratio >= v_basic_ratio THEN
           v_best_ratio := v_oltp_ratio;
@@ -632,23 +564,19 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
           v_best_ratio := v_basic_ratio;
           v_best_size := v_basic_size;
         END IF;
-
         -- Evaluate strategy
         v_recommended_compression := evaluate_strategy_rules(
           p_strategy_id, 'TABLE', v_current_size,
           v_hotness_score, v_access_score, v_best_ratio
         );
-
         v_savings_mb := v_current_size - v_best_size;
         v_savings_pct := CASE WHEN v_current_size > 0
           THEN ROUND((v_savings_mb / v_current_size) * 100, 2)
           ELSE 0 END;
-
         v_rationale := generate_rationale(
           'TABLE', v_current_size, v_hotness_score,
           v_access_score, v_best_ratio, v_recommended_compression
         );
-
         -- Insert partition-level result
         INSERT INTO t_compression_analysis (
           owner, object_name, object_type, partition_name,
@@ -674,7 +602,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
         v_current_size, v_basic_size, v_oltp_size,
         v_basic_ratio, v_oltp_ratio
       );
-
       -- Determine best compression
       IF v_oltp_ratio >= v_basic_ratio THEN
         v_best_ratio := v_oltp_ratio;
@@ -683,23 +610,19 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
         v_best_ratio := v_basic_ratio;
         v_best_size := v_basic_size;
       END IF;
-
       -- Evaluate strategy
       v_recommended_compression := evaluate_strategy_rules(
         p_strategy_id, 'TABLE', v_current_size,
         v_hotness_score, v_access_score, v_best_ratio
       );
-
       v_savings_mb := v_current_size - v_best_size;
       v_savings_pct := CASE WHEN v_current_size > 0
         THEN ROUND((v_savings_mb / v_current_size) * 100, 2)
         ELSE 0 END;
-
       v_rationale := generate_rationale(
         'TABLE', v_current_size, v_hotness_score,
         v_access_score, v_best_ratio, v_recommended_compression
       );
-
       -- Insert table-level result
       INSERT INTO t_compression_analysis (
         owner, object_name, object_type, partition_name,
@@ -717,16 +640,13 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
         v_rationale, SYSTIMESTAMP
       );
     END IF;
-
     COMMIT;
-
     pkg_compression_log.log_info(
       'PKG_COMPRESSION_ADVISOR',
       'analyze_table',
       'Completed analysis for ' || p_owner || '.' || p_table_name ||
       ' - Recommendation: ' || v_recommended_compression
     );
-
   EXCEPTION
     WHEN OTHERS THEN
       ROLLBACK;
@@ -738,7 +658,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
       );
       RAISE;
   END analyze_table;
-
   PROCEDURE analyze_index(
     p_owner IN VARCHAR2,
     p_index_name IN VARCHAR2,
@@ -760,7 +679,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
       'analyze_index',
       'Analyzing index ' || p_owner || '.' || p_index_name
     );
-
     -- Get index details
     BEGIN
       SELECT
@@ -780,7 +698,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
         );
         RETURN;
     END;
-
     -- Only analyze B-tree indexes
     IF v_index_type NOT IN ('NORMAL', 'NORMAL/REV') THEN
       pkg_compression_log.log_info(
@@ -790,7 +707,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
       );
       RETURN;
     END IF;
-
     -- Get current size
     SELECT NVL(SUM(bytes), 0) / 1024 / 1024
     INTO v_current_size
@@ -798,10 +714,8 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
     WHERE owner = p_owner
       AND segment_name = p_index_name
       AND segment_type LIKE 'INDEX%';
-
     -- Calculate access score
     v_access_score := calculate_access_score(p_owner, p_index_name, 'INDEX');
-
     -- Estimate compression ratio (conservative estimate for indexes)
     -- In practice, use analyze index validate structure for accurate stats
     v_compression_ratio := CASE
@@ -809,26 +723,21 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
       WHEN v_current_size > 100 THEN 2.0
       ELSE 1.5
     END;
-
     v_compressed_size := ROUND(v_current_size / v_compression_ratio, 2);
-
     -- Evaluate strategy
     v_recommended_compression := evaluate_strategy_rules(
       p_strategy_id, 'INDEX', v_current_size,
       0, -- No hotness for indexes
       v_access_score, v_compression_ratio
     );
-
     v_savings_mb := v_current_size - v_compressed_size;
     v_savings_pct := CASE WHEN v_current_size > 0
       THEN ROUND((v_savings_mb / v_current_size) * 100, 2)
       ELSE 0 END;
-
     v_rationale := generate_rationale(
       'INDEX', v_current_size, 0,
       v_access_score, v_compression_ratio, v_recommended_compression
     );
-
     -- Insert result
     INSERT INTO t_compression_analysis (
       owner, object_name, object_type, partition_name,
@@ -845,16 +754,13 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
       p_strategy_id, 0, v_access_score,
       v_rationale, SYSTIMESTAMP
     );
-
     COMMIT;
-
     pkg_compression_log.log_info(
       'PKG_COMPRESSION_ADVISOR',
       'analyze_index',
       'Completed analysis for ' || p_owner || '.' || p_index_name ||
       ' - Recommendation: ' || v_recommended_compression
     );
-
   EXCEPTION
     WHEN OTHERS THEN
       ROLLBACK;
@@ -866,7 +772,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
       );
       RAISE;
   END analyze_index;
-
   PROCEDURE analyze_lob(
     p_owner IN VARCHAR2,
     p_table_name IN VARCHAR2,
@@ -889,7 +794,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
       'analyze_lob',
       'Analyzing LOB ' || p_owner || '.' || p_table_name || '.' || p_column_name
     );
-
     -- Get LOB details
     BEGIN
       SELECT
@@ -911,7 +815,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
         );
         RETURN;
     END;
-
     -- Only analyze SecureFiles LOBs
     IF v_securefile = 'NO' THEN
       pkg_compression_log.log_info(
@@ -921,39 +824,32 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
       );
       RETURN;
     END IF;
-
     -- Get current size
     SELECT NVL(SUM(bytes), 0) / 1024 / 1024
     INTO v_current_size
     FROM dba_segments
     WHERE owner = p_owner
       AND segment_name = v_lob_segment;
-
     -- Estimate compression ratio for LOBs (typically very high)
     v_compression_ratio := CASE
       WHEN v_current_size > 1000 THEN 4.0  -- Large LOBs compress very well
       WHEN v_current_size > 100 THEN 3.0
       ELSE 2.5
     END;
-
     v_compressed_size := ROUND(v_current_size / v_compression_ratio, 2);
-
     -- Evaluate strategy
     v_recommended_compression := evaluate_strategy_rules(
       p_strategy_id, 'LOB', v_current_size,
       0, 0, v_compression_ratio
     );
-
     v_savings_mb := v_current_size - v_compressed_size;
     v_savings_pct := CASE WHEN v_current_size > 0
       THEN ROUND((v_savings_mb / v_current_size) * 100, 2)
       ELSE 0 END;
-
     v_rationale := generate_rationale(
       'LOB', v_current_size, 0, 0,
       v_compression_ratio, v_recommended_compression
     );
-
     -- Insert result
     INSERT INTO t_compression_analysis (
       owner, object_name, object_type, partition_name,
@@ -970,16 +866,13 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
       p_strategy_id, 0, 0,
       v_rationale, SYSTIMESTAMP
     );
-
     COMMIT;
-
     pkg_compression_log.log_info(
       'PKG_COMPRESSION_ADVISOR',
       'analyze_lob',
       'Completed analysis for LOB ' || p_owner || '.' || p_table_name || '.' || p_column_name ||
       ' - Recommendation: ' || v_recommended_compression
     );
-
   EXCEPTION
     WHEN OTHERS THEN
       ROLLBACK;
@@ -991,7 +884,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
       );
       RAISE;
   END analyze_lob;
-
   PROCEDURE run_analysis(
     p_owner IN VARCHAR2 DEFAULT NULL,
     p_strategy_id IN NUMBER DEFAULT 2,
@@ -1007,7 +899,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
   BEGIN
     init_compression_map;
     load_strategy_rules;
-
     pkg_compression_log.log_info(
       'PKG_COMPRESSION_ADVISOR',
       'run_analysis',
@@ -1015,7 +906,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
       ', Owner: ' || NVL(p_owner, 'ALL') ||
       ', Parallel Degree: ' || p_parallel_degree
     );
-
     -- Analyze tables (with parallel processing)
     IF p_parallel_degree > 1 THEN
       -- Collect tables to analyze
@@ -1034,11 +924,9 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
       ORDER BY
         (SELECT NVL(SUM(bytes), 0) FROM dba_segments s
          WHERE s.owner = t.owner AND s.segment_name = t.table_name) DESC;
-
       -- Create parallel jobs
       FOR i IN 1..LEAST(p_parallel_degree, v_table_list.COUNT) LOOP
         v_job_name := v_job_prefix || TO_CHAR(SYSDATE, 'YYYYMMDD_HH24MISS') || '_' || i;
-
         DBMS_SCHEDULER.create_job(
           job_name => v_job_name,
           job_type => 'PLSQL_BLOCK',
@@ -1063,10 +951,8 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
           auto_drop => TRUE
         );
       END LOOP;
-
       -- Wait for jobs to complete (simplified - in production use job monitoring)
       DBMS_LOCK.sleep(5);
-
       v_table_count := v_table_list.COUNT;
     ELSE
       -- Sequential processing
@@ -1100,7 +986,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
         END;
       END LOOP;
     END IF;
-
     -- Analyze indexes
     FOR rec IN (
       SELECT i.owner, i.index_name
@@ -1128,7 +1013,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
           );
       END;
     END LOOP;
-
     -- Analyze LOBs (SecureFiles only)
     FOR rec IN (
       SELECT l.owner, l.table_name, l.column_name
@@ -1156,7 +1040,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
           );
       END;
     END LOOP;
-
     pkg_compression_log.log_info(
       'PKG_COMPRESSION_ADVISOR',
       'run_analysis',
@@ -1165,7 +1048,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
       ', LOBs: ' || v_lob_count ||
       ', Duration: ' || EXTRACT(SECOND FROM (SYSTIMESTAMP - v_start_time)) || 's'
     );
-
   EXCEPTION
     WHEN OTHERS THEN
       pkg_compression_log.log_error(
@@ -1176,11 +1058,9 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
       );
       RAISE;
   END run_analysis;
-
   -- ========================================================================
   -- Recommendation and Reporting Functions Implementation
   -- ========================================================================
-
   FUNCTION get_recommendations(
     p_strategy_id IN NUMBER DEFAULT 2,
     p_min_savings_pct IN NUMBER DEFAULT 20
@@ -1215,17 +1095,14 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
         AND space_savings_pct >= p_min_savings_pct
         AND recommended_compression != 'NONE'
       ORDER BY space_savings_mb DESC, space_savings_pct DESC;
-
     RETURN v_cursor;
   END get_recommendations;
-
   FUNCTION generate_ddl(
     p_recommendation_id IN NUMBER DEFAULT NULL
   ) RETURN SYS_REFCURSOR IS
     v_cursor SYS_REFCURSOR;
   BEGIN
     init_compression_map;
-
     OPEN v_cursor FOR
       SELECT
         analysis_id,
@@ -1261,10 +1138,8 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
       WHERE (p_recommendation_id IS NULL OR analysis_id = p_recommendation_id)
         AND recommended_compression != 'NONE'
       ORDER BY space_savings_mb DESC;
-
     RETURN v_cursor;
   END generate_ddl;
-
   FUNCTION calculate_total_savings(
     p_strategy_id IN NUMBER DEFAULT NULL
   ) RETURN NUMBER IS
@@ -1275,14 +1150,11 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
     FROM t_compression_analysis
     WHERE (p_strategy_id IS NULL OR strategy_id = p_strategy_id)
       AND recommended_compression != 'NONE';
-
     RETURN v_total_savings;
   END calculate_total_savings;
-
   -- ========================================================================
   -- Utility Procedures Implementation
   -- ========================================================================
-
   PROCEDURE cleanup_old_results(
     p_days_old IN NUMBER DEFAULT 30
   ) IS
@@ -1290,17 +1162,14 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
   BEGIN
     DELETE FROM t_compression_analysis
     WHERE analysis_date < SYSTIMESTAMP - INTERVAL '1' DAY * p_days_old;
-
     v_rows_deleted := SQL%ROWCOUNT;
     COMMIT;
-
     pkg_compression_log.log_info(
       'PKG_COMPRESSION_ADVISOR',
       'cleanup_old_results',
       'Deleted ' || v_rows_deleted || ' old analysis records (older than ' || p_days_old || ' days)'
     );
   END cleanup_old_results;
-
   PROCEDURE reset_analysis(
     p_owner IN VARCHAR2,
     p_object_name IN VARCHAR2,
@@ -1312,10 +1181,8 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
     WHERE owner = p_owner
       AND object_name = p_object_name
       AND object_type = p_object_type;
-
     v_rows_deleted := SQL%ROWCOUNT;
     COMMIT;
-
     pkg_compression_log.log_info(
       'PKG_COMPRESSION_ADVISOR',
       'reset_analysis',
@@ -1323,17 +1190,14 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
       ' (' || v_rows_deleted || ' records deleted)'
     );
   END reset_analysis;
-
 BEGIN
   -- Package initialization
   init_compression_map;
   load_strategy_rules;
-
   pkg_compression_log.log_info(
     'PKG_COMPRESSION_ADVISOR',
     'INITIALIZATION',
     'Package initialized - Version: ' || c_version
   );
-
 END pkg_compression_advisor;
 /
