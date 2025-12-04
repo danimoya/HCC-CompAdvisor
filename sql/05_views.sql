@@ -42,7 +42,6 @@ ORDER BY
     r.savings_pct DESC;
 
 COMMENT ON TABLE v_compression_candidates IS 'All objects with actionable compression recommendations, prioritized by potential space savings';
-
 -- ============================================================================
 -- View: V_COMPRESSION_SUMMARY
 -- Purpose: Aggregate statistics by owner and object type
@@ -79,7 +78,6 @@ ORDER BY
     total_potential_savings_mb DESC;
 
 COMMENT ON TABLE v_compression_summary IS 'Aggregated compression statistics by owner and object type';
-
 -- ============================================================================
 -- View: V_COMPRESSION_HISTORY
 -- Purpose: Complete execution history of compression operations
@@ -113,7 +111,6 @@ ORDER BY
     h.start_time DESC;
 
 COMMENT ON TABLE v_compression_history IS 'Historical record of all compression execution operations';
-
 -- ============================================================================
 -- View: V_HOT_OBJECTS
 -- Purpose: Write-intensive objects requiring OLTP or no compression
@@ -146,7 +143,6 @@ ORDER BY
     r.current_size_mb DESC;
 
 COMMENT ON TABLE v_hot_objects IS 'Write-intensive objects with high hotness scores requiring OLTP or no compression';
-
 -- ============================================================================
 -- View: V_COLD_OBJECTS
 -- Purpose: Rarely accessed objects ideal for aggressive compression
@@ -181,7 +177,6 @@ ORDER BY
     r.hotness_score ASC;
 
 COMMENT ON TABLE v_cold_objects IS 'Rarely accessed objects with low hotness scores, ideal candidates for aggressive compression';
-
 -- ============================================================================
 -- View: V_COMPRESSION_EFFECTIVENESS
 -- Purpose: Analysis of compression results vs. predictions
@@ -213,7 +208,6 @@ ORDER BY
     total_space_saved_mb DESC;
 
 COMMENT ON TABLE v_compression_effectiveness IS 'Performance metrics and effectiveness analysis of compression executions';
-
 -- ============================================================================
 -- View: V_STRATEGY_RECOMMENDATIONS
 -- Purpose: Side-by-side comparison of recommendations across strategies
@@ -260,7 +254,6 @@ ORDER BY
     MAX(current_size_mb) DESC;
 
 COMMENT ON TABLE v_strategy_recommendations IS 'Comparison of compression recommendations across different analysis strategies';
-
 -- ============================================================================
 -- View: V_SPACE_ANALYSIS
 -- Purpose: Space usage and potential savings by tablespace
@@ -312,7 +305,6 @@ ORDER BY
     potential_savings_mb DESC;
 
 COMMENT ON TABLE v_space_analysis IS 'Space usage and potential savings analysis by tablespace';
-
 -- ============================================================================
 -- View: V_EXECUTION_QUEUE
 -- Purpose: Pending compression operations prioritized by savings
@@ -371,7 +363,6 @@ ORDER BY
     r.savings_pct DESC;
 
 COMMENT ON TABLE v_execution_queue IS 'Prioritized queue of compression operations ready for execution';
-
 -- ============================================================================
 -- View: V_ADVISOR_SUMMARY
 -- Purpose: High-level dashboard metrics and executive summary
@@ -418,7 +409,6 @@ SELECT
 FROM DUAL;
 
 COMMENT ON TABLE v_advisor_summary IS 'Executive dashboard summary with key metrics and statistics';
-
 -- ============================================================================
 -- View: V_COMPRESSION_ANALYSIS_WITH_AGE
 -- Purpose: Compression analysis results with calculated DATA_AGE_DAYS
@@ -476,7 +466,6 @@ FROM
     t_compression_analysis;
 
 COMMENT ON TABLE v_compression_analysis_with_age IS 'T_COMPRESSION_ANALYSIS with calculated DATA_AGE_DAYS (days since LAST_ANALYZED)';
-
 -- ============================================================================
 -- Grant SELECT privileges on views to PUBLIC or specific role
 -- ============================================================================

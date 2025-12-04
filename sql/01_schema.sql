@@ -710,13 +710,31 @@ ON DELETE SET NULL;
 PROMPT
 PROMPT Creating sequences...
 
-CREATE SEQUENCE SEQ_EXECUTION_ID
-    START WITH 1
-    INCREMENT BY 1
-    CACHE 20
-    NOCYCLE;
+DECLARE
+    v_sequence_exists NUMBER;
+BEGIN
+    -- Check if sequence already exists
+    SELECT COUNT(*)
+    INTO v_sequence_exists
+    FROM user_sequences
+    WHERE sequence_name = 'SEQ_EXECUTION_ID';
 
-COMMENT ON SEQUENCE SEQ_EXECUTION_ID IS 'Unique identifier for compression execution batches';
+    IF v_sequence_exists = 0 THEN
+        -- Create the sequence
+        EXECUTE IMMEDIATE 'CREATE SEQUENCE SEQ_EXECUTION_ID START WITH 1 INCREMENT BY 1 CACHE 20 NOCYCLE';
+        DBMS_OUTPUT.PUT_LINE('✓ Sequence SEQ_EXECUTION_ID created successfully');
+
+        -- Add comment
+        EXECUTE IMMEDIATE 'COMMENT ON SEQUENCE SEQ_EXECUTION_ID IS ''Unique identifier for compression execution batches''';
+    ELSE
+        DBMS_OUTPUT.PUT_LINE('  Sequence SEQ_EXECUTION_ID already exists - skipping');
+    END IF;
+EXCEPTION
+    WHEN OTHERS THEN
+        DBMS_OUTPUT.PUT_LINE('✗ Error creating SEQ_EXECUTION_ID: ' || SQLERRM);
+        RAISE;
+END;
+/
 
 -- ============================================================================
 -- SECTION 7: DEFAULT DATA
