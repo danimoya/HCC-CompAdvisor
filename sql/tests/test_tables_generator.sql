@@ -32,6 +32,7 @@
  *
  ******************************************************************************/
 
+SET DEFINE OFF
 SET ECHO ON
 SET FEEDBACK ON
 SET SERVEROUTPUT ON SIZE UNLIMITED
@@ -977,3 +978,4 @@ PROMPT
 PROMPT ================================================================================
 
 SET ECHO OFF
+SET DEFINE ON
