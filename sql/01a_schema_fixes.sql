@@ -63,13 +63,7 @@ BEGIN
 
     IF v_sequence_exists = 0 THEN
         -- Create the sequence
-        EXECUTE IMMEDIATE '
-            CREATE SEQUENCE SEQ_STRATEGY_RULES
-                START WITH 1
-                INCREMENT BY 1
-                CACHE 20
-                NOCYCLE
-                ORDER';
+        EXECUTE IMMEDIATE 'CREATE SEQUENCE SEQ_STRATEGY_RULES START WITH 1 INCREMENT BY 1 CACHE 20 NOCYCLE ORDER';
 
         DBMS_OUTPUT.PUT_LINE('✓ Sequence SEQ_STRATEGY_RULES created successfully');
     ELSE
@@ -104,16 +98,12 @@ BEGIN
 
     IF v_column_exists = 0 THEN
         -- Add the column
-        EXECUTE IMMEDIATE '
-            ALTER TABLE T_STRATEGY_RULES
-            ADD (MIN_WRITE_RATIO NUMBER(5,2))';
+        EXECUTE IMMEDIATE 'ALTER TABLE T_STRATEGY_RULES ADD (MIN_WRITE_RATIO NUMBER(5,2))';
 
         DBMS_OUTPUT.PUT_LINE('✓ Column MIN_WRITE_RATIO added to T_STRATEGY_RULES');
 
         -- Add column comment
-        EXECUTE IMMEDIATE '
-            COMMENT ON COLUMN T_STRATEGY_RULES.MIN_WRITE_RATIO IS
-            ''Minimum write ratio threshold (0.00 to 1.00). Represents minimum write operations / total operations ratio.''';
+        EXECUTE IMMEDIATE 'COMMENT ON COLUMN T_STRATEGY_RULES.MIN_WRITE_RATIO IS ''Minimum write ratio threshold (0.00 to 1.00). Represents minimum write operations / total operations ratio.''';
     ELSE
         DBMS_OUTPUT.PUT_LINE('  Column MIN_WRITE_RATIO already exists - skipping');
     END IF;
@@ -137,16 +127,12 @@ BEGIN
 
     IF v_column_exists = 0 THEN
         -- Add the column
-        EXECUTE IMMEDIATE '
-            ALTER TABLE T_STRATEGY_RULES
-            ADD (MAX_WRITE_RATIO NUMBER(5,2))';
+        EXECUTE IMMEDIATE 'ALTER TABLE T_STRATEGY_RULES ADD (MAX_WRITE_RATIO NUMBER(5,2))';
 
         DBMS_OUTPUT.PUT_LINE('✓ Column MAX_WRITE_RATIO added to T_STRATEGY_RULES');
 
         -- Add column comment
-        EXECUTE IMMEDIATE '
-            COMMENT ON COLUMN T_STRATEGY_RULES.MAX_WRITE_RATIO IS
-            ''Maximum write ratio threshold (0.00 to 1.00). Represents maximum write operations / total operations ratio.''';
+        EXECUTE IMMEDIATE 'COMMENT ON COLUMN T_STRATEGY_RULES.MAX_WRITE_RATIO IS ''Maximum write ratio threshold (0.00 to 1.00). Represents maximum write operations / total operations ratio.''';
     ELSE
         DBMS_OUTPUT.PUT_LINE('  Column MAX_WRITE_RATIO already exists - skipping');
     END IF;
@@ -176,15 +162,7 @@ BEGIN
 
     IF v_constraint_exists = 0 THEN
         -- Add the constraint
-        EXECUTE IMMEDIATE '
-            ALTER TABLE T_STRATEGY_RULES
-            ADD CONSTRAINT CHK_WRITE_RATIO_RANGE CHECK (
-                MIN_WRITE_RATIO IS NULL OR
-                MAX_WRITE_RATIO IS NULL OR
-                (MIN_WRITE_RATIO >= 0 AND
-                 MAX_WRITE_RATIO <= 1 AND
-                 MIN_WRITE_RATIO <= MAX_WRITE_RATIO)
-            )';
+        EXECUTE IMMEDIATE 'ALTER TABLE T_STRATEGY_RULES ADD CONSTRAINT CHK_WRITE_RATIO_RANGE CHECK (MIN_WRITE_RATIO IS NULL OR MAX_WRITE_RATIO IS NULL OR (MIN_WRITE_RATIO >= 0 AND MAX_WRITE_RATIO <= 1 AND MIN_WRITE_RATIO <= MAX_WRITE_RATIO))';
 
         DBMS_OUTPUT.PUT_LINE('✓ Check constraint CHK_WRITE_RATIO_RANGE added');
     ELSE
@@ -252,8 +230,7 @@ BEGIN
 
     IF v_synonym_exists = 0 THEN
         -- Create the synonym
-        EXECUTE IMMEDIATE '
-            CREATE SYNONYM T_STRATEGIES FOR T_COMPRESSION_STRATEGIES';
+        EXECUTE IMMEDIATE 'CREATE SYNONYM T_STRATEGIES FOR T_COMPRESSION_STRATEGIES';
 
         DBMS_OUTPUT.PUT_LINE('✓ Synonym T_STRATEGIES created for T_COMPRESSION_STRATEGIES');
     ELSE

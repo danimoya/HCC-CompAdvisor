@@ -148,22 +148,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_TEST_TABLE_GENERATOR AS
     END;
 
     -- Create table
-    EXECUTE IMMEDIATE '
-      CREATE TABLE TEST_BASIC_COMPRESSION (
-        id              NUMBER PRIMARY KEY,
-        customer_id     NUMBER NOT NULL,
-        order_id        NUMBER NOT NULL,
-        product_code    VARCHAR2(20),
-        category        VARCHAR2(30),
-        order_date      DATE,
-        amount          NUMBER(10,2),
-        quantity        NUMBER,
-        status          VARCHAR2(20),
-        description     VARCHAR2(500),
-        created_date    DATE DEFAULT SYSDATE,
-        updated_date    DATE DEFAULT SYSDATE
-      )
-    ';
+    EXECUTE IMMEDIATE 'CREATE TABLE TEST_BASIC_COMPRESSION (id NUMBER PRIMARY KEY, customer_id NUMBER NOT NULL, order_id NUMBER NOT NULL, product_code VARCHAR2(20), category VARCHAR2(30), order_date DATE, amount NUMBER(10,2), quantity NUMBER, status VARCHAR2(20), description VARCHAR2(500), created_date DATE DEFAULT SYSDATE, updated_date DATE DEFAULT SYSDATE)';
 
     -- Insert representative data (general purpose)
     INSERT INTO TEST_BASIC_COMPRESSION
@@ -216,21 +201,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_TEST_TABLE_GENERATOR AS
     END;
 
     -- Create table optimized for OLTP (frequent updates/inserts)
-    EXECUTE IMMEDIATE '
-      CREATE TABLE TEST_OLTP_COMPRESSION (
-        transaction_id  NUMBER PRIMARY KEY,
-        user_id         NUMBER NOT NULL,
-        session_id      VARCHAR2(50),
-        transaction_type VARCHAR2(20),
-        amount          NUMBER(12,2),
-        status          VARCHAR2(20),
-        transaction_time TIMESTAMP DEFAULT SYSTIMESTAMP,
-        updated_time    TIMESTAMP,
-        notes           VARCHAR2(200),
-        error_code      NUMBER,
-        retry_count     NUMBER DEFAULT 0
-      )
-    ';
+    EXECUTE IMMEDIATE 'CREATE TABLE TEST_OLTP_COMPRESSION (transaction_id NUMBER PRIMARY KEY, user_id NUMBER NOT NULL, session_id VARCHAR2(50), transaction_type VARCHAR2(20), amount NUMBER(12,2), status VARCHAR2(20), transaction_time TIMESTAMP DEFAULT SYSTIMESTAMP, updated_time TIMESTAMP, notes VARCHAR2(200), error_code NUMBER, retry_count NUMBER DEFAULT 0)';
 
     -- Insert OLTP-style data (many similar short-lived records)
     INSERT INTO TEST_OLTP_COMPRESSION
@@ -277,25 +248,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_TEST_TABLE_GENERATOR AS
       WHEN OTHERS THEN NULL;
     END;
 
-    EXECUTE IMMEDIATE '
-      CREATE TABLE TEST_ADV_LOW_COMPRESSION (
-        record_id       NUMBER PRIMARY KEY,
-        region          VARCHAR2(30),
-        country         VARCHAR2(50),
-        city            VARCHAR2(50),
-        department      VARCHAR2(50),
-        employee_id     NUMBER,
-        employee_name   VARCHAR2(100),
-        salary          NUMBER(10,2),
-        hire_date       DATE,
-        performance     VARCHAR2(20),
-        skill_level     VARCHAR2(20),
-        project_code    VARCHAR2(20),
-        hours_logged    NUMBER,
-        billing_rate    NUMBER(10,2),
-        revenue         NUMBER(12,2)
-      )
-    ';
+    EXECUTE IMMEDIATE 'CREATE TABLE TEST_ADV_LOW_COMPRESSION (record_id NUMBER PRIMARY KEY, region VARCHAR2(30), country VARCHAR2(50), city VARCHAR2(50), department VARCHAR2(50), employee_id NUMBER, employee_name VARCHAR2(100), salary NUMBER(10,2), hire_date DATE, performance VARCHAR2(20), skill_level VARCHAR2(20), project_code VARCHAR2(20), hours_logged NUMBER, billing_rate NUMBER(10,2), revenue NUMBER(12,2))';
 
     -- Insert data with good repetition (good for QUERY LOW)
     INSERT INTO TEST_ADV_LOW_COMPRESSION
@@ -394,24 +347,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_TEST_TABLE_GENERATOR AS
       WHEN OTHERS THEN NULL;
     END;
 
-    EXECUTE IMMEDIATE '
-      CREATE TABLE TEST_ADV_HIGH_COMPRESSION (
-        event_id        NUMBER PRIMARY KEY,
-        event_type      VARCHAR2(50),
-        event_category  VARCHAR2(50),
-        event_status    VARCHAR2(30),
-        severity_level  VARCHAR2(20),
-        source_system   VARCHAR2(50),
-        source_location VARCHAR2(100),
-        event_time      TIMESTAMP,
-        event_date      DATE,
-        description     VARCHAR2(500),
-        details         VARCHAR2(1000),
-        resolution      VARCHAR2(500),
-        tags            VARCHAR2(200),
-        metadata        VARCHAR2(500)
-      )
-    ';
+    EXECUTE IMMEDIATE 'CREATE TABLE TEST_ADV_HIGH_COMPRESSION (event_id NUMBER PRIMARY KEY, event_type VARCHAR2(50), event_category VARCHAR2(50), event_status VARCHAR2(30), severity_level VARCHAR2(20), source_system VARCHAR2(50), source_location VARCHAR2(100), event_time TIMESTAMP, event_date DATE, description VARCHAR2(500), details VARCHAR2(1000), resolution VARCHAR2(500), tags VARCHAR2(200), metadata VARCHAR2(500))';
 
     -- Insert data with very high repetition (good for QUERY HIGH aggressive compression)
     INSERT INTO TEST_ADV_HIGH_COMPRESSION
@@ -494,30 +430,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_TEST_TABLE_GENERATOR AS
       WHEN OTHERS THEN NULL;
     END;
 
-    EXECUTE IMMEDIATE '
-      CREATE TABLE TEST_HCC_QUERY_LOW (
-        transaction_id  NUMBER PRIMARY KEY,
-        customer_id     NUMBER NOT NULL,
-        order_id        NUMBER NOT NULL,
-        sku             VARCHAR2(30),
-        product_line    VARCHAR2(50),
-        channel         VARCHAR2(30),
-        store_id        NUMBER,
-        warehouse_id    NUMBER,
-        quantity_sold   NUMBER,
-        unit_price      NUMBER(10,2),
-        sale_amount     NUMBER(12,2),
-        cost_amount     NUMBER(12,2),
-        margin_percent  NUMBER(5,2),
-        transaction_date DATE,
-        region          VARCHAR2(50),
-        country         VARCHAR2(50),
-        customer_segment VARCHAR2(30),
-        payment_method  VARCHAR2(20),
-        promo_code      VARCHAR2(20),
-        discount_applied NUMBER(5,2)
-      )
-    ';
+    EXECUTE IMMEDIATE 'CREATE TABLE TEST_HCC_QUERY_LOW (transaction_id NUMBER PRIMARY KEY, customer_id NUMBER NOT NULL, order_id NUMBER NOT NULL, sku VARCHAR2(30), product_line VARCHAR2(50), channel VARCHAR2(30), store_id NUMBER, warehouse_id NUMBER, quantity_sold NUMBER, unit_price NUMBER(10,2), sale_amount NUMBER(12,2), cost_amount NUMBER(12,2), margin_percent NUMBER(5,2), transaction_date DATE, region VARCHAR2(50), country VARCHAR2(50), customer_segment VARCHAR2(30), payment_method VARCHAR2(20), promo_code VARCHAR2(20), discount_applied NUMBER(5,2))';
 
     -- Insert large volume of query-optimized data (good for QUERY LOW HCC)
     INSERT INTO TEST_HCC_QUERY_LOW
@@ -614,30 +527,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_TEST_TABLE_GENERATOR AS
       WHEN OTHERS THEN NULL;
     END;
 
-    EXECUTE IMMEDIATE '
-      CREATE TABLE TEST_HCC_QUERY_HIGH (
-        log_id          NUMBER PRIMARY KEY,
-        timestamp       TIMESTAMP,
-        log_date        DATE,
-        log_time        VARCHAR2(20),
-        server_name     VARCHAR2(50),
-        service_name    VARCHAR2(50),
-        process_id      NUMBER,
-        thread_id       NUMBER,
-        log_level       VARCHAR2(20),
-        log_message     VARCHAR2(500),
-        error_code      VARCHAR2(20),
-        error_message   VARCHAR2(500),
-        stack_trace     VARCHAR2(1000),
-        user_id         VARCHAR2(50),
-        session_id      VARCHAR2(50),
-        request_id      VARCHAR2(50),
-        correlation_id  VARCHAR2(50),
-        environment     VARCHAR2(20),
-        version         VARCHAR2(30),
-        component       VARCHAR2(100)
-      )
-    ';
+    EXECUTE IMMEDIATE 'CREATE TABLE TEST_HCC_QUERY_HIGH (log_id NUMBER PRIMARY KEY, timestamp TIMESTAMP, log_date DATE, log_time VARCHAR2(20), server_name VARCHAR2(50), service_name VARCHAR2(50), process_id NUMBER, thread_id NUMBER, log_level VARCHAR2(20), log_message VARCHAR2(500), error_code VARCHAR2(20), error_message VARCHAR2(500), stack_trace VARCHAR2(1000), user_id VARCHAR2(50), session_id VARCHAR2(50), request_id VARCHAR2(50), correlation_id VARCHAR2(50), environment VARCHAR2(20), version VARCHAR2(30), component VARCHAR2(100))';
 
     -- Insert high-volume repetitive log data (good for QUERY HIGH HCC)
     INSERT INTO TEST_HCC_QUERY_HIGH
@@ -722,34 +612,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_TEST_TABLE_GENERATOR AS
       WHEN OTHERS THEN NULL;
     END;
 
-    EXECUTE IMMEDIATE '
-      CREATE TABLE TEST_HCC_ARCHIVE_LOW (
-        archive_id      NUMBER PRIMARY KEY,
-        fiscal_year     NUMBER,
-        fiscal_quarter  VARCHAR2(3),
-        fiscal_month    NUMBER,
-        quarter_name    VARCHAR2(20),
-        month_name      VARCHAR2(20),
-        date_key        DATE,
-        region          VARCHAR2(50),
-        country         VARCHAR2(50),
-        state           VARCHAR2(50),
-        city            VARCHAR2(50),
-        customer_type   VARCHAR2(30),
-        product_category VARCHAR2(50),
-        revenue         NUMBER(12,2),
-        cost            NUMBER(12,2),
-        gross_profit    NUMBER(12,2),
-        units_sold      NUMBER(10),
-        avg_price       NUMBER(10,2),
-        market_share    NUMBER(5,2),
-        growth_rate     NUMBER(5,2),
-        status          VARCHAR2(20),
-        archive_date    DATE,
-        created_by      VARCHAR2(50),
-        notes           VARCHAR2(500)
-      )
-    ';
+    EXECUTE IMMEDIATE 'CREATE TABLE TEST_HCC_ARCHIVE_LOW (archive_id NUMBER PRIMARY KEY, fiscal_year NUMBER, fiscal_quarter VARCHAR2(3), fiscal_month NUMBER, quarter_name VARCHAR2(20), month_name VARCHAR2(20), date_key DATE, region VARCHAR2(50), country VARCHAR2(50), state VARCHAR2(50), city VARCHAR2(50), customer_type VARCHAR2(30), product_category VARCHAR2(50), revenue NUMBER(12,2), cost NUMBER(12,2), gross_profit NUMBER(12,2), units_sold NUMBER(10), avg_price NUMBER(10,2), market_share NUMBER(5,2), growth_rate NUMBER(5,2), status VARCHAR2(20), archive_date DATE, created_by VARCHAR2(50), notes VARCHAR2(500))';
 
     -- Insert historical/archival data (good for ARCHIVE LOW HCC)
     INSERT INTO TEST_HCC_ARCHIVE_LOW
@@ -859,40 +722,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_TEST_TABLE_GENERATOR AS
       WHEN OTHERS THEN NULL;
     END;
 
-    EXECUTE IMMEDIATE '
-      CREATE TABLE TEST_HCC_ARCHIVE_HIGH (
-        record_id       NUMBER PRIMARY KEY,
-        year_month      VARCHAR2(7),
-        year            NUMBER,
-        month           NUMBER,
-        week_num        NUMBER,
-        day_num         NUMBER,
-        record_date     DATE,
-        source_system   VARCHAR2(50),
-        data_type       VARCHAR2(30),
-        status          VARCHAR2(20),
-        severity        VARCHAR2(20),
-        priority        NUMBER,
-        assigned_to     VARCHAR2(50),
-        department      VARCHAR2(50),
-        cost_center     VARCHAR2(20),
-        project_id      VARCHAR2(20),
-        budget_code     VARCHAR2(20),
-        amount          NUMBER(12,2),
-        currency        VARCHAR2(3),
-        description     VARCHAR2(500),
-        long_description CLOB,
-        reference_id    VARCHAR2(50),
-        related_items   VARCHAR2(500),
-        comments        VARCHAR2(500),
-        approval_status VARCHAR2(20),
-        approved_by     VARCHAR2(50),
-        approval_date   DATE,
-        effective_date  DATE,
-        expiry_date     DATE,
-        last_modified   DATE
-      )
-    ';
+    EXECUTE IMMEDIATE 'CREATE TABLE TEST_HCC_ARCHIVE_HIGH (record_id NUMBER PRIMARY KEY, year_month VARCHAR2(7), year NUMBER, month NUMBER, week_num NUMBER, day_num NUMBER, record_date DATE, source_system VARCHAR2(50), data_type VARCHAR2(30), status VARCHAR2(20), severity VARCHAR2(20), priority NUMBER, assigned_to VARCHAR2(50), department VARCHAR2(50), cost_center VARCHAR2(20), project_id VARCHAR2(20), budget_code VARCHAR2(20), amount NUMBER(12,2), currency VARCHAR2(3), description VARCHAR2(500), long_description CLOB, reference_id VARCHAR2(50), related_items VARCHAR2(500), comments VARCHAR2(500), approval_status VARCHAR2(20), approved_by VARCHAR2(50), approval_date DATE, effective_date DATE, expiry_date DATE, last_modified DATE)';
 
     -- Insert massive archival dataset with high repetition (good for ARCHIVE HIGH HCC)
     INSERT INTO TEST_HCC_ARCHIVE_HIGH
