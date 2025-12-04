@@ -23,52 +23,46 @@
 
 PROMPT Inserting compression strategies...
 
-INSERT INTO T_STRATEGIES (
-    STRATEGY_ID,
+INSERT INTO T_COMPRESSION_STRATEGIES (
     STRATEGY_NAME,
     DESCRIPTION,
-    IS_ACTIVE,
-    CREATED_BY,
-    CREATED_DATE
+    CATEGORY,
+    ACTIVE_FLAG,
+    CREATED_BY
 ) VALUES (
-    1,
     'HIGH_PERFORMANCE',
     'Minimal compression overhead for transactional workloads. OLTP for write-heavy tables, HCC QUERY HIGH for frequently accessed read-only data, HCC ARCHIVE LOW for inactive tables. Best for: OLTP systems, real-time analytics, mixed read/write workloads.',
+    'PERFORMANCE',
     'Y',
-    USER,
-    SYSTIMESTAMP
+    USER
 );
 
-INSERT INTO T_STRATEGIES (
-    STRATEGY_ID,
+INSERT INTO T_COMPRESSION_STRATEGIES (
     STRATEGY_NAME,
     DESCRIPTION,
-    IS_ACTIVE,
-    CREATED_BY,
-    CREATED_DATE
+    CATEGORY,
+    ACTIVE_FLAG,
+    CREATED_BY
 ) VALUES (
-    2,
     'BALANCED',
     'Optimal space savings and performance balance. OLTP for write-heavy tables, HCC QUERY LOW for frequently accessed data, HCC ARCHIVE HIGH for inactive/cold tables. Best for: General-purpose databases, mixed read-heavy and read-only workloads, balanced update patterns.',
+    'BALANCED',
     'Y',
-    USER,
-    SYSTIMESTAMP
+    USER
 );
 
-INSERT INTO T_STRATEGIES (
-    STRATEGY_ID,
+INSERT INTO T_COMPRESSION_STRATEGIES (
     STRATEGY_NAME,
     DESCRIPTION,
-    IS_ACTIVE,
-    CREATED_BY,
-    CREATED_DATE
+    CATEGORY,
+    ACTIVE_FLAG,
+    CREATED_BY
 ) VALUES (
-    3,
     'MAXIMUM_COMPRESSION',
     'Maximum space savings with HCC ARCHIVE HIGH compression. OLTP only for write-heavy tables, HCC ARCHIVE HIGH for all read-only and inactive data. Best for: Data warehouses, analytics systems, archive data, read-heavy workloads, cost-sensitive storage environments.',
+    'SPACE',
     'Y',
-    USER,
-    SYSTIMESTAMP
+    USER
 );
 
 COMMIT;
@@ -797,9 +791,9 @@ PROMPT ================================
 SELECT
     STRATEGY_NAME,
     DESCRIPTION,
-    IS_ACTIVE,
+    ACTIVE_FLAG,
     TO_CHAR(CREATED_DATE, 'YYYY-MM-DD HH24:MI:SS') AS CREATED
-FROM T_STRATEGIES
+FROM T_COMPRESSION_STRATEGIES
 ORDER BY STRATEGY_ID;
 
 PROMPT
@@ -812,7 +806,7 @@ SELECT
     COUNT(CASE WHEN r.OBJECT_TYPE = 'TABLE' THEN 1 END) AS TABLE_RULES,
     COUNT(CASE WHEN r.OBJECT_TYPE = 'INDEX' THEN 1 END) AS INDEX_RULES,
     COUNT(CASE WHEN r.OBJECT_TYPE = 'LOB' THEN 1 END) AS LOB_RULES
-FROM T_STRATEGIES s
+FROM T_COMPRESSION_STRATEGIES s
 LEFT JOIN T_STRATEGY_RULES r ON s.STRATEGY_ID = r.STRATEGY_ID
 GROUP BY s.STRATEGY_NAME
 ORDER BY s.STRATEGY_ID;
@@ -828,7 +822,7 @@ SELECT
     ROUND(r.MIN_WRITE_RATIO * 100) || '-' || ROUND(r.MAX_WRITE_RATIO * 100) || '%' AS WRITE_RATIO_RANGE,
     r.COMPRESSION_TYPE,
     r.PRIORITY
-FROM T_STRATEGIES s
+FROM T_COMPRESSION_STRATEGIES s
 JOIN T_STRATEGY_RULES r ON s.STRATEGY_ID = r.STRATEGY_ID
 WHERE r.OBJECT_TYPE = 'TABLE'
 ORDER BY s.STRATEGY_ID, r.PRIORITY
