@@ -878,10 +878,15 @@ CREATE OR REPLACE PACKAGE BODY PKG_TEST_TABLE_GENERATOR AS
     END LOOP;
 
     DBMS_OUTPUT.PUT_LINE('');
-    DBMS_OUTPUT.PUT_LINE('Total size: ' ||
-      ROUND((SELECT SUM(blocks * 8192 / 1024 / 1024)
-             FROM user_tables
-             WHERE table_name LIKE 'TEST_%'), 2) || ' MB');
+    DECLARE
+      v_total_size NUMBER;
+    BEGIN
+      SELECT ROUND(SUM(blocks * 8192 / 1024 / 1024), 2)
+      INTO v_total_size
+      FROM user_tables
+      WHERE table_name LIKE 'TEST_%';
+      DBMS_OUTPUT.PUT_LINE('Total size: ' || NVL(v_total_size, 0) || ' MB');
+    END;
   END report_test_tables;
 
 BEGIN
