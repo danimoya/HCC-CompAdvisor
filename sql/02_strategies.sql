@@ -288,6 +288,31 @@ INSERT INTO T_STRATEGY_RULES (
     'Rarely used indexes with minimal access: HCC ARCHIVE LOW for excellent space savings'
 );
 
+-- Rule 9: LOBs - No compression
+INSERT INTO T_STRATEGY_RULES (
+    RULE_ID,
+    STRATEGY_ID,
+    OBJECT_TYPE,
+    HOTNESS_MIN,
+    HOTNESS_MAX,
+    MIN_WRITE_RATIO,
+    MAX_WRITE_RATIO,
+    COMPRESSION_TYPE,
+    PRIORITY,
+    RULE_DESCRIPTION
+) VALUES (
+    SEQ_STRATEGY_RULES.NEXTVAL,
+    1,
+    'LOB',
+    0,
+    100,
+    0,
+    1.0,
+    'NONE',
+    9,
+    'LOBs: Deferred to Oracle''s default SecureFile compression in Exadata'
+);
+
 -- ---------------------------------------------------------------------------
 -- STRATEGY RULES: BALANCED
 -- ---------------------------------------------------------------------------
@@ -498,6 +523,31 @@ INSERT INTO T_STRATEGY_RULES (
     'ARCHIVE HIGH',
     17,
     'Cold indexes: HCC ARCHIVE HIGH maximizes space recovery for rarely accessed indexes'
+);
+
+-- Rule 18: LOBs - No compression
+INSERT INTO T_STRATEGY_RULES (
+    RULE_ID,
+    STRATEGY_ID,
+    OBJECT_TYPE,
+    HOTNESS_MIN,
+    HOTNESS_MAX,
+    MIN_WRITE_RATIO,
+    MAX_WRITE_RATIO,
+    COMPRESSION_TYPE,
+    PRIORITY,
+    RULE_DESCRIPTION
+) VALUES (
+    SEQ_STRATEGY_RULES.NEXTVAL,
+    2,
+    'LOB',
+    0,
+    100,
+    0,
+    1.0,
+    'NONE',
+    18,
+    'LOBs: Rely on SecureFile automatic compression in Exadata'
 );
 
 -- ---------------------------------------------------------------------------
@@ -711,6 +761,31 @@ INSERT INTO T_STRATEGY_RULES (
     'ARCHIVE HIGH',
     26,
     'Cold indexes: Compress all indexes with HCC ARCHIVE HIGH for maximum space recovery'
+);
+
+-- Rule 27: LOBs - No compression
+INSERT INTO T_STRATEGY_RULES (
+    RULE_ID,
+    STRATEGY_ID,
+    OBJECT_TYPE,
+    HOTNESS_MIN,
+    HOTNESS_MAX,
+    MIN_WRITE_RATIO,
+    MAX_WRITE_RATIO,
+    COMPRESSION_TYPE,
+    PRIORITY,
+    RULE_DESCRIPTION
+) VALUES (
+    SEQ_STRATEGY_RULES.NEXTVAL,
+    3,
+    'LOB',
+    0,
+    100,
+    0,
+    1.0,
+    'NONE',
+    27,
+    'LOBs: Oracle Exadata handles LOB compression automatically via SecureFile'
 );
 
 COMMIT;
