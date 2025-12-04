@@ -420,6 +420,64 @@ FROM DUAL;
 COMMENT ON TABLE v_advisor_summary IS 'Executive dashboard summary with key metrics and statistics';
 
 -- ============================================================================
+-- View: V_COMPRESSION_ANALYSIS_WITH_AGE
+-- Purpose: Compression analysis results with calculated DATA_AGE_DAYS
+-- Note: DATA_AGE_DAYS is calculated at query time as TRUNC(SYSDATE - LAST_ANALYZED)
+-- ============================================================================
+CREATE OR REPLACE VIEW v_compression_analysis_with_age AS
+SELECT
+    analysis_id,
+    owner,
+    object_name,
+    object_type,
+    partition_name,
+    subpartition_name,
+    size_bytes,
+    size_mb,
+    size_gb,
+    row_count,
+    block_count,
+    avg_row_length,
+    basic_ratio,
+    oltp_ratio,
+    adv_low_ratio,
+    adv_high_ratio,
+    best_ratio,
+    insert_count,
+    update_count,
+    delete_count,
+    total_dml,
+    logical_reads,
+    physical_reads,
+    access_frequency,
+    last_access_date,
+    hotness_score,
+    hotness_category,
+    read_ratio,
+    write_ratio,
+    dml_24h_rate,
+    last_analyzed,
+    TRUNC(SYSDATE - LAST_ANALYZED) AS data_age_days,
+    current_compression,
+    compression_enabled,
+    advisable_compression,
+    recommendation_reason,
+    confidence_score,
+    projected_savings_bytes,
+    projected_savings_mb,
+    projected_savings_pct,
+    advisor_run_id,
+    analysis_date,
+    analysis_timestamp,
+    analysis_duration_sec,
+    sample_size_rows,
+    last_updated
+FROM
+    t_compression_analysis;
+
+COMMENT ON TABLE v_compression_analysis_with_age IS 'T_COMPRESSION_ANALYSIS with calculated DATA_AGE_DAYS (days since LAST_ANALYZED)';
+
+-- ============================================================================
 -- Grant SELECT privileges on views to PUBLIC or specific role
 -- ============================================================================
 PROMPT Granting SELECT privileges on views...
@@ -427,6 +485,7 @@ PROMPT Granting SELECT privileges on views...
 GRANT SELECT ON v_compression_candidates TO PUBLIC;
 GRANT SELECT ON v_compression_summary TO PUBLIC;
 GRANT SELECT ON v_compression_history TO PUBLIC;
+GRANT SELECT ON v_compression_analysis_with_age TO PUBLIC;
 GRANT SELECT ON v_hot_objects TO PUBLIC;
 GRANT SELECT ON v_cold_objects TO PUBLIC;
 GRANT SELECT ON v_compression_effectiveness TO PUBLIC;
@@ -443,6 +502,7 @@ PROMPT Creating public synonyms...
 CREATE OR REPLACE PUBLIC SYNONYM v_compression_candidates FOR v_compression_candidates;
 CREATE OR REPLACE PUBLIC SYNONYM v_compression_summary FOR v_compression_summary;
 CREATE OR REPLACE PUBLIC SYNONYM v_compression_history FOR v_compression_history;
+CREATE OR REPLACE PUBLIC SYNONYM v_compression_analysis_with_age FOR v_compression_analysis_with_age;
 CREATE OR REPLACE PUBLIC SYNONYM v_hot_objects FOR v_hot_objects;
 CREATE OR REPLACE PUBLIC SYNONYM v_cold_objects FOR v_cold_objects;
 CREATE OR REPLACE PUBLIC SYNONYM v_compression_effectiveness FOR v_compression_effectiveness;
@@ -491,13 +551,14 @@ PROMPT Available Views:
 PROMPT   1. V_COMPRESSION_CANDIDATES      - All compression recommendations
 PROMPT   2. V_COMPRESSION_SUMMARY         - Aggregated statistics by owner/type
 PROMPT   3. V_COMPRESSION_HISTORY         - Execution history and results
-PROMPT   4. V_HOT_OBJECTS                 - Write-intensive objects (hotness >= 70)
-PROMPT   5. V_COLD_OBJECTS                - Archive candidates (hotness < 20)
-PROMPT   6. V_COMPRESSION_EFFECTIVENESS   - Compression performance analysis
-PROMPT   7. V_STRATEGY_RECOMMENDATIONS    - Strategy comparison view
-PROMPT   8. V_SPACE_ANALYSIS              - Tablespace space analysis
-PROMPT   9. V_EXECUTION_QUEUE             - Prioritized execution queue
-PROMPT  10. V_ADVISOR_SUMMARY             - Executive dashboard summary
+PROMPT   4. V_COMPRESSION_ANALYSIS_WITH_AGE - Analysis results with calculated data age
+PROMPT   5. V_HOT_OBJECTS                 - Write-intensive objects (hotness >= 70)
+PROMPT   6. V_COLD_OBJECTS                - Archive candidates (hotness < 20)
+PROMPT   7. V_COMPRESSION_EFFECTIVENESS   - Compression performance analysis
+PROMPT   8. V_STRATEGY_RECOMMENDATIONS    - Strategy comparison view
+PROMPT   9. V_SPACE_ANALYSIS              - Tablespace space analysis
+PROMPT  10. V_EXECUTION_QUEUE             - Prioritized execution queue
+PROMPT  11. V_ADVISOR_SUMMARY             - Executive dashboard summary
 PROMPT
 PROMPT Usage Examples:
 PROMPT   SELECT * FROM v_advisor_summary;
