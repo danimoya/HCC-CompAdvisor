@@ -922,57 +922,21 @@ PROMPT =========================================================================
 PROMPT Test Tables Created Successfully!
 PROMPT ================================================================================
 PROMPT
-PROMPT Available Tables and Their Compression Target Types:
+PROMPT Test Tables Summary:
+PROMPT   1. TEST_BASIC_COMPRESSION (1M) - BASIC
+PROMPT   2. TEST_OLTP_COMPRESSION (2M) - OLTP
+PROMPT   3. TEST_ADV_LOW_COMPRESSION (3M) - QUERY LOW
+PROMPT   4. TEST_ADV_HIGH_COMPRESSION (5M) - QUERY HIGH
+PROMPT   5. TEST_HCC_QUERY_LOW (10M) - HCC QUERY LOW (Exadata)
+PROMPT   6. TEST_HCC_QUERY_HIGH (20M) - HCC QUERY HIGH (Exadata)
+PROMPT   7. TEST_HCC_ARCHIVE_LOW (5M) - HCC ARCHIVE LOW (Exadata)
+PROMPT   8. TEST_HCC_ARCHIVE_HIGH (10M) - HCC ARCHIVE HIGH (Exadata)
 PROMPT
-PROMPT 1. TEST_BASIC_COMPRESSION (1M rows)
-PROMPT    Compression Type: BASIC
-PROMPT    Use Case: General purpose, small to medium size
-PROMPT    Estimated Size: ~250 MB
+PROMPT Total: ~52 Million Records / ~15+ GB test data
 PROMPT
-PROMPT 2. TEST_OLTP_COMPRESSION (2M rows)
-PROMPT    Compression Type: OLTP
-PROMPT    Use Case: High write activity, frequent updates
-PROMPT    Estimated Size: ~500 MB
-PROMPT
-PROMPT 3. TEST_ADV_LOW_COMPRESSION (3M rows)
-PROMPT    Compression Type: ADV_LOW (QUERY LOW)
-PROMPT    Use Case: Read-heavy, moderate compression
-PROMPT    Estimated Size: ~750 MB
-PROMPT
-PROMPT 4. TEST_ADV_HIGH_COMPRESSION (5M rows)
-PROMPT    Compression Type: ADV_HIGH (QUERY HIGH)
-PROMPT    Use Case: Read-heavy, aggressive compression
-PROMPT    Estimated Size: ~1.25 GB
-PROMPT
-PROMPT 5. TEST_HCC_QUERY_LOW (10M rows)
-PROMPT    Compression Type: QUERY_LOW (HCC - Exadata only)
-PROMPT    Use Case: Exadata, query-optimized, balanced
-PROMPT    Estimated Size: ~2.5 GB
-PROMPT
-PROMPT 6. TEST_HCC_QUERY_HIGH (20M rows)
-PROMPT    Compression Type: QUERY_HIGH (HCC - Exadata only)
-PROMPT    Use Case: Exadata, query-heavy, high compression
-PROMPT    Estimated Size: ~5 GB
-PROMPT
-PROMPT 7. TEST_HCC_ARCHIVE_LOW (5M rows)
-PROMPT    Compression Type: ARCHIVE_LOW (HCC - Exadata only)
-PROMPT    Use Case: Exadata, archival data, high compression
-PROMPT    Estimated Size: ~1.25 GB
-PROMPT
-PROMPT 8. TEST_HCC_ARCHIVE_HIGH (10M rows)
-PROMPT    Compression Type: ARCHIVE_HIGH (HCC - Exadata only)
-PROMPT    Use Case: Exadata, archival data, maximum compression
-PROMPT    Estimated Size: ~2.5 GB
-PROMPT
-PROMPT TOTAL: ~52 Million Records / ~15+ GB of production-scale test data
-PROMPT
-PROMPT To analyze these tables for compression candidates:
+PROMPT Next steps:
 PROMPT   EXEC PKG_COMPRESSION_ADVISOR.run_analysis;
-PROMPT
-PROMPT To compress a specific table:
-PROMPT   EXEC PKG_COMPRESSION_EXECUTOR.compress_table('&OWNER', 'TEST_BASIC_COMPRESSION', 'BASIC');
-PROMPT
-PROMPT To drop all test tables:
+PROMPT   EXEC PKG_COMPRESSION_EXECUTOR.compress_table('&OWNER', 'TEST_TABLE_NAME', 'COMPRESSION_TYPE');
 PROMPT   EXEC PKG_TEST_TABLE_GENERATOR.drop_all_test_tables;
 PROMPT
 PROMPT ================================================================================
