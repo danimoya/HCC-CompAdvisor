@@ -288,31 +288,6 @@ INSERT INTO T_STRATEGY_RULES (
     'Rarely used indexes with minimal access: HCC ARCHIVE LOW for excellent space savings'
 );
 
--- Rule 9: LOBs - No compression
-INSERT INTO T_STRATEGY_RULES (
-    RULE_ID,
-    STRATEGY_ID,
-    OBJECT_TYPE,
-    HOTNESS_MIN,
-    HOTNESS_MAX,
-    MIN_WRITE_RATIO,
-    MAX_WRITE_RATIO,
-    COMPRESSION_TYPE,
-    PRIORITY,
-    RULE_DESCRIPTION
-) VALUES (
-    SEQ_STRATEGY_RULES.NEXTVAL,
-    1,
-    'LOB',
-    0,
-    100,
-    0,
-    1.0,
-    'NOCOMPRESS',
-    9,
-    'LOBs: Deferred to Oracle''s default SecureFile compression in Exadata'
-);
-
 -- ---------------------------------------------------------------------------
 -- STRATEGY RULES: BALANCED
 -- ---------------------------------------------------------------------------
@@ -523,31 +498,6 @@ INSERT INTO T_STRATEGY_RULES (
     'ARCHIVE HIGH',
     17,
     'Cold indexes: HCC ARCHIVE HIGH maximizes space recovery for rarely accessed indexes'
-);
-
--- Rule 18: LOBs - No compression
-INSERT INTO T_STRATEGY_RULES (
-    RULE_ID,
-    STRATEGY_ID,
-    OBJECT_TYPE,
-    HOTNESS_MIN,
-    HOTNESS_MAX,
-    MIN_WRITE_RATIO,
-    MAX_WRITE_RATIO,
-    COMPRESSION_TYPE,
-    PRIORITY,
-    RULE_DESCRIPTION
-) VALUES (
-    SEQ_STRATEGY_RULES.NEXTVAL,
-    2,
-    'LOB',
-    0,
-    100,
-    0,
-    1.0,
-    'NOCOMPRESS',
-    18,
-    'LOBs: Rely on SecureFile automatic compression in Exadata'
 );
 
 -- ---------------------------------------------------------------------------
@@ -763,31 +713,6 @@ INSERT INTO T_STRATEGY_RULES (
     'Cold indexes: Compress all indexes with HCC ARCHIVE HIGH for maximum space recovery'
 );
 
--- Rule 27: LOBs - No compression
-INSERT INTO T_STRATEGY_RULES (
-    RULE_ID,
-    STRATEGY_ID,
-    OBJECT_TYPE,
-    HOTNESS_MIN,
-    HOTNESS_MAX,
-    MIN_WRITE_RATIO,
-    MAX_WRITE_RATIO,
-    COMPRESSION_TYPE,
-    PRIORITY,
-    RULE_DESCRIPTION
-) VALUES (
-    SEQ_STRATEGY_RULES.NEXTVAL,
-    3,
-    'LOB',
-    0,
-    100,
-    0,
-    1.0,
-    'NOCOMPRESS',
-    27,
-    'LOBs: Oracle Exadata handles LOB compression automatically via SecureFile'
-);
-
 COMMIT;
 
 -- ---------------------------------------------------------------------------
@@ -842,10 +767,11 @@ FETCH FIRST 15 ROWS ONLY;
 PROMPT
 PROMPT Strategy setup complete!
 PROMPT =======================
-PROMPT 3 strategies configured with 27 total rules
-PROMPT - HIGH_PERFORMANCE: 9 rules (OLTP, QUERY HIGH, ARCHIVE LOW)
-PROMPT - BALANCED: 9 rules (OLTP, QUERY HIGH/LOW, ARCHIVE HIGH)
-PROMPT - MAXIMUM_COMPRESSION: 9 rules (OLTP, QUERY HIGH, ARCHIVE HIGH)
+PROMPT 3 strategies configured with 24 total rules
+PROMPT - HIGH_PERFORMANCE: 8 rules (OLTP, QUERY HIGH, QUERY LOW, ARCHIVE LOW - Tables and Indexes)
+PROMPT - BALANCED: 8 rules (OLTP, QUERY HIGH/LOW, ARCHIVE HIGH - Tables and Indexes)
+PROMPT - MAXIMUM_COMPRESSION: 8 rules (OLTP, QUERY HIGH, ARCHIVE HIGH - Tables and Indexes)
+PROMPT Note: LOBs use Oracle Exadata SecureFile automatic compression
 PROMPT
 
 -- ===========================================================================
