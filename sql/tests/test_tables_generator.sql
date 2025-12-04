@@ -832,18 +832,22 @@ CREATE OR REPLACE PACKAGE BODY PKG_TEST_TABLE_GENERATOR AS
   -- Drop All Tables
   -- ========================================================================
   PROCEDURE drop_all_test_tables IS
+    TYPE table_name_table IS TABLE OF VARCHAR2(50);
+    v_tables table_name_table := table_name_table(
+      'TEST_BASIC_COMPRESSION', 'TEST_OLTP_COMPRESSION', 'TEST_ADV_LOW_COMPRESSION',
+      'TEST_ADV_HIGH_COMPRESSION', 'TEST_HCC_QUERY_LOW', 'TEST_HCC_QUERY_HIGH',
+      'TEST_HCC_ARCHIVE_LOW', 'TEST_HCC_ARCHIVE_HIGH'
+    );
   BEGIN
     log_message('=== Dropping All Test Tables ===');
 
-    FOR t IN ('TEST_BASIC_COMPRESSION', 'TEST_OLTP_COMPRESSION', 'TEST_ADV_LOW_COMPRESSION',
-              'TEST_ADV_HIGH_COMPRESSION', 'TEST_HCC_QUERY_LOW', 'TEST_HCC_QUERY_HIGH',
-              'TEST_HCC_ARCHIVE_LOW', 'TEST_HCC_ARCHIVE_HIGH') LOOP
+    FOR i IN 1 .. v_tables.COUNT LOOP
       BEGIN
-        EXECUTE IMMEDIATE 'DROP TABLE ' || t;
-        log_message('✓ Dropped ' || t);
+        EXECUTE IMMEDIATE 'DROP TABLE ' || v_tables(i);
+        log_message('✓ Dropped ' || v_tables(i));
       EXCEPTION
         WHEN OTHERS THEN
-          log_message('! ' || t || ' not found (OK)');
+          log_message('! ' || v_tables(i) || ' not found (OK)');
       END;
     END LOOP;
 
