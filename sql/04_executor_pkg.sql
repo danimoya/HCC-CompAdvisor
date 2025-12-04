@@ -3,6 +3,17 @@
 -- Purpose: Execute compression operations with safety checks and logging
 -- Author: Daniel Moya (copyright), GitHub: github.com/danimoya Website: danielmoya.cv
 -- Date: 2025-11-13
+--
+-- COMPRESSION TYPE SUPPORT:
+--   Standard Platform (Oracle 23c Free):
+--     - BASIC, OLTP (tables)
+--     - ADV_LOW, ADV_HIGH (indexes)
+--
+--   Exadata Platform (HCC):
+--     - QUERY_LOW, QUERY_HIGH (tables & indexes)
+--     - ARCHIVE_LOW, ARCHIVE_HIGH (tables only)
+--
+-- All operations preserve original tablespaces for partitioned and regular objects
 --------------------------------------------------------------------------------
 
 --------------------------------------------------------------------------------
@@ -10,12 +21,18 @@
 --------------------------------------------------------------------------------
 CREATE OR REPLACE PACKAGE PKG_COMPRESSION_EXECUTOR AS
 
-  -- Constants for compression types
+  -- Constants for compression types (Standard Platform)
   C_COMPRESS_BASIC     CONSTANT VARCHAR2(30) := 'BASIC';
   C_COMPRESS_OLTP      CONSTANT VARCHAR2(30) := 'OLTP';
   C_COMPRESS_ADV_LOW   CONSTANT VARCHAR2(30) := 'ADV_LOW';
   C_COMPRESS_ADV_HIGH  CONSTANT VARCHAR2(30) := 'ADV_HIGH';
   C_NOCOMPRESS         CONSTANT VARCHAR2(30) := 'NOCOMPRESS';
+
+  -- Constants for HCC compression types (Exadata Platform)
+  C_COMPRESS_QUERY_LOW   CONSTANT VARCHAR2(30) := 'QUERY_LOW';
+  C_COMPRESS_QUERY_HIGH  CONSTANT VARCHAR2(30) := 'QUERY_HIGH';
+  C_COMPRESS_ARCHIVE_LOW CONSTANT VARCHAR2(30) := 'ARCHIVE_LOW';
+  C_COMPRESS_ARCHIVE_HIGH CONSTANT VARCHAR2(30) := 'ARCHIVE_HIGH';
 
   -- Exception codes
   E_OBJECT_NOT_FOUND   EXCEPTION;
@@ -32,12 +49,14 @@ CREATE OR REPLACE PACKAGE PKG_COMPRESSION_EXECUTOR AS
 
   /**
    * Compress a table with comprehensive safety checks
+   * Supports both standard (BASIC, OLTP, ADV_LOW/HIGH) and HCC (QUERY/ARCHIVE LOW/HIGH) types
    *
    * @param p_owner           Table owner
    * @param p_table_name      Table name
-   * @param p_compression_type Compression type (BASIC, OLTP, NOCOMPRESS)
+   * @param p_compression_type Compression type (BASIC, OLTP, QUERY_LOW, QUERY_HIGH, ARCHIVE_LOW, ARCHIVE_HIGH, NOCOMPRESS)
    * @param p_online          Use ONLINE clause if supported
    * @param p_dry_run         Generate DDL without executing
+   * @note HCC compression types (QUERY/ARCHIVE LOW/HIGH) are Exadata-only
    */
   PROCEDURE compress_table(
     p_owner IN VARCHAR2,
@@ -49,11 +68,14 @@ CREATE OR REPLACE PACKAGE PKG_COMPRESSION_EXECUTOR AS
 
   /**
    * Compress an index with validation
+   * Supports Advanced compression (ADV_LOW, ADV_HIGH) on standard platforms
+   * and HCC Query compression on Exadata (QUERY_LOW, QUERY_HIGH)
    *
    * @param p_owner           Index owner
    * @param p_index_name      Index name
-   * @param p_compression_type Compression type (ADV_LOW, ADV_HIGH, NOCOMPRESS)
+   * @param p_compression_type Compression type (ADV_LOW, ADV_HIGH, QUERY_LOW, QUERY_HIGH, NOCOMPRESS)
    * @param p_online          Use ONLINE clause
+   * @note HCC compression types are Exadata-only; Archive types (ARCHIVE_LOW/HIGH) are not supported for indexes
    */
   PROCEDURE compress_index(
     p_owner IN VARCHAR2,
@@ -237,12 +259,15 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
 
   /**
    * Get compression clause for DDL
+   * Supports both standard (BASIC, OLTP, ADV_LOW/HIGH) and HCC types (QUERY/ARCHIVE LOW/HIGH)
+   * HCC types are only supported on Exadata and will be mapped via PKG_EXADATA_DETECTION
    */
   FUNCTION get_compression_clause(
     p_compression_type IN VARCHAR2
   ) RETURN VARCHAR2 IS
   BEGIN
     CASE UPPER(p_compression_type)
+      -- Standard platform compression types
       WHEN C_COMPRESS_BASIC THEN
         RETURN 'COMPRESS BASIC';
       WHEN C_COMPRESS_OLTP THEN
@@ -253,6 +278,15 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
         RETURN 'COMPRESS ADVANCED HIGH';
       WHEN C_NOCOMPRESS THEN
         RETURN 'NOCOMPRESS';
+      -- HCC compression types (Exadata only)
+      WHEN C_COMPRESS_QUERY_LOW THEN
+        RETURN 'COMPRESS FOR QUERY LOW';
+      WHEN C_COMPRESS_QUERY_HIGH THEN
+        RETURN 'COMPRESS FOR QUERY HIGH';
+      WHEN C_COMPRESS_ARCHIVE_LOW THEN
+        RETURN 'COMPRESS FOR ARCHIVE LOW';
+      WHEN C_COMPRESS_ARCHIVE_HIGH THEN
+        RETURN 'COMPRESS FOR ARCHIVE HIGH';
       ELSE
         RAISE_APPLICATION_ERROR(-20002, 'Invalid compression type: ' || p_compression_type);
     END CASE;
@@ -596,8 +630,15 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
     log_message('Compression Type: ' || p_compression_type);
 
     -- Validate compression type for indexes
-    IF p_compression_type NOT IN (C_COMPRESS_ADV_LOW, C_COMPRESS_ADV_HIGH, C_NOCOMPRESS) THEN
-      RAISE_APPLICATION_ERROR(-20002, 'Invalid index compression type. Use ADV_LOW, ADV_HIGH, or NOCOMPRESS');
+    -- Supports: ADV_LOW, ADV_HIGH (standard), QUERY_LOW, QUERY_HIGH (HCC), NOCOMPRESS
+    -- Note: ARCHIVE_LOW/HIGH are not supported for indexes
+    IF p_compression_type NOT IN (
+        C_COMPRESS_ADV_LOW, C_COMPRESS_ADV_HIGH,
+        C_COMPRESS_QUERY_LOW, C_COMPRESS_QUERY_HIGH,
+        C_NOCOMPRESS
+    ) THEN
+      RAISE_APPLICATION_ERROR(-20002,
+        'Invalid index compression type. Use ADV_LOW, ADV_HIGH, QUERY_LOW, QUERY_HIGH, or NOCOMPRESS');
     END IF;
 
     -- Validate object

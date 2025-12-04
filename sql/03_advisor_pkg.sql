@@ -1,9 +1,12 @@
 -- ============================================================================
 -- Package: PKG_COMPRESSION_ADVISOR
 -- Description: Comprehensive compression analysis and recommendation system
---              Adapted for Oracle 23c Free (no HCC support)
+--              Platform-aware support (Oracle 23c Free & Exadata HCC)
 -- Features:
 --   - Multi-strategy analysis (Aggressive/Balanced/Conservative)
+--   - Platform detection (Standard vs Exadata)
+--   - HCC support on Exadata (QUERY/ARCHIVE LOW/HIGH)
+--   - Fallback to BASIC/OLTP on standard platforms
 --   - Parallel processing support
 --   - DML hotness tracking
 --   - Comprehensive object support (Tables/Indexes/LOBs)
@@ -158,14 +161,18 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
 
   /**
    * Initialize compression type mappings
+   * Note: Actual compression type selection is platform-aware via PKG_EXADATA_DETECTION
+   * This package provides the analysis framework; execution uses the detection package
+   * for HCC support on Exadata and fallback to BASIC/OLTP on standard platforms.
    */
   PROCEDURE init_compression_map IS
   BEGIN
-    -- Table compression mappings (no HCC in Oracle Free)
+    -- Table compression mappings (platform-aware via PKG_EXADATA_DETECTION)
+    -- STANDARD PLATFORM TYPES (Oracle 23c Free):
     g_compression_map('NONE') := 'NOCOMPRESS';
     g_compression_map('BASIC') := 'COMPRESS BASIC';
     g_compression_map('OLTP') := 'COMPRESS FOR OLTP';
-    g_compression_map('ADVANCED') := 'COMPRESS FOR OLTP'; -- Best available
+    g_compression_map('ADVANCED') := 'COMPRESS FOR OLTP';
 
     -- Index compression mappings
     g_compression_map('INDEX_ADVANCED_LOW') := 'COMPRESS ADVANCED LOW';
@@ -175,6 +182,12 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
     g_compression_map('LOB_LOW') := 'COMPRESS LOW';
     g_compression_map('LOB_MEDIUM') := 'COMPRESS MEDIUM';
     g_compression_map('LOB_HIGH') := 'COMPRESS HIGH';
+
+    -- HCC COMPRESSION TYPES (Exadata - enabled via PKG_EXADATA_DETECTION):
+    -- - QUERY_LOW: COMPRESS FOR QUERY LOW
+    -- - QUERY_HIGH: COMPRESS FOR QUERY HIGH
+    -- - ARCHIVE_LOW: COMPRESS FOR ARCHIVE LOW
+    -- - ARCHIVE_HIGH: COMPRESS FOR ARCHIVE HIGH
   END init_compression_map;
 
   /**

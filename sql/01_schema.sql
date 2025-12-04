@@ -1,12 +1,12 @@
 /*******************************************************************************
- * HCC Compression Advisor - Schema Objects (Oracle 23c Free)
+ * HCC Compression Advisor - Schema Objects (Oracle 23c Free & Exadata)
  * Version: 1.0.0
  * Date: 2025-11-13
  *
  * DESCRIPTION:
  *   Production-ready schema for compression analysis and execution tracking.
- *   Adapted for Oracle 23c Free (no HCC compression support).
- *   Supports: BASIC, OLTP (ADVANCED), LOW, HIGH compression types.
+ *   Platform-aware support: Standard compression for Oracle 23c Free,
+ *   HCC (Hybrid Columnar Compression) for Oracle Exadata.
  *
  * SUPPORTED COMPRESSION TYPES (Oracle 23c Free):
  *   - BASIC (ROW STORE COMPRESS BASIC)
@@ -14,9 +14,11 @@
  *   - ADV_LOW (COLUMN STORE COMPRESS FOR QUERY LOW - if licensed)
  *   - ADV_HIGH (COLUMN STORE COMPRESS FOR QUERY HIGH - if licensed)
  *
- * NOT SUPPORTED (HCC - requires Exadata/ZFS):
- *   - QUERY LOW/HIGH (HCC)
- *   - ARCHIVE LOW/HIGH (HCC)
+ * SUPPORTED COMPRESSION TYPES (Oracle Exadata - HCC):
+ *   - QUERY LOW (HCC COMPRESS FOR QUERY LOW)
+ *   - QUERY HIGH (HCC COMPRESS FOR QUERY HIGH)
+ *   - ARCHIVE LOW (HCC COMPRESS FOR ARCHIVE LOW)
+ *   - ARCHIVE HIGH (HCC COMPRESS FOR ARCHIVE HIGH)
  *
  * USAGE:
  *   Connect as schema owner (e.g., COMPRESSION_MGR) and execute:
