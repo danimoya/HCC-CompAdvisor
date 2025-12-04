@@ -1,30 +1,24 @@
 -- ===========================================================================
 -- File: 02_strategies.sql
--- Description: Predefined compression strategies and rules for HCC CompAdvisor
--- Version: 2.0.0
--- Oracle Versions: 23c Free & Exadata (with HCC support)
+-- Description: Predefined compression strategies for Exadata HCC CompAdvisor
+-- Version: 2.1.0
+-- Platform: Oracle Exadata (HCC - Hybrid Columnar Compression)
 -- ===========================================================================
--- COMPRESSION TYPE REFERENCE:
---   Oracle 23c Free:
---     - BASIC: Row-store compression, moderate ratio, minimal overhead
---     - OLTP: Advanced row-store, minimal overhead, suitable for write-heavy
---     - ADVANCED LOW: Column-store for query workloads (if licensed)
---     - ADVANCED HIGH: Column-store, high compression (if licensed)
---   Exadata HCC (Hybrid Columnar Compression):
---     - QUERY LOW: Column-store, moderate compression, fast query performance
---     - QUERY HIGH: Column-store, aggressive compression, optimized for analytics
---     - ARCHIVE LOW: Column-store, very high compression, for inactive data
---     - ARCHIVE HIGH: Column-store, maximum compression, archive-focused
+-- HCC COMPRESSION TYPES:
+--   - OLTP: For write-heavy/frequently modified tables (minimal overhead)
+--   - QUERY LOW: For frequently accessed read-heavy data (moderate compression)
+--   - QUERY HIGH: For very frequently accessed analytics data (aggressive compression)
+--   - ARCHIVE LOW: For inactive/cold data (very high compression)
+--   - ARCHIVE HIGH: For archived data (maximum compression)
 -- ===========================================================================
 
 -- ---------------------------------------------------------------------------
 -- STRATEGY DEFINITIONS
 -- ---------------------------------------------------------------------------
--- Three core strategies balancing performance vs. space savings:
--- Platform-aware recommendations for both Oracle 23c Free and Exadata HCC
---   1. HIGH_PERFORMANCE: Minimal overhead, optimized for transactional workloads
---   2. BALANCED: Optimal space/performance balance for mixed workloads
---   3. MAXIMUM_COMPRESSION: Aggressive space savings for read-heavy/archive data
+-- Three core Exadata HCC strategies balancing performance vs. space savings:
+--   1. HIGH_PERFORMANCE: OLTP for writes, QUERY HIGH for frequent reads, ARCHIVE LOW for inactive
+--   2. BALANCED: OLTP for writes, QUERY LOW for reads, ARCHIVE HIGH for inactive
+--   3. MAXIMUM_COMPRESSION: OLTP only for writes, ARCHIVE HIGH for all read-heavy/inactive data
 -- ---------------------------------------------------------------------------
 
 PROMPT Inserting compression strategies...
@@ -39,7 +33,7 @@ INSERT INTO T_STRATEGIES (
 ) VALUES (
     1,
     'HIGH_PERFORMANCE',
-    'Minimal compression overhead strategy optimized for transactional workloads. Exadata: OLTP for writes, HCC QUERY HIGH for frequent reads, HCC ARCHIVE LOW for inactive data. 23c Free: OLTP for writes, ADVANCED HIGH for reads, ADVANCED LOW for inactive. Best for: OLTP systems, real-time analytics, frequently updated tables.',
+    'Minimal compression overhead for transactional workloads. OLTP for write-heavy tables, HCC QUERY HIGH for frequently accessed read-only data, HCC ARCHIVE LOW for inactive tables. Best for: OLTP systems, real-time analytics, mixed read/write workloads.',
     'Y',
     USER,
     SYSTIMESTAMP
@@ -55,7 +49,7 @@ INSERT INTO T_STRATEGIES (
 ) VALUES (
     2,
     'BALANCED',
-    'Balanced strategy optimizing space savings and performance. Exadata: OLTP for writes, HCC QUERY LOW for frequent reads, HCC ARCHIVE HIGH for inactive data. 23c Free: OLTP for writes, ADVANCED LOW for reads, ADVANCED HIGH for inactive. Best for: General-purpose databases, mixed workloads, moderate update patterns.',
+    'Optimal space savings and performance balance. OLTP for write-heavy tables, HCC QUERY LOW for frequently accessed data, HCC ARCHIVE HIGH for inactive/cold tables. Best for: General-purpose databases, mixed read-heavy and read-only workloads, balanced update patterns.',
     'Y',
     USER,
     SYSTIMESTAMP
@@ -71,7 +65,7 @@ INSERT INTO T_STRATEGIES (
 ) VALUES (
     3,
     'MAXIMUM_COMPRESSION',
-    'Aggressive compression strategy maximizing space savings. Exadata: OLTP only for highly modified tables, HCC ARCHIVE HIGH for all read-heavy and inactive data. 23c Free: OLTP for writes, ADVANCED HIGH for all read-only and inactive data. Best for: Archive data, read-heavy workloads, data warehouses, analytics tables, low-update data, cost-sensitive environments.',
+    'Maximum space savings with HCC ARCHIVE HIGH compression. OLTP only for write-heavy tables, HCC ARCHIVE HIGH for all read-only and inactive data. Best for: Data warehouses, analytics systems, archive data, read-heavy workloads, cost-sensitive storage environments.',
     'Y',
     USER,
     SYSTIMESTAMP
@@ -82,15 +76,10 @@ COMMIT;
 -- ---------------------------------------------------------------------------
 -- STRATEGY RULES: HIGH_PERFORMANCE
 -- ---------------------------------------------------------------------------
--- Philosophy: Minimal overhead, optimal for transactional workloads
--- EXADATA HCC:
---   - Hot data (>70, high write ratio): OLTP (minimal overhead for writes)
---   - Frequent reads, low writes (>70, low write ratio): HCC QUERY HIGH (excellent compression, fast reads)
---   - Cold data (<40): HCC ARCHIVE LOW (maximum space savings, minimal access impact)
--- ORACLE 23c FREE:
---   - Hot data (>70, high write ratio): OLTP (minimal overhead)
---   - Frequent reads, low writes (>70, low write ratio): ADVANCED HIGH (best compression)
---   - Cold data (<40): ADVANCED LOW (space savings for rare access)
+-- Philosophy: Minimize compression overhead for OLTP, maximize compression for read-only
+-- - Hot/frequently modified tables (high write ratio): OLTP (minimal overhead)
+-- - Frequently accessed reads (>70 hotness, low writes): HCC QUERY HIGH (excellent compression, optimized for frequent access)
+-- - Cold/inactive data (<40 hotness): HCC ARCHIVE LOW (maximum space savings, minimal access impact)
 -- ---------------------------------------------------------------------------
 
 PROMPT Inserting HIGH_PERFORMANCE strategy rules...
@@ -120,7 +109,7 @@ INSERT INTO T_STRATEGY_RULES (
     'Hot tables with heavy writes: Use OLTP for minimal overhead while maintaining some space savings'
 );
 
--- Rule 2: Hot tables with light writes - HCC QUERY HIGH (Exadata) or ADVANCED HIGH (23c Free)
+-- Rule 2: Hot tables with light writes - HCC QUERY HIGH
 INSERT INTO T_STRATEGY_RULES (
     RULE_ID,
     STRATEGY_ID,
@@ -142,7 +131,7 @@ INSERT INTO T_STRATEGY_RULES (
     0.5,
     'QUERY HIGH',
     2,
-    'Hot tables, light writes: Exadata HCC QUERY HIGH for excellent compression on frequent reads. 23c Free use ADVANCED HIGH if licensed.'
+    'Frequently accessed tables with low writes: HCC QUERY HIGH for excellent compression and fast query performance'
 );
 
 -- Rule 3: Warm tables with heavy writes - OLTP compression
@@ -195,7 +184,7 @@ INSERT INTO T_STRATEGY_RULES (
     'Warm tables with light writes: Safe to use OLTP for moderate space savings'
 );
 
--- Rule 5: Cold tables - HCC ARCHIVE LOW (Exadata) or ADVANCED LOW (23c Free)
+-- Rule 5: Cold tables - HCC ARCHIVE LOW
 INSERT INTO T_STRATEGY_RULES (
     RULE_ID,
     STRATEGY_ID,
@@ -217,7 +206,7 @@ INSERT INTO T_STRATEGY_RULES (
     1.0,
     'ARCHIVE LOW',
     5,
-    'Cold/inactive tables: Exadata HCC ARCHIVE LOW for maximum space savings with minimal access overhead. 23c Free use ADVANCED LOW if licensed.'
+    'Inactive/cold tables with rare access: HCC ARCHIVE LOW for maximum space savings with minimal performance impact'
 );
 
 -- Rule 6: Hot indexes - ADVANCED LOW (minimal overhead)
@@ -270,7 +259,7 @@ INSERT INTO T_STRATEGY_RULES (
     'Warm indexes: Safe compression level for moderately accessed indexes'
 );
 
--- Rule 8: Cold indexes - HCC ARCHIVE LOW (Exadata) or ADVANCED LOW (23c Free)
+-- Rule 8: Cold indexes - HCC ARCHIVE LOW
 INSERT INTO T_STRATEGY_RULES (
     RULE_ID,
     STRATEGY_ID,
@@ -292,10 +281,10 @@ INSERT INTO T_STRATEGY_RULES (
     1.0,
     'ARCHIVE LOW',
     8,
-    'Cold/rarely used indexes: Exadata HCC ARCHIVE LOW for excellent space savings. 23c Free use ADVANCED LOW if licensed.'
+    'Rarely used indexes with minimal access: HCC ARCHIVE LOW for excellent space savings'
 );
 
--- Rule 9: LOBs - No compression (Oracle 23c Free limitation)
+-- Rule 9: LOBs - HCC compression supported (SecureFiles)
 INSERT INTO T_STRATEGY_RULES (
     RULE_ID,
     STRATEGY_ID,
