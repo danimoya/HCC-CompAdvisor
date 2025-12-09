@@ -738,10 +738,9 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_log AS
         EXECUTE IMMEDIATE 'CREATE TABLE T_COMPRESSION_LOG_ARCHIVE AS SELECT * FROM T_COMPRESSION_LOG WHERE 1=0';
       END IF;
     END;
-    -- Archive old logs
-    INSERT INTO T_COMPRESSION_LOG_ARCHIVE
-    SELECT * FROM T_COMPRESSION_LOG
-    WHERE LOG_DATE < SYSDATE - p_archive_days;
+    -- Archive old logs (use EXECUTE IMMEDIATE to defer validation until runtime)
+    EXECUTE IMMEDIATE 'INSERT INTO T_COMPRESSION_LOG_ARCHIVE SELECT * FROM T_COMPRESSION_LOG WHERE LOG_DATE < SYSDATE - :days'
+      USING p_archive_days;
     v_rows_archived := SQL%ROWCOUNT;
     -- Delete archived logs from main table
     DELETE FROM T_COMPRESSION_LOG
