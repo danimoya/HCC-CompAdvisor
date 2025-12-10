@@ -357,7 +357,7 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
         ownname => p_owner,
         objname => p_table_name,
         subobjname => p_partition_name,
-        comptype => DBMS_COMPRESSION.comp_for_oltp, -- Use OLTP as baseline
+        comptype => DBMS_COMPRESSION.COMP_ADVANCED, -- Use Advanced/OLTP as baseline
         blkcnt_cmp => v_blkcnt_cmp,
         blkcnt_uncmp => v_blkcnt_uncmp,
         row_cmp => v_row_cmp,
@@ -378,7 +378,7 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
         ownname => p_owner,
         objname => p_table_name,
         subobjname => p_partition_name,
-        comptype => DBMS_COMPRESSION.comp_for_oltp,
+        comptype => DBMS_COMPRESSION.COMP_ADVANCED,
         blkcnt_cmp => v_blkcnt_cmp,
         blkcnt_uncmp => v_blkcnt_uncmp,
         row_cmp => v_row_cmp,
@@ -543,7 +543,10 @@ END test_table_compression;
     v_current_compression VARCHAR2(30);
     v_partition_count NUMBER;
     v_partitions t_partition_list;
+    v_run_id NUMBER;
   BEGIN
+    -- Get advisor run ID before any INSERTs
+    v_run_id := get_advisor_run_id(p_strategy_id);
     pkg_compression_log.log_info(
       'PKG_COMPRESSION_ADVISOR',
       'analyze_table',
@@ -625,7 +628,7 @@ END test_table_compression;
           v_hotness_score, v_access_score,
           v_savings_mb * 1024 * 1024, v_savings_pct,
           v_rationale || ' (Partition: ' || v_partitions(i) || ')',
-          get_advisor_run_id(p_strategy_id)
+          v_run_id
         );
       END LOOP;
     ELSE
@@ -670,7 +673,7 @@ END test_table_compression;
         v_current_compression, v_recommended_compression,
         v_hotness_score, v_access_score,
         v_savings_mb * 1024 * 1024, v_savings_pct,
-        v_rationale, get_advisor_run_id(p_strategy_id)
+        v_rationale, v_run_id
       );
     END IF;
     COMMIT;
@@ -706,7 +709,10 @@ END test_table_compression;
     v_rationale VARCHAR2(4000);
     v_current_compression VARCHAR2(30);
     v_index_type VARCHAR2(30);
+    v_run_id NUMBER;
   BEGIN
+    -- Get advisor run ID before any INSERTs
+    v_run_id := get_advisor_run_id(p_strategy_id);
     pkg_compression_log.log_info(
       'PKG_COMPRESSION_ADVISOR',
       'analyze_index',
@@ -785,7 +791,7 @@ END test_table_compression;
       v_current_compression, v_recommended_compression,
       0, v_access_score,
       v_savings_mb * 1024 * 1024, v_savings_pct,
-      v_rationale, get_advisor_run_id(p_strategy_id)
+      v_rationale, v_run_id
     );
     COMMIT;
     pkg_compression_log.log_info(
@@ -821,7 +827,10 @@ END test_table_compression;
     v_current_compression VARCHAR2(30);
     v_securefile VARCHAR2(10);
     v_lob_segment VARCHAR2(128);
+    v_run_id NUMBER;
   BEGIN
+    -- Get advisor run ID before any INSERTs
+    v_run_id := get_advisor_run_id(p_strategy_id);
     pkg_compression_log.log_info(
       'PKG_COMPRESSION_ADVISOR',
       'analyze_lob',
@@ -897,7 +906,7 @@ END test_table_compression;
       v_current_compression, v_recommended_compression,
       0, 0,
       v_savings_mb * 1024 * 1024, v_savings_pct,
-      v_rationale, get_advisor_run_id(p_strategy_id)
+      v_rationale, v_run_id
     );
     COMMIT;
     pkg_compression_log.log_info(
@@ -946,7 +955,15 @@ END test_table_compression;
       BULK COLLECT INTO v_table_list
       FROM dba_tables t
       WHERE (p_owner IS NULL OR t.owner = p_owner)
-        AND is_excluded_schema(t.owner) = 'N'
+        AND t.owner NOT IN ('SYS', 'SYSTEM', 'AUDSYS', 'OUTLN', 'DBSNMP', 'GSMADMIN_INTERNAL',
+                            'XDB', 'WMSYS', 'CTXSYS', 'MDSYS', 'ORDSYS', 'ORDDATA', 'OLAPSYS',
+                            'APPQOSSYS', 'DBSFWUSER', 'GGSYS', 'SPATIAL_CSW_ADMIN_USR',
+                            'SPATIAL_WFS_ADMIN_USR', 'ANONYMOUS', 'APEX_PUBLIC_USER',
+                            'DIP', 'FLOWS_FILES', 'MDDATA', 'ORACLE_OCM', 'XS$NULL',
+                            'REMOTE_SCHEDULER_AGENT', 'APEX_INSTANCE_ADMIN_USER')
+        AND t.owner NOT LIKE 'APEX_%'
+        AND t.owner NOT LIKE 'ORACLE%'
+        AND t.owner NOT LIKE 'FLOWS_%'
         AND t.temporary = 'N'
         AND EXISTS (
           SELECT 1 FROM dba_segments s
@@ -993,7 +1010,15 @@ END test_table_compression;
         SELECT t.owner, t.table_name
         FROM dba_tables t
         WHERE (p_owner IS NULL OR t.owner = p_owner)
-          AND is_excluded_schema(t.owner) = 'N'
+          AND t.owner NOT IN ('SYS', 'SYSTEM', 'AUDSYS', 'OUTLN', 'DBSNMP', 'GSMADMIN_INTERNAL',
+                              'XDB', 'WMSYS', 'CTXSYS', 'MDSYS', 'ORDSYS', 'ORDDATA', 'OLAPSYS',
+                              'APPQOSSYS', 'DBSFWUSER', 'GGSYS', 'SPATIAL_CSW_ADMIN_USR',
+                              'SPATIAL_WFS_ADMIN_USR', 'ANONYMOUS', 'APEX_PUBLIC_USER',
+                              'DIP', 'FLOWS_FILES', 'MDDATA', 'ORACLE_OCM', 'XS$NULL',
+                              'REMOTE_SCHEDULER_AGENT', 'APEX_INSTANCE_ADMIN_USER')
+          AND t.owner NOT LIKE 'APEX_%'
+          AND t.owner NOT LIKE 'ORACLE%'
+          AND t.owner NOT LIKE 'FLOWS_%'
           AND t.temporary = 'N'
           AND EXISTS (
             SELECT 1 FROM dba_segments s
@@ -1024,7 +1049,15 @@ END test_table_compression;
       SELECT i.owner, i.index_name
       FROM dba_indexes i
       WHERE (p_owner IS NULL OR i.owner = p_owner)
-        AND is_excluded_schema(i.owner) = 'N'
+        AND i.owner NOT IN ('SYS', 'SYSTEM', 'AUDSYS', 'OUTLN', 'DBSNMP', 'GSMADMIN_INTERNAL',
+                            'XDB', 'WMSYS', 'CTXSYS', 'MDSYS', 'ORDSYS', 'ORDDATA', 'OLAPSYS',
+                            'APPQOSSYS', 'DBSFWUSER', 'GGSYS', 'SPATIAL_CSW_ADMIN_USR',
+                            'SPATIAL_WFS_ADMIN_USR', 'ANONYMOUS', 'APEX_PUBLIC_USER',
+                            'DIP', 'FLOWS_FILES', 'MDDATA', 'ORACLE_OCM', 'XS$NULL',
+                            'REMOTE_SCHEDULER_AGENT', 'APEX_INSTANCE_ADMIN_USER')
+        AND i.owner NOT LIKE 'APEX_%'
+        AND i.owner NOT LIKE 'ORACLE%'
+        AND i.owner NOT LIKE 'FLOWS_%'
         AND i.index_type IN ('NORMAL', 'NORMAL/REV')
         AND EXISTS (
           SELECT 1 FROM dba_segments s
@@ -1051,7 +1084,15 @@ END test_table_compression;
       SELECT l.owner, l.table_name, l.column_name
       FROM dba_lobs l
       WHERE (p_owner IS NULL OR l.owner = p_owner)
-        AND is_excluded_schema(l.owner) = 'N'
+        AND l.owner NOT IN ('SYS', 'SYSTEM', 'AUDSYS', 'OUTLN', 'DBSNMP', 'GSMADMIN_INTERNAL',
+                            'XDB', 'WMSYS', 'CTXSYS', 'MDSYS', 'ORDSYS', 'ORDDATA', 'OLAPSYS',
+                            'APPQOSSYS', 'DBSFWUSER', 'GGSYS', 'SPATIAL_CSW_ADMIN_USR',
+                            'SPATIAL_WFS_ADMIN_USR', 'ANONYMOUS', 'APEX_PUBLIC_USER',
+                            'DIP', 'FLOWS_FILES', 'MDDATA', 'ORACLE_OCM', 'XS$NULL',
+                            'REMOTE_SCHEDULER_AGENT', 'APEX_INSTANCE_ADMIN_USER')
+        AND l.owner NOT LIKE 'APEX_%'
+        AND l.owner NOT LIKE 'ORACLE%'
+        AND l.owner NOT LIKE 'FLOWS_%'
         AND l.securefile = 'YES'
         AND EXISTS (
           SELECT 1 FROM dba_segments s
