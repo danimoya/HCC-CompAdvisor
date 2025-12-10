@@ -373,7 +373,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
         'Error testing compression for ' || p_owner || '.' || p_table_name,
         SQLERRM
       );
-  END;
 END test_table_compression;
   /**
    * Evaluate strategy rules and determine recommendation
