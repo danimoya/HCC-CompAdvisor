@@ -360,7 +360,7 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
         p_owner,
         p_table_name,
         p_partition_name,
-        1, -- COMP_BASIC
+        4096, -- COMP_BASIC (DBMS_COMPRESSION constant)
         v_blkcnt_cmp,
         v_blkcnt_uncmp,
         v_row_cmp,
