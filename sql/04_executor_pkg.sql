@@ -832,7 +832,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
       WHEN 'LOW' THEN 'COMPRESS LOW'
       WHEN 'NOCOMPRESS' THEN 'NOCOMPRESS'
       ELSE 'COMPRESS MEDIUM'
-    END CASE;
+    END;
     -- Build DDL to modify LOB storage with tablespace preservation
     -- CRITICAL: Include TABLESPACE clause to preserve LOB location
     v_ddl := 'ALTER TABLE ' || p_owner || '.' || p_table_name ||
@@ -904,9 +904,10 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
     FOR rec IN (
       SELECT r.owner, r.table_name, r.recommended_compression,
              t.size_bytes
-      FROM V_COMPRESSION_RECOMMENDATIONS r
-      JOIN T_TABLE_ANALYSIS t ON r.owner = t.owner AND r.table_name = t.table_name
-      WHERE r.strategy_id = p_strategy_id
+      FROM V_COMPRESSION_RECOMMENDATIONS r, T_TABLE_ANALYSIS t
+      WHERE r.owner = t.owner
+        AND r.table_name = t.table_name
+        AND r.strategy_id = p_strategy_id
         AND r.object_type = 'TABLE'
         AND r.priority IN ('HIGH', 'MEDIUM')
       ORDER BY
