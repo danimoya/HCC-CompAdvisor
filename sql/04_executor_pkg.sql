@@ -6,12 +6,13 @@
 --
 -- COMPRESSION TYPE SUPPORT:
 --   Standard Platform (Oracle 23c Free):
---     - BASIC, OLTP (tables)
+--     - BASIC, OLTP (tables, partitions, subpartitions)
 --     - ADV_LOW, ADV_HIGH (indexes)
 --
---   Exadata Platform (HCC):
---     - QUERY_LOW, QUERY_HIGH (tables & indexes)
---     - ARCHIVE_LOW, ARCHIVE_HIGH (tables only)
+--   Exadata Platform (HCC - Tables, Partitions, Subpartitions ONLY):
+--     - QUERY_LOW, QUERY_HIGH
+--     - ARCHIVE_LOW, ARCHIVE_HIGH
+--     NOTE: HCC is NOT supported for indexes
 --
 -- All operations preserve original tablespaces for partitioned and regular objects
 --------------------------------------------------------------------------------
@@ -62,14 +63,13 @@ CREATE OR REPLACE PACKAGE PKG_COMPRESSION_EXECUTOR AS
   );
   /**
    * Compress an index with validation
-   * Supports Advanced compression (ADV_LOW, ADV_HIGH) on standard platforms
-   * and HCC Query compression on Exadata (QUERY_LOW, QUERY_HIGH)
+   * Supports Advanced compression (ADV_LOW, ADV_HIGH) on all platforms
    *
    * @param p_owner           Index owner
    * @param p_index_name      Index name
-   * @param p_compression_type Compression type (ADV_LOW, ADV_HIGH, QUERY_LOW, QUERY_HIGH, NOCOMPRESS)
+   * @param p_compression_type Compression type (ADV_LOW, ADV_HIGH, NOCOMPRESS)
    * @param p_online          Use ONLINE clause
-   * @note HCC compression types are Exadata-only; Archive types (ARCHIVE_LOW/HIGH) are not supported for indexes
+   * @note HCC compression (QUERY/ARCHIVE) is NOT supported for indexes - tables only
    */
   PROCEDURE compress_index(
     p_owner IN VARCHAR2,
@@ -207,12 +207,15 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
   BEGIN
     SELECT COUNT(*)
     INTO v_locked
-    FROM DBA_LOCKS l
-    JOIN DBA_OBJECTS o ON l.ID1 = o.OBJECT_ID
-    WHERE o.OWNER = p_owner
-      AND o.OBJECT_NAME = p_object_name
-      AND l.LOCKED_MODE > 0;
+    FROM V$LOCKED_OBJECT lo, DBA_OBJECTS o
+    WHERE lo.OBJECT_ID = o.OBJECT_ID
+      AND o.OWNER = p_owner
+      AND o.OBJECT_NAME = p_object_name;
     RETURN v_locked > 0;
+  EXCEPTION
+    WHEN OTHERS THEN
+      -- If we can't check locks (no privileges), assume not locked
+      RETURN FALSE;
   END is_object_locked;
   /**
    * Get current segment size in bytes
@@ -490,14 +493,12 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
     -- Create history record
     INSERT INTO T_COMPRESSION_HISTORY (
       owner, object_name, object_type,
-      compression_before, compression_after,
-      size_before_bytes, operation_type,
-      executed_by, ddl_statement
+      compression_type_applied, original_size_bytes,
+      compression_clause
     ) VALUES (
       p_owner, p_table_name, 'TABLE',
-      v_current_compression, p_compression_type,
-      v_size_before, 'COMPRESS',
-      USER, v_ddl
+      p_compression_type, v_size_before,
+      v_ddl
     ) RETURNING history_id INTO v_history_id;
     COMMIT;
     -- Execute DDL
@@ -513,12 +514,11 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
       v_size_after := get_segment_size(p_owner, p_table_name, 'TABLE');
       -- Update history
       UPDATE T_COMPRESSION_HISTORY
-      SET size_after_bytes = v_size_after,
-          space_saved_bytes = v_size_before - v_size_after,
-          compression_ratio = CASE WHEN v_size_after > 0 THEN v_size_before / v_size_after ELSE 0 END,
-          status = 'SUCCESS',
+      SET compressed_size_bytes = v_size_after,
+          compression_ratio_achieved = CASE WHEN v_size_after > 0 THEN ROUND(v_size_before / v_size_after, 2) ELSE 0 END,
+          operation_status = 'SUCCESS',
           end_time = SYSTIMESTAMP,
-          execution_time_seconds = EXTRACT(SECOND FROM (SYSTIMESTAMP - start_time))
+          duration_seconds = EXTRACT(SECOND FROM (SYSTIMESTAMP - start_time))
       WHERE history_id = v_history_id;
       COMMIT;
       log_message('New size: ' || ROUND(v_size_after / 1024 / 1024, 2) || ' MB');
@@ -529,7 +529,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
       WHEN OTHERS THEN
         -- Update history with error
         UPDATE T_COMPRESSION_HISTORY
-        SET status = 'FAILED',
+        SET operation_status = 'FAILED',
             error_message = SUBSTR(SQLERRM, 1, 4000),
             end_time = SYSTIMESTAMP
         WHERE history_id = v_history_id;
@@ -588,12 +588,12 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
     -- Create history record
     INSERT INTO T_COMPRESSION_HISTORY (
       owner, object_name, object_type,
-      compression_after, size_before_bytes,
-      operation_type, executed_by, ddl_statement
+      compression_type_applied, original_size_bytes,
+      compression_clause
     ) VALUES (
       p_owner, p_index_name, 'INDEX',
       p_compression_type, v_size_before,
-      'COMPRESS', USER, v_ddl
+      v_ddl
     ) RETURNING history_id INTO v_history_id;
     COMMIT;
     -- Execute DDL
@@ -604,10 +604,9 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
       v_size_after := get_segment_size(p_owner, p_index_name, 'INDEX');
       -- Update history
       UPDATE T_COMPRESSION_HISTORY
-      SET size_after_bytes = v_size_after,
-          space_saved_bytes = v_size_before - v_size_after,
-          compression_ratio = CASE WHEN v_size_after > 0 THEN v_size_before / v_size_after ELSE 0 END,
-          status = 'SUCCESS',
+      SET compressed_size_bytes = v_size_after,
+          compression_ratio_achieved = CASE WHEN v_size_after > 0 THEN ROUND(v_size_before / v_size_after, 2) ELSE 0 END,
+          operation_status = 'SUCCESS',
           end_time = SYSTIMESTAMP
       WHERE history_id = v_history_id;
       COMMIT;
@@ -616,7 +615,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
     EXCEPTION
       WHEN OTHERS THEN
         UPDATE T_COMPRESSION_HISTORY
-        SET status = 'FAILED',
+        SET operation_status = 'FAILED',
             error_message = SUBSTR(SQLERRM, 1, 4000),
             end_time = SYSTIMESTAMP
         WHERE history_id = v_history_id;
@@ -679,13 +678,13 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
     log_message('DDL: ' || v_ddl);
     -- Create history record
     INSERT INTO T_COMPRESSION_HISTORY (
-      owner, object_name, object_type,
-      compression_after, size_before_bytes,
-      operation_type, executed_by, ddl_statement
+      owner, object_name, object_type, partition_name,
+      compression_type_applied, original_size_bytes,
+      compression_clause
     ) VALUES (
-      p_owner, p_table_name || '.' || p_partition_name, 'TABLE PARTITION',
+      p_owner, p_table_name, 'PARTITION', p_partition_name,
       p_compression_type, v_size_before,
-      'COMPRESS', USER, v_ddl
+      v_ddl
     ) RETURNING history_id INTO v_history_id;
     COMMIT;
     -- Execute DDL
@@ -717,10 +716,9 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
       v_size_after := get_segment_size(p_owner, p_table_name || ':' || p_partition_name, 'TABLE PARTITION');
       -- Update history
       UPDATE T_COMPRESSION_HISTORY
-      SET size_after_bytes = v_size_after,
-          space_saved_bytes = v_size_before - v_size_after,
-          compression_ratio = CASE WHEN v_size_after > 0 THEN v_size_before / v_size_after ELSE 0 END,
-          status = 'SUCCESS',
+      SET compressed_size_bytes = v_size_after,
+          compression_ratio_achieved = CASE WHEN v_size_after > 0 THEN ROUND(v_size_before / v_size_after, 2) ELSE 0 END,
+          operation_status = 'SUCCESS',
           end_time = SYSTIMESTAMP
       WHERE history_id = v_history_id;
       COMMIT;
@@ -729,7 +727,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
     EXCEPTION
       WHEN OTHERS THEN
         UPDATE T_COMPRESSION_HISTORY
-        SET status = 'FAILED',
+        SET operation_status = 'FAILED',
             error_message = SUBSTR(SQLERRM, 1, 4000),
             end_time = SYSTIMESTAMP
         WHERE history_id = v_history_id;
@@ -846,12 +844,12 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
     -- Create history record
     INSERT INTO T_COMPRESSION_HISTORY (
       owner, object_name, object_type,
-      compression_after, size_before_bytes,
-      operation_type, executed_by, ddl_statement
+      compression_type_applied, original_size_bytes,
+      compression_clause
     ) VALUES (
       p_owner, p_table_name || '.' || p_column_name, 'LOB',
       p_compression_type, v_size_before,
-      'COMPRESS', USER, v_ddl
+      v_ddl
     ) RETURNING history_id INTO v_history_id;
     COMMIT;
     -- Execute DDL
@@ -863,10 +861,9 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
       v_size_after := get_segment_size(p_owner, v_lob_segment_name, 'LOBSEGMENT');
       -- Update history
       UPDATE T_COMPRESSION_HISTORY
-      SET size_after_bytes = v_size_after,
-          space_saved_bytes = v_size_before - v_size_after,
-          compression_ratio = CASE WHEN v_size_after > 0 THEN v_size_before / v_size_after ELSE 0 END,
-          status = 'SUCCESS',
+      SET compressed_size_bytes = v_size_after,
+          compression_ratio_achieved = CASE WHEN v_size_after > 0 THEN ROUND(v_size_before / v_size_after, 2) ELSE 0 END,
+          operation_status = 'SUCCESS',
           end_time = SYSTIMESTAMP
       WHERE history_id = v_history_id;
       COMMIT;
@@ -875,7 +872,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
     EXCEPTION
       WHEN OTHERS THEN
         UPDATE T_COMPRESSION_HISTORY
-        SET status = 'FAILED',
+        SET operation_status = 'FAILED',
             error_message = SUBSTR(SQLERRM, 1, 4000),
             end_time = SYSTIMESTAMP
         WHERE history_id = v_history_id;
@@ -975,7 +972,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
     END IF;
     -- Mark as rolled back
     UPDATE T_COMPRESSION_HISTORY
-    SET status = 'ROLLED_BACK'
+    SET operation_status = 'ROLLED_BACK'
     WHERE history_id = p_history_id;
     COMMIT;
     log_message('=== Rollback completed successfully ===');
@@ -994,7 +991,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
   ) RETURN VARCHAR2 IS
     v_status VARCHAR2(30);
   BEGIN
-    SELECT status
+    SELECT operation_status
     INTO v_status
     FROM T_COMPRESSION_HISTORY
     WHERE history_id = p_history_id;
