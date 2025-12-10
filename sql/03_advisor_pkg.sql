@@ -332,11 +332,14 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
     x_oltp_ratio OUT NUMBER
   ) IS
     v_scratch_tbs VARCHAR2(128);
-    v_blkcnt_cmp NUMBER;
-    v_blkcnt_uncmp NUMBER;
-    v_row_cmp NUMBER;
-    v_row_uncmp NUMBER;
+    v_blkcnt_cmp PLS_INTEGER;
+    v_blkcnt_uncmp PLS_INTEGER;
+    v_row_cmp PLS_INTEGER;
+    v_row_uncmp PLS_INTEGER;
     v_cmp_ratio NUMBER;
+    v_comptype_str VARCHAR2(30);
+    v_block_compr_ratio PLS_INTEGER;
+    v_byte_comp_ratio NUMBER;
   BEGIN
     -- Get current size
     SELECT NVL(SUM(bytes), 0) / 1024 / 1024
@@ -362,7 +365,10 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
         v_blkcnt_uncmp,
         v_row_cmp,
         v_row_uncmp,
-        v_cmp_ratio
+        v_cmp_ratio,
+        v_comptype_str,
+        v_block_compr_ratio,
+        v_byte_comp_ratio
       );
       x_basic_ratio := v_cmp_ratio;
       x_basic_size := ROUND(x_current_size / NULLIF(v_cmp_ratio, 0), 2);
@@ -383,7 +389,10 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
         v_blkcnt_uncmp,
         v_row_cmp,
         v_row_uncmp,
-        v_cmp_ratio
+        v_cmp_ratio,
+        v_comptype_str,
+        v_block_compr_ratio,
+        v_byte_comp_ratio
       );
       x_oltp_ratio := v_cmp_ratio;
       x_oltp_size := ROUND(x_current_size / NULLIF(v_cmp_ratio, 0), 2);
@@ -1179,39 +1188,39 @@ END test_table_compression;
     init_compression_map;
     OPEN v_cursor FOR
       SELECT
-        analysis_id,
-        owner,
-        object_name,
-        object_type,
-        partition_name,
-        advisable_compression recommended_compression,
-        CASE object_type
+        ca.analysis_id,
+        ca.owner,
+        ca.object_name,
+        ca.object_type,
+        ca.partition_name,
+        ca.advisable_compression recommended_compression,
+        CASE ca.object_type
           WHEN 'TABLE' THEN
             CASE
-              WHEN partition_name IS NOT NULL THEN
-                'ALTER TABLE ' || owner || '.' || object_name ||
-                ' MODIFY PARTITION ' || partition_name ||
-                ' ' || g_compression_map(advisable_compression) || ';'
+              WHEN ca.partition_name IS NOT NULL THEN
+                'ALTER TABLE ' || ca.owner || '.' || ca.object_name ||
+                ' MODIFY PARTITION ' || ca.partition_name ||
+                ' ' || g_compression_map(ca.advisable_compression) || ';'
               ELSE
-                'ALTER TABLE ' || owner || '.' || object_name ||
-                ' MOVE ' || g_compression_map(advisable_compression) || ';'
+                'ALTER TABLE ' || ca.owner || '.' || ca.object_name ||
+                ' MOVE ' || g_compression_map(ca.advisable_compression) || ';'
             END
           WHEN 'INDEX' THEN
-            'ALTER INDEX ' || owner || '.' || object_name ||
-            ' REBUILD ' || g_compression_map(advisable_compression) || ';'
+            'ALTER INDEX ' || ca.owner || '.' || ca.object_name ||
+            ' REBUILD ' || g_compression_map(ca.advisable_compression) || ';'
           WHEN 'LOB' THEN
-            'ALTER TABLE ' || owner || '.' || SUBSTR(object_name, 1, INSTR(object_name, '.') - 1) ||
-            ' MODIFY LOB (' || SUBSTR(object_name, INSTR(object_name, '.') + 1) || ') (' ||
-            g_compression_map(advisable_compression) || ');'
+            'ALTER TABLE ' || ca.owner || '.' || SUBSTR(ca.object_name, 1, INSTR(ca.object_name, '.') - 1) ||
+            ' MODIFY LOB (' || SUBSTR(ca.object_name, INSTR(ca.object_name, '.') + 1) || ') (' ||
+            g_compression_map(ca.advisable_compression) || ');'
           ELSE
-            '-- Unknown object type: ' || object_type
+            '-- Unknown object type: ' || ca.object_type
         END AS ddl_statement,
-        projected_savings_mb space_savings_mb,
-        projected_savings_pct space_savings_pct
-      FROM t_compression_analysis
-      WHERE (p_recommendation_id IS NULL OR analysis_id = p_recommendation_id)
-        AND advisable_compression != 'NONE'
-      ORDER BY projected_savings_mb DESC;
+        ca.projected_savings_mb space_savings_mb,
+        ca.projected_savings_pct space_savings_pct
+      FROM t_compression_analysis ca
+      WHERE (p_recommendation_id IS NULL OR ca.analysis_id = p_recommendation_id)
+        AND ca.advisable_compression != 'NONE'
+      ORDER BY ca.projected_savings_mb DESC;
     RETURN v_cursor;
   END generate_ddl;
   FUNCTION calculate_total_savings(
