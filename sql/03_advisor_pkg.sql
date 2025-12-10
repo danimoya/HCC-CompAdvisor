@@ -133,10 +133,13 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
   -- ========================================================================
   TYPE t_strategy_rules_cache IS TABLE OF t_strategy_rules%ROWTYPE
     INDEX BY PLS_INTEGER;
+  TYPE t_partition_list IS TABLE OF VARCHAR2(128);
+  TYPE t_compression_map IS TABLE OF VARCHAR2(30) INDEX BY VARCHAR2(30);
+  -- Package variables
   g_strategy_rules t_strategy_rules_cache;
   g_rules_loaded BOOLEAN := FALSE;
   g_current_run_id NUMBER := NULL;
-  TYPE t_partition_list IS TABLE OF VARCHAR2(128);
+  g_compression_map t_compression_map;
   /**
    * Get or create an advisor run ID for analysis
    */
@@ -156,9 +159,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
     g_current_run_id := v_run_id;
     RETURN v_run_id;
   END get_advisor_run_id;
-  -- Compression type mappings for Oracle 23c Free
-  TYPE t_compression_map IS TABLE OF VARCHAR2(30) INDEX BY VARCHAR2(30);
-  g_compression_map t_compression_map;
   -- ========================================================================
   -- Private Utility Functions
   -- ========================================================================
