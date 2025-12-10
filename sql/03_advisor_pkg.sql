@@ -194,18 +194,23 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
   END load_strategy_rules;
   /**
    * Check if schema should be excluded from analysis
+   * Returns 'Y' if excluded, 'N' if not (VARCHAR2 for SQL compatibility)
    */
-  FUNCTION is_excluded_schema(p_owner IN VARCHAR2) RETURN BOOLEAN IS
+  FUNCTION is_excluded_schema(p_owner IN VARCHAR2) RETURN VARCHAR2 IS
   BEGIN
-    RETURN p_owner IN ('SYS', 'SYSTEM', 'AUDSYS', 'OUTLN', 'DBSNMP', 'GSMADMIN_INTERNAL',
-                       'XDB', 'WMSYS', 'CTXSYS', 'MDSYS', 'ORDSYS', 'ORDDATA', 'OLAPSYS',
-                       'APPQOSSYS', 'DBSFWUSER', 'GGSYS', 'SPATIAL_CSW_ADMIN_USR',
-                       'SPATIAL_WFS_ADMIN_USR', 'ANONYMOUS', 'APEX_PUBLIC_USER',
-                       'DIP', 'FLOWS_FILES', 'MDDATA', 'ORACLE_OCM', 'XS$NULL',
-                       'REMOTE_SCHEDULER_AGENT', 'APEX_INSTANCE_ADMIN_USER')
-           OR p_owner LIKE 'APEX_%'
-           OR p_owner LIKE 'ORACLE%'
-           OR p_owner LIKE 'FLOWS_%';
+    IF p_owner IN ('SYS', 'SYSTEM', 'AUDSYS', 'OUTLN', 'DBSNMP', 'GSMADMIN_INTERNAL',
+                   'XDB', 'WMSYS', 'CTXSYS', 'MDSYS', 'ORDSYS', 'ORDDATA', 'OLAPSYS',
+                   'APPQOSSYS', 'DBSFWUSER', 'GGSYS', 'SPATIAL_CSW_ADMIN_USR',
+                   'SPATIAL_WFS_ADMIN_USR', 'ANONYMOUS', 'APEX_PUBLIC_USER',
+                   'DIP', 'FLOWS_FILES', 'MDDATA', 'ORACLE_OCM', 'XS$NULL',
+                   'REMOTE_SCHEDULER_AGENT', 'APEX_INSTANCE_ADMIN_USER')
+       OR p_owner LIKE 'APEX_%'
+       OR p_owner LIKE 'ORACLE%'
+       OR p_owner LIKE 'FLOWS_%' THEN
+      RETURN 'Y';
+    ELSE
+      RETURN 'N';
+    END IF;
   END is_excluded_schema;
   /**
    * Calculate DML hotness score based on recent activity
@@ -917,7 +922,7 @@ END test_table_compression;
       BULK COLLECT INTO v_table_list
       FROM dba_tables t
       WHERE (p_owner IS NULL OR t.owner = p_owner)
-        AND NOT is_excluded_schema(t.owner)
+        AND is_excluded_schema(t.owner) = 'N'
         AND t.temporary = 'N'
         AND EXISTS (
           SELECT 1 FROM dba_segments s
@@ -964,7 +969,7 @@ END test_table_compression;
         SELECT t.owner, t.table_name
         FROM dba_tables t
         WHERE (p_owner IS NULL OR t.owner = p_owner)
-          AND NOT is_excluded_schema(t.owner)
+          AND is_excluded_schema(t.owner) = 'N'
           AND t.temporary = 'N'
           AND EXISTS (
             SELECT 1 FROM dba_segments s
@@ -995,7 +1000,7 @@ END test_table_compression;
       SELECT i.owner, i.index_name
       FROM dba_indexes i
       WHERE (p_owner IS NULL OR i.owner = p_owner)
-        AND NOT is_excluded_schema(i.owner)
+        AND is_excluded_schema(i.owner) = 'N'
         AND i.index_type IN ('NORMAL', 'NORMAL/REV')
         AND EXISTS (
           SELECT 1 FROM dba_segments s
@@ -1022,7 +1027,7 @@ END test_table_compression;
       SELECT l.owner, l.table_name, l.column_name
       FROM dba_lobs l
       WHERE (p_owner IS NULL OR l.owner = p_owner)
-        AND NOT is_excluded_schema(l.owner)
+        AND is_excluded_schema(l.owner) = 'N'
         AND l.securefile = 'YES'
         AND EXISTS (
           SELECT 1 FROM dba_segments s
