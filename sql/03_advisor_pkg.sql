@@ -119,6 +119,11 @@ CREATE OR REPLACE PACKAGE pkg_compression_advisor AS
     p_object_name IN VARCHAR2,
     p_object_type IN VARCHAR2
   );
+  /**
+   * Check if schema should be excluded from analysis
+   * Returns 'Y' if excluded, 'N' if not
+   */
+  FUNCTION is_excluded_schema(p_owner IN VARCHAR2) RETURN VARCHAR2 DETERMINISTIC;
 END pkg_compression_advisor;
 /
 
@@ -130,7 +135,27 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
     INDEX BY PLS_INTEGER;
   g_strategy_rules t_strategy_rules_cache;
   g_rules_loaded BOOLEAN := FALSE;
+  g_current_run_id NUMBER := NULL;
   TYPE t_partition_list IS TABLE OF VARCHAR2(128);
+  /**
+   * Get or create an advisor run ID for analysis
+   */
+  FUNCTION get_advisor_run_id(p_strategy_id IN NUMBER DEFAULT 2) RETURN NUMBER IS
+    v_run_id NUMBER;
+  BEGIN
+    IF g_current_run_id IS NOT NULL THEN
+      RETURN g_current_run_id;
+    END IF;
+    -- Create a new advisor run
+    INSERT INTO t_advisor_run (
+      run_name, run_type, strategy_id, run_status
+    ) VALUES (
+      'Auto-run ' || TO_CHAR(SYSTIMESTAMP, 'YYYY-MM-DD HH24:MI:SS'),
+      'ALL', p_strategy_id, 'RUNNING'
+    ) RETURNING run_id INTO v_run_id;
+    g_current_run_id := v_run_id;
+    RETURN v_run_id;
+  END get_advisor_run_id;
   -- Compression type mappings for Oracle 23c Free
   TYPE t_compression_map IS TABLE OF VARCHAR2(30) INDEX BY VARCHAR2(30);
   g_compression_map t_compression_map;
@@ -179,8 +204,8 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
     FOR rec IN (
       SELECT *
       FROM t_strategy_rules
-      WHERE is_active = 'Y'
-      ORDER BY strategy_id, rule_order
+      WHERE enabled_flag = 'Y'
+      ORDER BY strategy_id, priority
     ) LOOP
       v_count := v_count + 1;
       g_strategy_rules(v_count) := rec;
@@ -196,7 +221,7 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
    * Check if schema should be excluded from analysis
    * Returns 'Y' if excluded, 'N' if not (VARCHAR2 for SQL compatibility)
    */
-  FUNCTION is_excluded_schema(p_owner IN VARCHAR2) RETURN VARCHAR2 IS
+  FUNCTION is_excluded_schema(p_owner IN VARCHAR2) RETURN VARCHAR2 DETERMINISTIC IS
   BEGIN
     IF p_owner IN ('SYS', 'SYSTEM', 'AUDSYS', 'OUTLN', 'DBSNMP', 'GSMADMIN_INTERNAL',
                    'XDB', 'WMSYS', 'CTXSYS', 'MDSYS', 'ORDSYS', 'ORDDATA', 'OLAPSYS',
@@ -398,13 +423,10 @@ END test_table_compression;
     FOR i IN 1..g_strategy_rules.COUNT LOOP
       IF g_strategy_rules(i).strategy_id = p_strategy_id
          AND g_strategy_rules(i).object_type = p_object_type THEN
-        -- Check if rule conditions match
-        IF (g_strategy_rules(i).min_size_mb IS NULL OR p_size_mb >= g_strategy_rules(i).min_size_mb)
-           AND (g_strategy_rules(i).max_size_mb IS NULL OR p_size_mb <= g_strategy_rules(i).max_size_mb)
-           AND (g_strategy_rules(i).min_hotness_score IS NULL OR p_hotness_score >= g_strategy_rules(i).min_hotness_score)
-           AND (g_strategy_rules(i).max_hotness_score IS NULL OR p_hotness_score <= g_strategy_rules(i).max_hotness_score)
-           AND (g_strategy_rules(i).min_compression_ratio IS NULL OR p_compression_ratio >= g_strategy_rules(i).min_compression_ratio) THEN
-          v_recommended_compression := g_strategy_rules(i).recommended_compression;
+        -- Check if rule conditions match (using actual schema columns)
+        IF (g_strategy_rules(i).hotness_min IS NULL OR p_hotness_score >= g_strategy_rules(i).hotness_min)
+           AND (g_strategy_rules(i).hotness_max IS NULL OR p_hotness_score <= g_strategy_rules(i).hotness_max) THEN
+          v_recommended_compression := g_strategy_rules(i).compression_type;
           v_rule_matched := TRUE;
           EXIT;
         END IF;
@@ -589,19 +611,19 @@ END test_table_compression;
         -- Insert partition-level result
         INSERT INTO t_compression_analysis (
           owner, object_name, object_type, partition_name,
-          current_size_mb, compressed_size_mb, compression_ratio,
-          space_savings_mb, space_savings_pct,
-          current_compression, recommended_compression,
-          strategy_id, hotness_score, access_score,
-          analysis_rationale, analysis_date
+          size_bytes, basic_ratio, oltp_ratio,
+          current_compression, advisable_compression,
+          hotness_score, access_frequency,
+          projected_savings_bytes, projected_savings_pct,
+          recommendation_reason, advisor_run_id
         ) VALUES (
           p_owner, p_table_name, 'TABLE', v_partitions(i),
-          v_current_size, v_best_size, v_best_ratio,
-          v_savings_mb, v_savings_pct,
+          v_current_size * 1024 * 1024, v_basic_ratio, v_oltp_ratio,
           v_current_compression, v_recommended_compression,
-          p_strategy_id, v_hotness_score, v_access_score,
+          v_hotness_score, v_access_score,
+          v_savings_mb * 1024 * 1024, v_savings_pct,
           v_rationale || ' (Partition: ' || v_partitions(i) || ')',
-          SYSTIMESTAMP
+          get_advisor_run_id(p_strategy_id)
         );
       END LOOP;
     ELSE
@@ -635,18 +657,18 @@ END test_table_compression;
       -- Insert table-level result
       INSERT INTO t_compression_analysis (
         owner, object_name, object_type, partition_name,
-        current_size_mb, compressed_size_mb, compression_ratio,
-        space_savings_mb, space_savings_pct,
-        current_compression, recommended_compression,
-        strategy_id, hotness_score, access_score,
-        analysis_rationale, analysis_date
+        size_bytes, basic_ratio, oltp_ratio,
+        current_compression, advisable_compression,
+        hotness_score, access_frequency,
+        projected_savings_bytes, projected_savings_pct,
+        recommendation_reason, advisor_run_id
       ) VALUES (
         p_owner, p_table_name, 'TABLE', NULL,
-        v_current_size, v_best_size, v_best_ratio,
-        v_savings_mb, v_savings_pct,
+        v_current_size * 1024 * 1024, v_basic_ratio, v_oltp_ratio,
         v_current_compression, v_recommended_compression,
-        p_strategy_id, v_hotness_score, v_access_score,
-        v_rationale, SYSTIMESTAMP
+        v_hotness_score, v_access_score,
+        v_savings_mb * 1024 * 1024, v_savings_pct,
+        v_rationale, get_advisor_run_id(p_strategy_id)
       );
     END IF;
     COMMIT;
@@ -750,18 +772,18 @@ END test_table_compression;
     -- Insert result
     INSERT INTO t_compression_analysis (
       owner, object_name, object_type, partition_name,
-      current_size_mb, compressed_size_mb, compression_ratio,
-      space_savings_mb, space_savings_pct,
-      current_compression, recommended_compression,
-      strategy_id, hotness_score, access_score,
-      analysis_rationale, analysis_date
+      size_bytes, basic_ratio,
+      current_compression, advisable_compression,
+      hotness_score, access_frequency,
+      projected_savings_bytes, projected_savings_pct,
+      recommendation_reason, advisor_run_id
     ) VALUES (
       p_owner, p_index_name, 'INDEX', NULL,
-      v_current_size, v_compressed_size, v_compression_ratio,
-      v_savings_mb, v_savings_pct,
+      v_current_size * 1024 * 1024, v_compression_ratio,
       v_current_compression, v_recommended_compression,
-      p_strategy_id, 0, v_access_score,
-      v_rationale, SYSTIMESTAMP
+      0, v_access_score,
+      v_savings_mb * 1024 * 1024, v_savings_pct,
+      v_rationale, get_advisor_run_id(p_strategy_id)
     );
     COMMIT;
     pkg_compression_log.log_info(
@@ -862,18 +884,18 @@ END test_table_compression;
     -- Insert result
     INSERT INTO t_compression_analysis (
       owner, object_name, object_type, partition_name,
-      current_size_mb, compressed_size_mb, compression_ratio,
-      space_savings_mb, space_savings_pct,
-      current_compression, recommended_compression,
-      strategy_id, hotness_score, access_score,
-      analysis_rationale, analysis_date
+      size_bytes, basic_ratio,
+      current_compression, advisable_compression,
+      hotness_score, access_frequency,
+      projected_savings_bytes, projected_savings_pct,
+      recommendation_reason, advisor_run_id
     ) VALUES (
       p_owner, p_table_name || '.' || p_column_name, 'LOB', NULL,
-      v_current_size, v_compressed_size, v_compression_ratio,
-      v_savings_mb, v_savings_pct,
+      v_current_size * 1024 * 1024, v_compression_ratio,
       v_current_compression, v_recommended_compression,
-      p_strategy_id, 0, 0,
-      v_rationale, SYSTIMESTAMP
+      0, 0,
+      v_savings_mb * 1024 * 1024, v_savings_pct,
+      v_rationale, get_advisor_run_id(p_strategy_id)
     );
     COMMIT;
     pkg_compression_log.log_info(
