@@ -305,7 +305,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
     v_row_cmp NUMBER;
     v_row_uncmp NUMBER;
     v_cmp_ratio NUMBER;
-    v_comptype_str VARCHAR2(100);
   BEGIN
     -- Get current size
     SELECT NVL(SUM(bytes), 0) / 1024 / 1024
@@ -331,8 +330,7 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
         blkcnt_uncmp => v_blkcnt_uncmp,
         row_cmp => v_row_cmp,
         row_uncmp => v_row_uncmp,
-        cmp_ratio => v_cmp_ratio,
-        comptype_str => v_comptype_str
+        cmp_ratio => v_cmp_ratio
       );
       x_basic_ratio := v_cmp_ratio;
       x_basic_size := ROUND(x_current_size / NULLIF(v_cmp_ratio, 0), 2);
@@ -353,8 +351,7 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
         blkcnt_uncmp => v_blkcnt_uncmp,
         row_cmp => v_row_cmp,
         row_uncmp => v_row_uncmp,
-        cmp_ratio => v_cmp_ratio,
-        comptype_str => v_comptype_str
+        cmp_ratio => v_cmp_ratio
       );
       x_oltp_ratio := v_cmp_ratio;
       x_oltp_size := ROUND(x_current_size / NULLIF(v_cmp_ratio, 0), 2);
