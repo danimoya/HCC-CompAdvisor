@@ -353,16 +353,16 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
     -- Test BASIC compression
     BEGIN
       DBMS_COMPRESSION.get_compression_ratio(
-        scratchtbsname => v_scratch_tbs,
-        ownname => p_owner,
-        objname => p_table_name,
-        subobjname => p_partition_name,
-        comptype => 1, -- COMP_BASIC
-        blkcnt_cmp => v_blkcnt_cmp,
-        blkcnt_uncmp => v_blkcnt_uncmp,
-        row_cmp => v_row_cmp,
-        row_uncmp => v_row_uncmp,
-        cmp_ratio => v_cmp_ratio
+        v_scratch_tbs,
+        p_owner,
+        p_table_name,
+        p_partition_name,
+        1, -- COMP_BASIC
+        v_blkcnt_cmp,
+        v_blkcnt_uncmp,
+        v_row_cmp,
+        v_row_uncmp,
+        v_cmp_ratio
       );
       x_basic_ratio := v_cmp_ratio;
       x_basic_size := ROUND(x_current_size / NULLIF(v_cmp_ratio, 0), 2);
@@ -374,16 +374,16 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
     -- Test OLTP compression (Advanced in Oracle Free)
     BEGIN
       DBMS_COMPRESSION.get_compression_ratio(
-        scratchtbsname => v_scratch_tbs,
-        ownname => p_owner,
-        objname => p_table_name,
-        subobjname => p_partition_name,
-        comptype => 2, -- COMP_ADVANCED/OLTP
-        blkcnt_cmp => v_blkcnt_cmp,
-        blkcnt_uncmp => v_blkcnt_uncmp,
-        row_cmp => v_row_cmp,
-        row_uncmp => v_row_uncmp,
-        cmp_ratio => v_cmp_ratio
+        v_scratch_tbs,
+        p_owner,
+        p_table_name,
+        p_partition_name,
+        2, -- COMP_ADVANCED/OLTP
+        v_blkcnt_cmp,
+        v_blkcnt_uncmp,
+        v_row_cmp,
+        v_row_uncmp,
+        v_cmp_ratio
       );
       x_oltp_ratio := v_cmp_ratio;
       x_oltp_size := ROUND(x_current_size / NULLIF(v_cmp_ratio, 0), 2);
