@@ -20,6 +20,10 @@ CREATE OR REPLACE PACKAGE pkg_compression_advisor AS
   c_strategy_aggressive CONSTANT NUMBER := 1;
   c_strategy_balanced CONSTANT NUMBER := 2;
   c_strategy_conservative CONSTANT NUMBER := 3;
+  -- Minimum size thresholds for analysis candidates (in bytes)
+  c_min_table_size_bytes CONSTANT NUMBER := 1048576;    -- 1 MB
+  c_min_index_size_bytes CONSTANT NUMBER := 10485760;   -- 10 MB
+  c_min_lob_size_bytes   CONSTANT NUMBER := 10485760;   -- 10 MB
   -- ========================================================================
   -- Main Analysis Procedures
   -- ========================================================================
@@ -988,7 +992,7 @@ END test_table_compression;
           SELECT 1 FROM dba_segments s
           WHERE s.owner = t.owner
             AND s.segment_name = t.table_name
-            AND s.bytes > 1048576  -- > 1 MB
+            AND s.bytes > c_min_table_size_bytes
         )
       ORDER BY
         (SELECT NVL(SUM(bytes), 0) FROM dba_segments s
@@ -1043,7 +1047,7 @@ END test_table_compression;
             SELECT 1 FROM dba_segments s
             WHERE s.owner = t.owner
               AND s.segment_name = t.table_name
-              AND s.bytes > 1048576  -- > 1 MB
+              AND s.bytes > c_min_table_size_bytes
           )
         ORDER BY
           (SELECT NVL(SUM(bytes), 0) FROM dba_segments s
@@ -1082,7 +1086,7 @@ END test_table_compression;
           SELECT 1 FROM dba_segments s
           WHERE s.owner = i.owner
             AND s.segment_name = i.index_name
-            AND s.bytes > 10485760  -- > 10 MB
+            AND s.bytes > c_min_index_size_bytes
         )
     ) LOOP
       BEGIN
@@ -1117,7 +1121,7 @@ END test_table_compression;
           SELECT 1 FROM dba_segments s
           WHERE s.owner = l.owner
             AND s.segment_name = l.segment_name
-            AND s.bytes > 10485760  -- > 10 MB
+            AND s.bytes > c_min_lob_size_bytes
         )
     ) LOOP
       BEGIN
