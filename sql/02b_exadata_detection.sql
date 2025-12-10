@@ -315,7 +315,7 @@ CREATE OR REPLACE PACKAGE BODY PKG_EXADATA_DETECTION AS
         FROM v$cell
         WHERE ROWNUM <= 100;
         v_accessible := v_cell_count > 0;
-        log_message('V$CELL accessible: ' || CASE WHEN v_accessible = TRUE THEN 'YES' ELSE 'NO' END ||
+        log_message('V$CELL accessible: ' || CASE WHEN v_accessible THEN 'YES' ELSE 'NO' END ||
                    ', Cell count: ' || v_cell_count, 'DEBUG');
         -- Store cell count
         g_cell_count := v_cell_count;
@@ -404,6 +404,11 @@ CREATE OR REPLACE PACKAGE BODY PKG_EXADATA_DETECTION AS
         v_detection_methods VARCHAR2(500);
         v_confidence        NUMBER := 0;
         v_platform          VARCHAR2(30);
+        -- VARCHAR2 helpers for SQL (BOOLEAN not allowed in SQL)
+        v_hcc_yn            VARCHAR2(1);
+        v_cell_offload_yn   VARCHAR2(1);
+        v_cell_offload_str  VARCHAR2(5);
+        v_vcell_yn          VARCHAR2(1);
     BEGIN
         log_message('Starting platform detection...', 'INFO');
         -- Run all detection methods
@@ -443,6 +448,11 @@ CREATE OR REPLACE PACKAGE BODY PKG_EXADATA_DETECTION AS
         -- Store results
         g_platform_type := v_platform;
         g_confidence_score := v_confidence;
+        -- Convert BOOLEANs to VARCHAR2 for SQL usage
+        IF g_hcc_available THEN v_hcc_yn := 'Y'; ELSE v_hcc_yn := 'N'; END IF;
+        IF v_cell_offload THEN v_cell_offload_yn := 'Y'; ELSE v_cell_offload_yn := 'N'; END IF;
+        IF v_cell_offload THEN v_cell_offload_str := 'TRUE'; ELSE v_cell_offload_str := 'FALSE'; END IF;
+        IF v_vcell_accessible THEN v_vcell_yn := 'Y'; ELSE v_vcell_yn := 'N'; END IF;
         -- Update main config record
         MERGE INTO T_PLATFORM_CONFIG t
         USING (SELECT 'PLATFORM_TYPE' AS key FROM DUAL) s
@@ -453,10 +463,10 @@ CREATE OR REPLACE PACKAGE BODY PKG_EXADATA_DETECTION AS
                 t.platform_type = v_platform,
                 t.detection_method = v_detection_methods,
                 t.detection_confidence = v_confidence,
-                t.hcc_available = CASE WHEN g_hcc_available = TRUE THEN 'Y' ELSE 'N' END,
-                t.smart_scan_available = CASE WHEN v_cell_offload = TRUE THEN 'Y' ELSE 'N' END,
-                t.cell_offload_enabled = CASE WHEN v_cell_offload = TRUE THEN 'TRUE' ELSE 'FALSE' END,
-                t.v$cell_accessible = CASE WHEN v_vcell_accessible = TRUE THEN 'Y' ELSE 'N' END,
+                t.hcc_available = v_hcc_yn,
+                t.smart_scan_available = v_cell_offload_yn,
+                t.cell_offload_enabled = v_cell_offload_str,
+                t.v$cell_accessible = v_vcell_yn,
                 t.storage_cells_count = g_cell_count,
                 t.last_detected = SYSTIMESTAMP,
                 t.detected_by = USER
@@ -469,16 +479,13 @@ CREATE OR REPLACE PACKAGE BODY PKG_EXADATA_DETECTION AS
             ) VALUES (
                 s.key, v_platform, 'PLATFORM', v_platform,
                 v_detection_methods, v_confidence,
-                CASE WHEN g_hcc_available = TRUE THEN 'Y' ELSE 'N' END,
-                CASE WHEN v_cell_offload = TRUE THEN 'Y' ELSE 'N' END,
-                CASE WHEN v_cell_offload = TRUE THEN 'TRUE' ELSE 'FALSE' END,
-                CASE WHEN v_vcell_accessible = TRUE THEN 'Y' ELSE 'N' END,
+                v_hcc_yn, v_cell_offload_yn, v_cell_offload_str, v_vcell_yn,
                 g_cell_count, SYSTIMESTAMP, USER
             );
         COMMIT;
         log_message('Platform detection complete: ' || v_platform ||
                    ' (Confidence: ' || v_confidence || '%)', 'INFO');
-        log_message('HCC Available: ' || CASE WHEN g_hcc_available = TRUE THEN 'YES' ELSE 'NO' END, 'INFO');
+        log_message('HCC Available: ' || v_hcc_yn, 'INFO');
         log_message('Detection methods: ' || v_detection_methods, 'INFO');
     EXCEPTION
         WHEN OTHERS THEN
@@ -672,8 +679,8 @@ CREATE OR REPLACE PACKAGE BODY PKG_EXADATA_DETECTION AS
         g_initialized := TRUE;
         log_message('=== Initialization Complete ===', 'INFO');
         log_message('Platform: ' || g_platform_type, 'INFO');
-        log_message('Exadata: ' || CASE WHEN g_is_exadata = TRUE THEN 'YES' ELSE 'NO' END, 'INFO');
-        log_message('HCC Available: ' || CASE WHEN g_hcc_available = TRUE THEN 'YES' ELSE 'NO' END, 'INFO');
+        log_message('Exadata: ' || CASE WHEN g_is_exadata THEN 'YES' ELSE 'NO' END, 'INFO');
+        log_message('HCC Available: ' || CASE WHEN g_hcc_available THEN 'YES' ELSE 'NO' END, 'INFO');
         log_message('Confidence: ' || g_confidence_score || '%', 'INFO');
         IF g_cell_count > 0 THEN
             log_message('Storage Cells: ' || g_cell_count, 'INFO');
@@ -944,8 +951,8 @@ BEGIN
 
     DBMS_OUTPUT.PUT_LINE('');
     DBMS_OUTPUT.PUT_LINE('Platform Type      : ' || PKG_EXADATA_DETECTION.get_platform_type);
-    DBMS_OUTPUT.PUT_LINE('Is Exadata         : ' || CASE WHEN PKG_EXADATA_DETECTION.is_exadata = TRUE THEN 'YES' ELSE 'NO' END);
-    DBMS_OUTPUT.PUT_LINE('HCC Available      : ' || CASE WHEN PKG_EXADATA_DETECTION.is_hcc_available = TRUE THEN 'YES' ELSE 'NO' END);
+    DBMS_OUTPUT.PUT_LINE('Is Exadata         : ' || CASE WHEN PKG_EXADATA_DETECTION.is_exadata THEN 'YES' ELSE 'NO' END);
+    DBMS_OUTPUT.PUT_LINE('HCC Available      : ' || CASE WHEN PKG_EXADATA_DETECTION.is_hcc_available THEN 'YES' ELSE 'NO' END);
     DBMS_OUTPUT.PUT_LINE('Confidence Score   : ' || PKG_EXADATA_DETECTION.get_confidence_score || '%');
     DBMS_OUTPUT.PUT_LINE('Storage Cells      : ' || PKG_EXADATA_DETECTION.get_cell_count);
 END;
