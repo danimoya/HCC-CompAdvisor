@@ -357,7 +357,7 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
         ownname => p_owner,
         objname => p_table_name,
         subobjname => p_partition_name,
-        comptype => DBMS_COMPRESSION.COMP_ADVANCED, -- Use Advanced/OLTP as baseline
+        comptype => 1, -- COMP_BASIC
         blkcnt_cmp => v_blkcnt_cmp,
         blkcnt_uncmp => v_blkcnt_uncmp,
         row_cmp => v_row_cmp,
@@ -378,7 +378,7 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
         ownname => p_owner,
         objname => p_table_name,
         subobjname => p_partition_name,
-        comptype => DBMS_COMPRESSION.COMP_ADVANCED,
+        comptype => 2, -- COMP_ADVANCED/OLTP
         blkcnt_cmp => v_blkcnt_cmp,
         blkcnt_uncmp => v_blkcnt_uncmp,
         row_cmp => v_row_cmp,
@@ -1148,27 +1148,27 @@ END test_table_compression;
         object_name,
         object_type,
         partition_name,
-        current_size_mb,
-        compressed_size_mb,
-        compression_ratio,
-        space_savings_mb,
-        space_savings_pct,
+        size_mb,
+        ROUND(size_bytes / BEST_RATIO / 1024 / 1024, 2) compressed_size_mb,
+        best_ratio compression_ratio,
+        projected_savings_mb space_savings_mb,
+        projected_savings_pct space_savings_pct,
         current_compression,
-        recommended_compression,
+        advisable_compression recommended_compression,
         hotness_score,
-        access_score,
-        analysis_rationale,
+        access_frequency access_score,
+        recommendation_reason analysis_rationale,
         analysis_date,
         CASE
-          WHEN space_savings_pct >= 50 THEN 'HIGH'
-          WHEN space_savings_pct >= 30 THEN 'MEDIUM'
+          WHEN projected_savings_pct >= 50 THEN 'HIGH'
+          WHEN projected_savings_pct >= 30 THEN 'MEDIUM'
           ELSE 'LOW'
         END AS priority
       FROM t_compression_analysis
-      WHERE (p_strategy_id IS NULL OR strategy_id = p_strategy_id)
-        AND space_savings_pct >= p_min_savings_pct
-        AND recommended_compression != 'NONE'
-      ORDER BY space_savings_mb DESC, space_savings_pct DESC;
+      WHERE (p_strategy_id IS NULL OR advisor_run_id IN (SELECT run_id FROM t_advisor_run WHERE strategy_id = p_strategy_id))
+        AND projected_savings_pct >= p_min_savings_pct
+        AND advisable_compression != 'NONE'
+      ORDER BY projected_savings_mb DESC, projected_savings_pct DESC;
     RETURN v_cursor;
   END get_recommendations;
   FUNCTION generate_ddl(
@@ -1184,34 +1184,34 @@ END test_table_compression;
         object_name,
         object_type,
         partition_name,
-        recommended_compression,
+        advisable_compression recommended_compression,
         CASE object_type
           WHEN 'TABLE' THEN
             CASE
               WHEN partition_name IS NOT NULL THEN
                 'ALTER TABLE ' || owner || '.' || object_name ||
                 ' MODIFY PARTITION ' || partition_name ||
-                ' ' || g_compression_map(recommended_compression) || ';'
+                ' ' || g_compression_map(advisable_compression) || ';'
               ELSE
                 'ALTER TABLE ' || owner || '.' || object_name ||
-                ' MOVE ' || g_compression_map(recommended_compression) || ';'
+                ' MOVE ' || g_compression_map(advisable_compression) || ';'
             END
           WHEN 'INDEX' THEN
             'ALTER INDEX ' || owner || '.' || object_name ||
-            ' REBUILD ' || g_compression_map(recommended_compression) || ';'
+            ' REBUILD ' || g_compression_map(advisable_compression) || ';'
           WHEN 'LOB' THEN
             'ALTER TABLE ' || owner || '.' || SUBSTR(object_name, 1, INSTR(object_name, '.') - 1) ||
             ' MODIFY LOB (' || SUBSTR(object_name, INSTR(object_name, '.') + 1) || ') (' ||
-            g_compression_map(recommended_compression) || ');'
+            g_compression_map(advisable_compression) || ');'
           ELSE
             '-- Unknown object type: ' || object_type
         END AS ddl_statement,
-        space_savings_mb,
-        space_savings_pct
+        projected_savings_mb space_savings_mb,
+        projected_savings_pct space_savings_pct
       FROM t_compression_analysis
       WHERE (p_recommendation_id IS NULL OR analysis_id = p_recommendation_id)
-        AND recommended_compression != 'NONE'
-      ORDER BY space_savings_mb DESC;
+        AND advisable_compression != 'NONE'
+      ORDER BY projected_savings_mb DESC;
     RETURN v_cursor;
   END generate_ddl;
   FUNCTION calculate_total_savings(
@@ -1219,11 +1219,11 @@ END test_table_compression;
   ) RETURN NUMBER IS
     v_total_savings NUMBER;
   BEGIN
-    SELECT NVL(SUM(space_savings_mb), 0)
+    SELECT NVL(SUM(projected_savings_mb), 0)
     INTO v_total_savings
     FROM t_compression_analysis
-    WHERE (p_strategy_id IS NULL OR strategy_id = p_strategy_id)
-      AND recommended_compression != 'NONE';
+    WHERE (p_strategy_id IS NULL OR advisor_run_id IN (SELECT run_id FROM t_advisor_run WHERE strategy_id = p_strategy_id))
+      AND advisable_compression != 'NONE';
     RETURN v_total_savings;
   END calculate_total_savings;
   -- ========================================================================
