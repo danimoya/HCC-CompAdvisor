@@ -126,9 +126,9 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
   -- ========================================================================
   -- Private Types and Variables
   -- ========================================================================
-  TYPE t_strategy_rules IS TABLE OF t_strategy_rules%ROWTYPE
+  TYPE t_strategy_rules_cache IS TABLE OF t_strategy_rules%ROWTYPE
     INDEX BY PLS_INTEGER;
-  g_strategy_rules t_strategy_rules;
+  g_strategy_rules t_strategy_rules_cache;
   g_rules_loaded BOOLEAN := FALSE;
   TYPE t_partition_list IS TABLE OF VARCHAR2(128);
   -- Compression type mappings for Oracle 23c Free
