@@ -140,25 +140,8 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
   g_rules_loaded BOOLEAN := FALSE;
   g_current_run_id NUMBER := NULL;
   g_compression_map t_compression_map;
-  /**
-   * Get or create an advisor run ID for analysis
-   */
-  FUNCTION get_advisor_run_id(p_strategy_id IN NUMBER DEFAULT 2) RETURN NUMBER IS
-    v_run_id NUMBER;
-  BEGIN
-    IF g_current_run_id IS NOT NULL THEN
-      RETURN g_current_run_id;
-    END IF;
-    -- Create a new advisor run
-    INSERT INTO t_advisor_run (
-      run_name, run_type, strategy_id, run_status
-    ) VALUES (
-      'Auto-run ' || TO_CHAR(SYSTIMESTAMP, 'YYYY-MM-DD HH24:MI:SS'),
-      'ALL', p_strategy_id, 'RUNNING'
-    ) RETURNING run_id INTO v_run_id;
-    g_current_run_id := v_run_id;
-    RETURN v_run_id;
-  END get_advisor_run_id;
+  -- Forward declaration
+  FUNCTION get_advisor_run_id(p_strategy_id IN NUMBER DEFAULT 2) RETURN NUMBER;
   -- ========================================================================
   -- Private Utility Functions
   -- ========================================================================
@@ -237,6 +220,25 @@ CREATE OR REPLACE PACKAGE BODY pkg_compression_advisor AS
       RETURN 'N';
     END IF;
   END is_excluded_schema;
+  /**
+   * Get or create an advisor run ID for analysis
+   */
+  FUNCTION get_advisor_run_id(p_strategy_id IN NUMBER DEFAULT 2) RETURN NUMBER IS
+    v_run_id NUMBER;
+  BEGIN
+    IF g_current_run_id IS NOT NULL THEN
+      RETURN g_current_run_id;
+    END IF;
+    -- Create a new advisor run
+    INSERT INTO t_advisor_run (
+      run_name, run_type, strategy_id, run_status
+    ) VALUES (
+      'Auto-run ' || TO_CHAR(SYSTIMESTAMP, 'YYYY-MM-DD HH24:MI:SS'),
+      'ALL', p_strategy_id, 'RUNNING'
+    ) RETURNING run_id INTO v_run_id;
+    g_current_run_id := v_run_id;
+    RETURN v_run_id;
+  END get_advisor_run_id;
   /**
    * Calculate DML hotness score based on recent activity
    */
