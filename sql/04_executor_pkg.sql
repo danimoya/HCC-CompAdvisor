@@ -108,6 +108,40 @@ CREATE OR REPLACE PACKAGE PKG_COMPRESSION_EXECUTOR AS
     p_online IN BOOLEAN DEFAULT TRUE
   );
   /**
+   * Compress a table subpartition preserving tablespace
+   *
+   * @param p_owner             Table owner
+   * @param p_table_name        Table name
+   * @param p_partition_name    Parent partition name
+   * @param p_subpartition_name Subpartition name
+   * @param p_compression_type  Compression type
+   * @param p_online            Use ONLINE clause if supported
+   */
+  PROCEDURE compress_subpartition(
+    p_owner IN VARCHAR2,
+    p_table_name IN VARCHAR2,
+    p_partition_name IN VARCHAR2,
+    p_subpartition_name IN VARCHAR2,
+    p_compression_type IN VARCHAR2,
+    p_online IN BOOLEAN DEFAULT TRUE
+  );
+  /**
+   * Compress all subpartitions of a partition preserving tablespaces
+   *
+   * @param p_owner             Table owner
+   * @param p_table_name        Table name
+   * @param p_partition_name    Parent partition name (NULL = all subpartitions of all partitions)
+   * @param p_compression_type  Compression type
+   * @param p_online            Use ONLINE clause if supported
+   */
+  PROCEDURE compress_all_subpartitions(
+    p_owner IN VARCHAR2,
+    p_table_name IN VARCHAR2,
+    p_partition_name IN VARCHAR2 DEFAULT NULL,
+    p_compression_type IN VARCHAR2,
+    p_online IN BOOLEAN DEFAULT TRUE
+  );
+  /**
    * Compress LOBs preserving tablespace
    *
    * @param p_owner           Table owner
@@ -785,6 +819,178 @@ CREATE OR REPLACE PACKAGE BODY PKG_COMPRESSION_EXECUTOR AS
     log_message('Successful: ' || v_success_count);
     log_message('Failed: ' || v_fail_count);
   END compress_all_partitions;
+  /**
+   * Compress a table subpartition preserving tablespace
+   * CRITICAL: Preserves the subpartition's original tablespace
+   */
+  PROCEDURE compress_subpartition(
+    p_owner IN VARCHAR2,
+    p_table_name IN VARCHAR2,
+    p_partition_name IN VARCHAR2,
+    p_subpartition_name IN VARCHAR2,
+    p_compression_type IN VARCHAR2,
+    p_online IN BOOLEAN DEFAULT TRUE
+  ) IS
+    v_ddl VARCHAR2(4000);
+    v_tablespace_name VARCHAR2(128);
+    v_compression_clause VARCHAR2(100);
+    v_size_before NUMBER;
+    v_size_after NUMBER;
+    v_history_id NUMBER;
+  BEGIN
+    log_message('=== Starting subpartition compression ===');
+    log_message('Subpartition: ' || p_owner || '.' || p_table_name || '.' || p_partition_name || '.' || p_subpartition_name);
+    log_message('Compression Type: ' || p_compression_type);
+    -- Query subpartition tablespace to preserve it
+    -- CRITICAL: Each subpartition may be in a different tablespace
+    BEGIN
+      SELECT tablespace_name
+      INTO v_tablespace_name
+      FROM DBA_TAB_SUBPARTITIONS
+      WHERE table_owner = p_owner
+        AND table_name = p_table_name
+        AND partition_name = p_partition_name
+        AND subpartition_name = p_subpartition_name;
+    EXCEPTION
+      WHEN NO_DATA_FOUND THEN
+        RAISE_APPLICATION_ERROR(-20001, 'Subpartition not found: ' || p_owner || '.' || p_table_name || '.' || p_partition_name || '.' || p_subpartition_name);
+    END;
+    log_message('Current subpartition tablespace: ' || NVL(v_tablespace_name, 'NULL'));
+    v_size_before := get_segment_size(p_owner, p_table_name || ':' || p_subpartition_name, 'TABLE SUBPARTITION');
+    log_message('Current size: ' || ROUND(v_size_before / 1024 / 1024, 2) || ' MB');
+    -- Get compression clause
+    v_compression_clause := get_compression_clause(p_compression_type);
+    -- Build DDL with TABLESPACE preservation
+    -- CRITICAL: Include TABLESPACE clause to preserve subpartition location
+    v_ddl := 'ALTER TABLE ' || p_owner || '.' || p_table_name ||
+             ' MOVE SUBPARTITION ' || p_subpartition_name ||
+             ' ' || v_compression_clause;
+    IF v_tablespace_name IS NOT NULL THEN
+      v_ddl := v_ddl || ' TABLESPACE ' || v_tablespace_name;
+      log_message('Preserving subpartition tablespace: ' || v_tablespace_name);
+    END IF;
+    IF p_online AND p_compression_type IN (C_COMPRESS_BASIC, C_COMPRESS_OLTP) THEN
+      v_ddl := v_ddl || ' ONLINE';
+    END IF;
+    log_message('DDL: ' || v_ddl);
+    -- Create history record
+    INSERT INTO T_COMPRESSION_HISTORY (
+      owner, object_name, object_type, partition_name, subpartition_name,
+      compression_type_applied, original_size_bytes,
+      compression_clause
+    ) VALUES (
+      p_owner, p_table_name, 'SUBPARTITION', p_partition_name, p_subpartition_name,
+      p_compression_type, v_size_before,
+      v_ddl
+    ) RETURNING history_id INTO v_history_id;
+    COMMIT;
+    -- Execute DDL
+    BEGIN
+      log_message('Executing subpartition compression...');
+      EXECUTE IMMEDIATE v_ddl;
+      log_message('Subpartition compressed successfully');
+      -- Rebuild subpartition indexes
+      FOR idx IN (
+        SELECT i.index_name, i.tablespace_name
+        FROM DBA_INDEXES i
+        WHERE i.table_owner = p_owner
+          AND i.table_name = p_table_name
+      ) LOOP
+        BEGIN
+          v_ddl := 'ALTER INDEX ' || p_owner || '.' || idx.index_name ||
+                   ' REBUILD SUBPARTITION ' || p_subpartition_name;
+          -- Preserve index subpartition tablespace
+          IF idx.tablespace_name IS NOT NULL THEN
+            v_ddl := v_ddl || ' TABLESPACE ' || idx.tablespace_name;
+          END IF;
+          EXECUTE IMMEDIATE v_ddl;
+          log_message('Rebuilt index subpartition: ' || idx.index_name || '.' || p_subpartition_name);
+        EXCEPTION
+          WHEN OTHERS THEN
+            log_message('Warning: Failed to rebuild index subpartition: ' || SQLERRM, 'WARN');
+        END;
+      END LOOP;
+      v_size_after := get_segment_size(p_owner, p_table_name || ':' || p_subpartition_name, 'TABLE SUBPARTITION');
+      -- Update history
+      UPDATE T_COMPRESSION_HISTORY
+      SET compressed_size_bytes = v_size_after,
+          compression_ratio_achieved = CASE WHEN v_size_after > 0 THEN ROUND(v_size_before / v_size_after, 2) ELSE 0 END,
+          operation_status = 'SUCCESS',
+          end_time = SYSTIMESTAMP
+      WHERE history_id = v_history_id;
+      COMMIT;
+      log_message('New size: ' || ROUND(v_size_after / 1024 / 1024, 2) || ' MB');
+      log_message('=== Subpartition compression completed ===');
+    EXCEPTION
+      WHEN OTHERS THEN
+        UPDATE T_COMPRESSION_HISTORY
+        SET operation_status = 'FAILED',
+            error_message = SUBSTR(SQLERRM, 1, 4000),
+            end_time = SYSTIMESTAMP
+        WHERE history_id = v_history_id;
+        COMMIT;
+        log_message('ERROR: ' || SQLERRM, 'ERROR');
+        RAISE;
+    END;
+  END compress_subpartition;
+  /**
+   * Compress all subpartitions of a partition (or all partitions) preserving tablespaces
+   * CRITICAL: Each subpartition's tablespace is individually preserved
+   */
+  PROCEDURE compress_all_subpartitions(
+    p_owner IN VARCHAR2,
+    p_table_name IN VARCHAR2,
+    p_partition_name IN VARCHAR2 DEFAULT NULL,
+    p_compression_type IN VARCHAR2,
+    p_online IN BOOLEAN DEFAULT TRUE
+  ) IS
+    v_subpartition_count NUMBER := 0;
+    v_success_count NUMBER := 0;
+    v_fail_count NUMBER := 0;
+  BEGIN
+    log_message('=== Starting batch subpartition compression ===');
+    log_message('Table: ' || p_owner || '.' || p_table_name);
+    IF p_partition_name IS NOT NULL THEN
+      log_message('Partition: ' || p_partition_name);
+    ELSE
+      log_message('Partition: ALL');
+    END IF;
+    log_message('Compression Type: ' || p_compression_type);
+    -- Process each subpartition individually to preserve its tablespace
+    FOR subpart IN (
+      SELECT partition_name, subpartition_name, tablespace_name
+      FROM DBA_TAB_SUBPARTITIONS
+      WHERE table_owner = p_owner
+        AND table_name = p_table_name
+        AND (p_partition_name IS NULL OR partition_name = p_partition_name)
+      ORDER BY partition_name, subpartition_position
+    ) LOOP
+      v_subpartition_count := v_subpartition_count + 1;
+      log_message('Processing subpartition ' || v_subpartition_count || ': ' ||
+                  subpart.partition_name || '.' || subpart.subpartition_name ||
+                  ' (tablespace: ' || NVL(subpart.tablespace_name, 'NULL') || ')');
+      BEGIN
+        compress_subpartition(
+          p_owner => p_owner,
+          p_table_name => p_table_name,
+          p_partition_name => subpart.partition_name,
+          p_subpartition_name => subpart.subpartition_name,
+          p_compression_type => p_compression_type,
+          p_online => p_online
+        );
+        v_success_count := v_success_count + 1;
+      EXCEPTION
+        WHEN OTHERS THEN
+          v_fail_count := v_fail_count + 1;
+          log_message('Failed to compress subpartition ' || subpart.subpartition_name || ': ' || SQLERRM, 'ERROR');
+          -- Continue with next subpartition
+      END;
+    END LOOP;
+    log_message('=== Batch subpartition compression completed ===');
+    log_message('Total subpartitions: ' || v_subpartition_count);
+    log_message('Successful: ' || v_success_count);
+    log_message('Failed: ' || v_fail_count);
+  END compress_all_subpartitions;
   /**
    * Compress LOB segments preserving tablespace
    * CRITICAL: Preserves LOB segment tablespace
