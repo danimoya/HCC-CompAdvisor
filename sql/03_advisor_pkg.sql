@@ -464,21 +464,28 @@ END test_table_compression;
     END IF;
     v_rationale := v_rationale || 'Compression ratio: ' || ROUND(p_compression_ratio, 2) || ':1; ';
     -- Add recommendation explanation
-    CASE p_recommended_compression
-      WHEN 'NONE' THEN
-        v_rationale := v_rationale || 'No compression recommended (ratio too low or high DML activity)';
-      WHEN 'BASIC' THEN
-        v_rationale := v_rationale || 'Basic compression recommended (moderate ratio, acceptable overhead)';
-      WHEN 'OLTP' THEN
-        v_rationale := v_rationale || 'OLTP compression recommended (good ratio, optimized for DML)';
-      WHEN 'INDEX_ADVANCED_LOW' THEN
-        v_rationale := v_rationale || 'Index compression (Advanced Low) recommended';
-      WHEN 'INDEX_ADVANCED_HIGH' THEN
-        v_rationale := v_rationale || 'Index compression (Advanced High) recommended for maximum savings';
-      WHEN 'LOB_LOW', 'LOB_MEDIUM', 'LOB_HIGH' THEN
-        v_rationale := v_rationale || 'LOB compression recommended for large object storage';
+    CASE
+      WHEN p_recommended_compression IN ('LOB_LOW', 'LOB_MEDIUM', 'LOB_HIGH') THEN
+        v_rationale := v_rationale ||
+          'LOB compression recommended for large object storage';
+      WHEN p_recommended_compression = 'NONE' THEN
+        v_rationale := v_rationale ||
+          'No compression recommended (ratio too low or high DML activity)';
+      WHEN p_recommended_compression = 'BASIC' THEN
+        v_rationale := v_rationale ||
+          'Basic compression recommended (moderate ratio, acceptable overhead)';
+      WHEN p_recommended_compression = 'OLTP' THEN
+        v_rationale := v_rationale ||
+          'OLTP compression recommended (good ratio, optimized for DML)';
+      WHEN p_recommended_compression = 'INDEX_ADVANCED_LOW' THEN
+        v_rationale := v_rationale ||
+          'Index compression (Advanced Low) recommended';
+      WHEN p_recommended_compression = 'INDEX_ADVANCED_HIGH' THEN
+        v_rationale := v_rationale ||
+          'Index compression (Advanced High) recommended for maximum savings';
       ELSE
-        v_rationale := v_rationale || 'Compression type: ' || p_recommended_compression;
+        v_rationale := v_rationale ||
+          'Compression type: ' || p_recommended_compression;
     END CASE;
     RETURN SUBSTR(v_rationale, 1, 4000);
   END generate_rationale;
