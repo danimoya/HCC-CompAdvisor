@@ -124,6 +124,16 @@ CREATE OR REPLACE PACKAGE pkg_compression_advisor AS
    * Returns 'Y' if excluded, 'N' if not
    */
   FUNCTION is_excluded_schema(p_owner IN VARCHAR2) RETURN VARCHAR2 DETERMINISTIC;
+  /**
+   * Get compression DDL clause for a given compression type
+   * @param p_compression_type Compression type (BASIC, OLTP, etc.)
+   * @param p_object_type Object type (TABLE, INDEX, LOB)
+   * @return DDL clause string
+   */
+  FUNCTION get_compression_clause(
+    p_compression_type IN VARCHAR2,
+    p_object_type IN VARCHAR2
+  ) RETURN VARCHAR2;
 END pkg_compression_advisor;
 /
 
@@ -1180,12 +1190,56 @@ END test_table_compression;
       ORDER BY projected_savings_mb DESC, projected_savings_pct DESC;
     RETURN v_cursor;
   END get_recommendations;
+  -- Helper function to map compression type to DDL clause
+  FUNCTION get_compression_clause(
+    p_compression_type IN VARCHAR2,
+    p_object_type IN VARCHAR2
+  ) RETURN VARCHAR2 IS
+  BEGIN
+    IF p_object_type = 'TABLE' THEN
+      RETURN CASE p_compression_type
+        -- Standard compression types
+        WHEN 'NONE' THEN 'NOCOMPRESS'
+        WHEN 'BASIC' THEN 'COMPRESS BASIC'
+        WHEN 'OLTP' THEN 'COMPRESS FOR OLTP'
+        WHEN 'ADVANCED' THEN 'COMPRESS FOR OLTP'
+        -- HCC compression types (Exadata only)
+        WHEN 'HCC_QUERY_LOW' THEN 'COMPRESS FOR QUERY LOW'
+        WHEN 'HCC_QUERY_HIGH' THEN 'COMPRESS FOR QUERY HIGH'
+        WHEN 'HCC_ARCHIVE_LOW' THEN 'COMPRESS FOR ARCHIVE LOW'
+        WHEN 'HCC_ARCHIVE_HIGH' THEN 'COMPRESS FOR ARCHIVE HIGH'
+        -- Alternate naming conventions
+        WHEN 'QUERY_LOW' THEN 'COMPRESS FOR QUERY LOW'
+        WHEN 'QUERY_HIGH' THEN 'COMPRESS FOR QUERY HIGH'
+        WHEN 'ARCHIVE_LOW' THEN 'COMPRESS FOR ARCHIVE LOW'
+        WHEN 'ARCHIVE_HIGH' THEN 'COMPRESS FOR ARCHIVE HIGH'
+        ELSE 'COMPRESS BASIC'
+      END;
+    ELSIF p_object_type = 'INDEX' THEN
+      RETURN CASE p_compression_type
+        WHEN 'NONE' THEN 'NOCOMPRESS'
+        WHEN 'INDEX_ADVANCED_LOW' THEN 'COMPRESS ADVANCED LOW'
+        WHEN 'INDEX_ADVANCED_HIGH' THEN 'COMPRESS ADVANCED HIGH'
+        ELSE 'COMPRESS ADVANCED LOW'
+      END;
+    ELSIF p_object_type = 'LOB' THEN
+      RETURN CASE p_compression_type
+        WHEN 'NONE' THEN 'NOCOMPRESS'
+        WHEN 'LOB_LOW' THEN 'COMPRESS LOW'
+        WHEN 'LOB_MEDIUM' THEN 'COMPRESS MEDIUM'
+        WHEN 'LOB_HIGH' THEN 'COMPRESS HIGH'
+        ELSE 'COMPRESS MEDIUM'
+      END;
+    ELSE
+      RETURN 'NOCOMPRESS';
+    END IF;
+  END get_compression_clause;
+
   FUNCTION generate_ddl(
     p_recommendation_id IN NUMBER DEFAULT NULL
   ) RETURN SYS_REFCURSOR IS
     v_cursor SYS_REFCURSOR;
   BEGIN
-    init_compression_map;
     OPEN v_cursor FOR
       SELECT
         ca.analysis_id,
@@ -1200,18 +1254,18 @@ END test_table_compression;
               WHEN ca.partition_name IS NOT NULL THEN
                 'ALTER TABLE ' || ca.owner || '.' || ca.object_name ||
                 ' MODIFY PARTITION ' || ca.partition_name ||
-                ' ' || g_compression_map(ca.advisable_compression) || ';'
+                ' ' || pkg_compression_advisor.get_compression_clause(ca.advisable_compression, 'TABLE') || ';'
               ELSE
                 'ALTER TABLE ' || ca.owner || '.' || ca.object_name ||
-                ' MOVE ' || g_compression_map(ca.advisable_compression) || ';'
+                ' MOVE ' || pkg_compression_advisor.get_compression_clause(ca.advisable_compression, 'TABLE') || ';'
             END
           WHEN 'INDEX' THEN
             'ALTER INDEX ' || ca.owner || '.' || ca.object_name ||
-            ' REBUILD ' || g_compression_map(ca.advisable_compression) || ';'
+            ' REBUILD ' || pkg_compression_advisor.get_compression_clause(ca.advisable_compression, 'INDEX') || ';'
           WHEN 'LOB' THEN
             'ALTER TABLE ' || ca.owner || '.' || SUBSTR(ca.object_name, 1, INSTR(ca.object_name, '.') - 1) ||
             ' MODIFY LOB (' || SUBSTR(ca.object_name, INSTR(ca.object_name, '.') + 1) || ') (' ||
-            g_compression_map(ca.advisable_compression) || ');'
+            pkg_compression_advisor.get_compression_clause(ca.advisable_compression, 'LOB') || ');'
           ELSE
             '-- Unknown object type: ' || ca.object_type
         END AS ddl_statement,
