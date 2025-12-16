@@ -57,6 +57,7 @@ PROMPT   - Logging Package (foundation)
 PROMPT   - Exadata Detection Package
 PROMPT   - HCC Advisor Package (main logic)
 PROMPT   - Compression Executor Package
+PROMPT   - Compression Analyzer Package (public API)
 PROMPT   - Reporting Views
 PROMPT   - REST API Modules (if ORDS available)
 PROMPT   - Installation Validation
@@ -317,6 +318,10 @@ PROMPT
 PROMPT [4.4] Installing HCC_EXECUTOR_PKG package (compression execution)...
 @@04_executor_pkg.sql
 
+PROMPT
+PROMPT [4.5] Installing PKG_COMPRESSION_ANALYZER package (public API)...
+@@07_analyzer_pkg.sql
+
 -- Verify packages compiled
 WHENEVER SQLERROR EXIT FAILURE
 
@@ -327,16 +332,20 @@ BEGIN
     SELECT COUNT(*) INTO v_pkg_count
     FROM user_objects
     WHERE object_type IN ('PACKAGE', 'PACKAGE BODY')
-      AND object_name IN ('HCC_LOGGING_PKG', 'HCC_EXADATA_PKG', 'HCC_ADVISOR_PKG', 'HCC_EXECUTOR_PKG')
+      AND object_name IN ('HCC_LOGGING_PKG', 'HCC_EXADATA_PKG', 'HCC_ADVISOR_PKG', 'HCC_EXECUTOR_PKG',
+                          'PKG_COMPRESSION_LOG', 'PKG_COMPRESSION_ADVISOR', 'PKG_COMPRESSION_EXECUTOR',
+                          'PKG_COMPRESSION_ANALYZER')
       AND status = 'VALID';
 
     SELECT COUNT(*) INTO v_invalid_count
     FROM user_objects
     WHERE object_type IN ('PACKAGE', 'PACKAGE BODY')
-      AND object_name IN ('HCC_LOGGING_PKG', 'HCC_EXADATA_PKG', 'HCC_ADVISOR_PKG', 'HCC_EXECUTOR_PKG')
+      AND object_name IN ('HCC_LOGGING_PKG', 'HCC_EXADATA_PKG', 'HCC_ADVISOR_PKG', 'HCC_EXECUTOR_PKG',
+                          'PKG_COMPRESSION_LOG', 'PKG_COMPRESSION_ADVISOR', 'PKG_COMPRESSION_EXECUTOR',
+                          'PKG_COMPRESSION_ANALYZER')
       AND status = 'INVALID';
 
-    DBMS_OUTPUT.PUT_LINE('Valid packages: ' || v_pkg_count || '/8');
+    DBMS_OUTPUT.PUT_LINE('Valid packages: ' || v_pkg_count);
     DBMS_OUTPUT.PUT_LINE('Invalid objects: ' || v_invalid_count);
 
     IF v_invalid_count > 0 THEN
