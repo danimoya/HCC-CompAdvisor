@@ -195,18 +195,11 @@ DECLARE
     v_views view_array;
     v_sql VARCHAR2(500);
 BEGIN
-    -- Get all HCC and compression views
+    -- Get all HCC views
     SELECT view_name
     BULK COLLECT INTO v_views
     FROM user_views
     WHERE view_name LIKE 'HCC_%'
-       OR view_name LIKE 'V_COMPRESSION%'
-       OR view_name LIKE 'V_HOT_%'
-       OR view_name LIKE 'V_COLD_%'
-       OR view_name LIKE 'V_SPACE_%'
-       OR view_name LIKE 'V_EXECUTION_%'
-       OR view_name LIKE 'V_STRATEGY_%'
-       OR view_name LIKE 'V_ADVISOR_%'
     ORDER BY view_name;
 
     IF v_views.COUNT > 0 THEN
@@ -242,12 +235,12 @@ DECLARE
     v_packages package_array;
     v_sql VARCHAR2(500);
 BEGIN
-    -- Drop package bodies first (including PKG_COMPRESSION_* packages)
+    -- Drop package bodies first
     SELECT object_name
     BULK COLLECT INTO v_packages
     FROM user_objects
     WHERE object_type = 'PACKAGE BODY'
-      AND (object_name LIKE 'HCC_%' OR object_name LIKE 'PKG_COMPRESSION%')
+      AND object_name LIKE 'HCC_%'
     ORDER BY object_name;
 
     IF v_packages.COUNT > 0 THEN
@@ -272,12 +265,12 @@ DECLARE
     v_packages package_array;
     v_sql VARCHAR2(500);
 BEGIN
-    -- Drop package specifications (including PKG_COMPRESSION_* packages)
+    -- Drop package specifications
     SELECT object_name
     BULK COLLECT INTO v_packages
     FROM user_objects
     WHERE object_type = 'PACKAGE'
-      AND (object_name LIKE 'HCC_%' OR object_name LIKE 'PKG_COMPRESSION%')
+      AND object_name LIKE 'HCC_%'
     ORDER BY object_name;
 
     IF v_packages.COUNT > 0 THEN
@@ -313,24 +306,18 @@ DECLARE
     v_tables table_array;
     v_sql VARCHAR2(500);
 BEGIN
-    -- Get all HCC and T_COMPRESSION tables in reverse dependency order
+    -- Get all HCC tables in reverse dependency order
     SELECT table_name
     BULK COLLECT INTO v_tables
     FROM user_tables
     WHERE table_name LIKE 'HCC_%'
-       OR table_name LIKE 'T_COMPRESSION%'
-       OR table_name LIKE 'T_STRATEGY%'
-       OR table_name LIKE 'T_ADVISOR%'
-       OR table_name LIKE 'T_INDEX_COMPRESSION%'
-       OR table_name LIKE 'T_LOB_COMPRESSION%'
     ORDER BY
-        CASE
-            WHEN table_name LIKE '%HISTORY%' THEN 1
-            WHEN table_name LIKE '%ANALYSIS%' THEN 2
-            WHEN table_name LIKE '%CONFIG%' THEN 3
-            WHEN table_name LIKE '%RULE%' THEN 4
-            WHEN table_name LIKE '%STRAT%' THEN 5
-            ELSE 6
+        CASE table_name
+            WHEN 'HCC_SEGMENT_ANALYSIS' THEN 1
+            WHEN 'HCC_ANALYSIS_HISTORY' THEN 2
+            WHEN 'HCC_ADVISOR_CONFIG' THEN 3
+            WHEN 'HCC_COMPRESSION_STRATEGIES' THEN 4
+            ELSE 5
         END;
 
     IF v_tables.COUNT > 0 THEN
@@ -366,12 +353,11 @@ DECLARE
     v_sequences sequence_array;
     v_sql VARCHAR2(500);
 BEGIN
-    -- Get all HCC and SEQ_EXECUTION sequences
+    -- Get all HCC sequences
     SELECT sequence_name
     BULK COLLECT INTO v_sequences
     FROM user_sequences
     WHERE sequence_name LIKE 'HCC_%'
-       OR sequence_name LIKE 'SEQ_%'
     ORDER BY sequence_name;
 
     IF v_sequences.COUNT > 0 THEN
@@ -425,24 +411,14 @@ DECLARE
 BEGIN
     SELECT COUNT(*) INTO v_remaining_count
     FROM user_objects
-    WHERE object_name LIKE 'HCC_%'
-       OR object_name LIKE 'PKG_COMPRESSION%'
-       OR object_name LIKE 'T_COMPRESSION%'
-       OR object_name LIKE 'V_COMPRESSION%'
-       OR object_name LIKE 'T_STRATEGY%'
-       OR object_name LIKE 'T_ADVISOR%';
+    WHERE object_name LIKE 'HCC_%';
 
     IF v_remaining_count > 0 THEN
-        DBMS_OUTPUT.PUT_LINE('WARNING: ' || v_remaining_count || ' compression advisor objects still exist:');
+        DBMS_OUTPUT.PUT_LINE('WARNING: ' || v_remaining_count || ' HCC objects still exist:');
 
         FOR rec IN (SELECT object_type, object_name, status
                     FROM user_objects
                     WHERE object_name LIKE 'HCC_%'
-                       OR object_name LIKE 'PKG_COMPRESSION%'
-                       OR object_name LIKE 'T_COMPRESSION%'
-                       OR object_name LIKE 'V_COMPRESSION%'
-                       OR object_name LIKE 'T_STRATEGY%'
-                       OR object_name LIKE 'T_ADVISOR%'
                     ORDER BY object_type, object_name) LOOP
             DBMS_OUTPUT.PUT_LINE('  - ' || rec.object_type || ': ' || rec.object_name || ' (' || rec.status || ')');
         END LOOP;
