@@ -59,8 +59,12 @@ class Config:
     # API Timeout
     API_TIMEOUT: int = 30  # seconds
 
-    # Compression Strategies
+    # Compression Strategies (Oracle 23c Free + HCC for Exadata)
     COMPRESSION_STRATEGIES: list = [
+        'BASIC',
+        'OLTP',
+        'ADV_LOW',
+        'ADV_HIGH',
         'QUERY LOW',
         'QUERY HIGH',
         'ARCHIVE LOW',
