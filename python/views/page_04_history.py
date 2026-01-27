@@ -8,18 +8,16 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
-from utils.api_client import get_api_client
+from utils.db_queries import CompressionQueries
 from config import config
 
 
 def show_history_page():
     """Display history page"""
 
-    st.title("🕐 Execution History")
+    st.title("Execution History")
     st.markdown("View and analyze compression execution history")
     st.markdown("---")
-
-    api_client = get_api_client()
 
     # Date range filter
     col1, col2, col3 = st.columns([2, 2, 1])
@@ -45,23 +43,20 @@ def show_history_page():
             step=10
         )
 
-    # Fetch history
+    # Fetch history using direct database query
     with st.spinner("Loading execution history..."):
-        history = api_client.get_execution_history(
+        df = CompressionQueries.get_execution_history(
             start_date=start_date.isoformat(),
             end_date=end_date.isoformat(),
             limit=limit
         )
 
-    if "error" in history:
-        st.error("Failed to load execution history")
-        return
-
-    if "items" not in history or not history["items"]:
+    if df.empty:
         st.warning("No execution history found for the selected date range")
         return
 
-    df = pd.DataFrame(history["items"])
+    # Normalize column names to lowercase
+    df.columns = [col.lower() for col in df.columns]
 
     # Convert dates
     if 'executed_at' in df.columns:
@@ -77,7 +72,7 @@ def show_history_page():
         )
 
     with col2:
-        completed = len(df[df['status'] == 'COMPLETED'])
+        completed = len(df[df['status'] == 'COMPLETED']) if 'status' in df.columns else 0
         success_rate = (completed / len(df) * 100) if len(df) > 0 else 0
         st.metric(
             label="Success Rate",
@@ -86,7 +81,7 @@ def show_history_page():
         )
 
     with col3:
-        total_savings = df['savings_pct'].mean() if 'savings_pct' in df.columns else 0
+        total_savings = df['savings_pct'].mean() if 'savings_pct' in df.columns and not df['savings_pct'].isna().all() else 0
         st.metric(
             label="Avg Savings",
             value=f"{total_savings:.1f}%"
@@ -105,9 +100,9 @@ def show_history_page():
     col1, col2 = st.columns(2)
 
     with col1:
-        st.subheader("📈 Executions Over Time")
+        st.subheader("Executions Over Time")
 
-        if 'executed_at' in df.columns:
+        if 'executed_at' in df.columns and not df['executed_at'].isna().all():
             # Group by date
             daily_counts = df.groupby(df['executed_at'].dt.date).size().reset_index()
             daily_counts.columns = ['Date', 'Count']
@@ -127,38 +122,43 @@ def show_history_page():
             )
 
             st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No date information available for timeline chart")
 
     with col2:
-        st.subheader("📊 Executions by Status")
+        st.subheader("Executions by Status")
 
-        status_counts = df['status'].value_counts()
+        if 'status' in df.columns:
+            status_counts = df['status'].value_counts()
 
-        colors = {
-            'COMPLETED': config.CHART_COLORS['success'],
-            'RUNNING': config.CHART_COLORS['info'],
-            'FAILED': config.CHART_COLORS['danger'],
-            'PENDING': config.CHART_COLORS['warning']
-        }
+            colors = {
+                'COMPLETED': config.CHART_COLORS['success'],
+                'RUNNING': config.CHART_COLORS['info'],
+                'FAILED': config.CHART_COLORS['danger'],
+                'PENDING': config.CHART_COLORS['warning']
+            }
 
-        fig = go.Figure(data=[
-            go.Pie(
-                labels=status_counts.index,
-                values=status_counts.values,
-                marker=dict(colors=[colors.get(status, config.CHART_COLORS['secondary']) for status in status_counts.index])
-            )
-        ])
+            fig = go.Figure(data=[
+                go.Pie(
+                    labels=status_counts.index,
+                    values=status_counts.values,
+                    marker=dict(colors=[colors.get(status, config.CHART_COLORS['secondary']) for status in status_counts.index])
+                )
+            ])
 
-        fig.update_layout(height=400)
-        st.plotly_chart(fig, use_container_width=True)
+            fig.update_layout(height=400)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No status information available")
 
     # Strategy analysis
     st.markdown("---")
     col1, col2 = st.columns(2)
 
     with col1:
-        st.subheader("🎯 Executions by Strategy")
+        st.subheader("Executions by Strategy")
 
-        if 'strategy' in df.columns:
+        if 'strategy' in df.columns and not df['strategy'].isna().all():
             strategy_counts = df['strategy'].value_counts()
 
             fig = go.Figure(data=[
@@ -176,13 +176,15 @@ def show_history_page():
             )
 
             st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No strategy information available")
 
     with col2:
-        st.subheader("💾 Savings Distribution")
+        st.subheader("Savings Distribution")
 
-        if 'savings_pct' in df.columns:
+        if 'savings_pct' in df.columns and not df['savings_pct'].isna().all():
             fig = px.histogram(
-                df,
+                df.dropna(subset=['savings_pct']),
                 x='savings_pct',
                 nbins=20,
                 color_discrete_sequence=[config.CHART_COLORS['success']]
@@ -195,54 +197,64 @@ def show_history_page():
             )
 
             st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No savings information available")
 
     # Top tables by savings
     st.markdown("---")
-    st.subheader("🏆 Top Tables by Savings")
+    st.subheader("Top Tables by Savings")
 
-    if 'savings_pct' in df.columns:
-        top_tables = df.nlargest(10, 'savings_pct')
+    if 'savings_pct' in df.columns and 'table_name' in df.columns and not df['savings_pct'].isna().all():
+        top_tables = df.dropna(subset=['savings_pct']).nlargest(10, 'savings_pct')
 
-        fig = go.Figure()
+        if not top_tables.empty:
+            fig = go.Figure()
 
-        fig.add_trace(go.Bar(
-            x=top_tables['table_name'],
-            y=top_tables['savings_pct'],
-            marker_color=config.CHART_COLORS['success'],
-            text=top_tables['savings_pct'].round(1),
-            textposition='auto',
-            hovertemplate='<b>%{x}</b><br>Savings: %{y:.1f}%<extra></extra>'
-        ))
+            fig.add_trace(go.Bar(
+                x=top_tables['table_name'],
+                y=top_tables['savings_pct'],
+                marker_color=config.CHART_COLORS['success'],
+                text=top_tables['savings_pct'].round(1),
+                textposition='auto',
+                hovertemplate='<b>%{x}</b><br>Savings: %{y:.1f}%<extra></extra>'
+            ))
 
-        fig.update_layout(
-            xaxis_title="Table Name",
-            yaxis_title="Savings (%)",
-            height=400,
-            showlegend=False
-        )
+            fig.update_layout(
+                xaxis_title="Table Name",
+                yaxis_title="Savings (%)",
+                height=400,
+                showlegend=False
+            )
 
-        st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No savings data available for top tables chart")
 
     # Detailed history table
     st.markdown("---")
-    st.subheader("📋 Execution History Details")
+    st.subheader("Execution History Details")
 
-    # Prepare display DataFrame
-    display_columns = [
-        'execution_id', 'table_owner', 'table_name', 'strategy',
-        'status', 'savings_pct', 'dry_run', 'executed_at'
-    ]
+    # Prepare display DataFrame - use available columns
+    available_columns = df.columns.tolist()
+    display_column_mapping = {
+        'execution_id': 'ID',
+        'table_owner': 'Owner',
+        'table_name': 'Table',
+        'strategy': 'Strategy',
+        'status': 'Status',
+        'savings_pct': 'Savings %',
+        'dry_run': 'Dry Run',
+        'executed_at': 'Executed At'
+    }
 
+    # Filter to available columns
+    display_columns = [c for c in display_column_mapping.keys() if c in available_columns]
     display_df = df[display_columns].copy()
-
-    display_df.columns = [
-        'ID', 'Owner', 'Table', 'Strategy',
-        'Status', 'Savings %', 'Dry Run', 'Executed At'
-    ]
+    display_df.columns = [display_column_mapping[c] for c in display_columns]
 
     # Format dates
     if 'Executed At' in display_df.columns:
-        display_df['Executed At'] = display_df['Executed At'].dt.strftime('%Y-%m-%d %H:%M:%S')
+        display_df['Executed At'] = pd.to_datetime(display_df['Executed At']).dt.strftime('%Y-%m-%d %H:%M:%S')
 
     # Format numbers
     if 'Savings %' in display_df.columns:
