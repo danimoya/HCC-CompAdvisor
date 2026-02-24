@@ -1525,6 +1525,7 @@ class CentralQueries:
                 port,
                 service_name,
                 username,
+                password_encrypted,
                 description,
                 environment,
                 platform_type,
