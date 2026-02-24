@@ -38,7 +38,7 @@ log_error() {
 }
 
 # Configuration
-ORACLE_HOME=${ORACLE_HOME:-/opt/oracle/product/23c/dbhomeFree}
+ORACLE_HOME=${ORACLE_HOME:-/opt/oracle/product/26ai/dbhomeFree}
 ORACLE_SID=${ORACLE_SID:-FREE}
 ORACLE_PWD=${ORACLE_PWD:-Welcome123}
 COMPRESSION_USER=${COMPRESSION_USER:-COMPRESSION_MGR}

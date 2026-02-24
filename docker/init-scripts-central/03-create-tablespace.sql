@@ -95,15 +95,9 @@ PROMPT ========================================
 PROMPT Tablespace Creation Complete
 PROMPT ========================================
 
--- Additional datafile for growth capacity
-ALTER TABLESPACE SCRATCH_TS ADD DATAFILE
-    '/opt/oracle/oradata/FREE/FREEPDB1/scratch02.dbf'
-    SIZE 256M
-    AUTOEXTEND ON
-    NEXT 64M
-    MAXSIZE 2G;
-
-PROMPT Additional datafile added to SCRATCH_TS
+-- Note: Oracle Free Edition creates bigfile tablespaces by default.
+-- ADD DATAFILE is not supported on bigfile tablespaces - the single
+-- datafile auto-extends up to MAXSIZE (5G) which is sufficient.
 
 -- Create directory for external tables and export operations
 CREATE OR REPLACE DIRECTORY COMPRESSION_DIR AS '/opt/oracle/compression_advisor';

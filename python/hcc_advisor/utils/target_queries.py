@@ -8,8 +8,8 @@ table introspection, and session monitoring on target instances.
 import pandas as pd
 import streamlit as st
 from typing import Optional, Dict, Any, List
-from utils.target_connector import TargetConnector
-from utils.logger import log_error, log_info, log_debug, log_warning
+from hcc_advisor.utils.target_connector import TargetConnector
+from hcc_advisor.utils.logger import log_error, log_info, log_debug, log_warning
 
 
 class TargetQueries:

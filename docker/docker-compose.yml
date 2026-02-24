@@ -1,5 +1,3 @@
-version: '3.8'
-
 # =============================================================================
 # HCC Compression Advisor - Centralized Server Deployment
 # =============================================================================
@@ -54,11 +52,11 @@ services:
       # Persistent database files
       - central-data:/opt/oracle/oradata
 
-      # Central DB initialization scripts
-      - ./init-scripts-central:/opt/oracle/scripts/startup
+      # Central DB initialization scripts (setup = runs once on first creation)
+      - ./init-scripts-central:/opt/oracle/scripts/setup
 
       # Central schema SQL files
-      - ../sql/central:/opt/oracle/compression_advisor/central:ro
+      - ../sql/central:/opt/oracle/compression_advisor/sql/central:ro
 
       # Diagnostic logs
       - ./logs:/opt/oracle/oradata/logs
@@ -151,10 +149,6 @@ services:
 volumes:
   central-data:
     driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: ./data
 
   streamlit-logs:
     driver: local

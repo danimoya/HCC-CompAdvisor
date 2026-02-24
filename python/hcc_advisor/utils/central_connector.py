@@ -9,8 +9,8 @@ import pandas as pd
 from typing import Optional, Dict, Any, List
 from contextlib import contextmanager
 import streamlit as st
-from config import config
-from utils.logger import log_db_error, log_info, log_debug, log_error
+from hcc_advisor.config import config
+from hcc_advisor.utils.logger import log_db_error, log_info, log_debug, log_error
 
 
 class CentralConnector:

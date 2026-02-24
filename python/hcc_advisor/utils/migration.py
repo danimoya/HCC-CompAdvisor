@@ -17,9 +17,7 @@ import oracledb
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from config import config
+from hcc_advisor.config import config
 from cryptography.fernet import Fernet
 
 BATCH_SIZE = 500

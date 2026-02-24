@@ -884,6 +884,7 @@ SELECT
 FROM user_objects
 WHERE object_name LIKE 'T_%COMPRESS%'
    OR object_name LIKE 'T_TARGET%'
+   OR object_name LIKE 'T_SCHEMA_METADATA'
    OR object_name LIKE 'SEQ_%'
    OR object_name LIKE 'IDX_%COMP%'
    OR object_name LIKE 'IDX_%TARGET%'
@@ -893,9 +894,29 @@ WHERE object_name LIKE 'T_%COMPRESS%'
 GROUP BY object_type
 ORDER BY object_type;
 
+-- ============================================================================
+-- T_SCHEMA_METADATA - Schema version and deployment tracking
+-- ============================================================================
+
+PROMPT Creating T_SCHEMA_METADATA...
+
+CREATE TABLE T_SCHEMA_METADATA (
+    KEY         VARCHAR2(100) PRIMARY KEY,
+    VALUE       VARCHAR2(500) NOT NULL,
+    UPDATED_AT  TIMESTAMP DEFAULT SYSTIMESTAMP
+);
+
+INSERT INTO T_SCHEMA_METADATA (KEY, VALUE) VALUES ('schema_version', '2.0.0');
+INSERT INTO T_SCHEMA_METADATA (KEY, VALUE) VALUES ('installed_at', TO_CHAR(SYSTIMESTAMP, 'YYYY-MM-DD HH24:MI:SS'));
+COMMIT;
+
+PROMPT T_SCHEMA_METADATA created and seeded.
+
 PROMPT
 PROMPT Table row counts:
-SELECT 'T_TARGET_DATABASES' AS table_name, COUNT(*) AS row_count FROM T_TARGET_DATABASES
+SELECT 'T_SCHEMA_METADATA' AS table_name, COUNT(*) AS row_count FROM T_SCHEMA_METADATA
+UNION ALL
+SELECT 'T_TARGET_DATABASES', COUNT(*) FROM T_TARGET_DATABASES
 UNION ALL
 SELECT 'T_COMPRESSION_STRATEGIES', COUNT(*) FROM T_COMPRESSION_STRATEGIES
 UNION ALL

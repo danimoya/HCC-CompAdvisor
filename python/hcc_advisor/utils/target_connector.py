@@ -9,8 +9,8 @@ import pandas as pd
 from typing import Optional, Dict, Any, List
 from contextlib import contextmanager
 import streamlit as st
-from config import config
-from utils.logger import log_db_error, log_info, log_debug, log_error
+from hcc_advisor.config import config
+from hcc_advisor.utils.logger import log_db_error, log_info, log_debug, log_error
 
 
 class TargetConnector:
@@ -69,7 +69,7 @@ class TargetConnector:
             oracledb.Connection: Database connection to the target
         """
         if conn_config is None:
-            from utils.central_queries import CentralQueries
+            from hcc_advisor.utils.central_queries import CentralQueries
             db_info = CentralQueries.get_target_database(database_id)
             if not db_info:
                 raise ValueError(f"Target database {database_id} not found in central registry")

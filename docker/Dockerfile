@@ -7,12 +7,8 @@ LABEL maintainer="HCC Compression Advisor Team"
 LABEL description="Oracle 23c Free with HCC Compression Advisor pre-configured"
 LABEL version="1.0.0"
 
-# Environment variables
-ENV ORACLE_BASE=/opt/oracle \
-    ORACLE_HOME=/opt/oracle/product/23c/dbhomeFree \
-    ORACLE_SID=FREE \
-    PATH=$ORACLE_HOME/bin:$PATH \
-    COMPRESSION_USER=COMPRESSION_MGR \
+# Environment variables (ORACLE_BASE, ORACLE_HOME, ORACLE_SID, PATH inherited from base image)
+ENV COMPRESSION_USER=COMPRESSION_MGR \
     COMPRESSION_TS=SCRATCH_TS \
     INSTALL_DIR=/opt/oracle/scripts/setup
 
@@ -52,7 +48,7 @@ EXPOSE 1521 5500 8080
 
 # Health check to verify database is running
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=5 \
-    CMD ${ORACLE_HOME}/bin/sqlplus -s sys/${ORACLE_PWD}@localhost:1521/FREE as sysdba <<< "SELECT 'healthy' FROM dual;" || exit 1
+    CMD /opt/oracle/checkDBStatus.sh || exit 1
 
 # Default command - runs Oracle Database startup
 CMD ["/bin/bash", "-c", "exec $ORACLE_BASE/$RUN_FILE"]

@@ -7,9 +7,9 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime
-from utils.central_queries import CentralQueries
-from utils.target_queries import TargetQueries
-from config import config
+from hcc_advisor.utils.central_queries import CentralQueries
+from hcc_advisor.utils.target_queries import TargetQueries
+from hcc_advisor.config import config
 
 
 def show_analysis_page():

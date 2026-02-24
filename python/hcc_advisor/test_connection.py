@@ -7,12 +7,9 @@ Tests database and ORDS API connectivity
 import sys
 from pathlib import Path
 
-# Add parent directory to path
-sys.path.insert(0, str(Path(__file__).parent))
-
-from config import config
-from utils.central_connector import CentralConnector
-from utils.api_client import ORDSClient
+from hcc_advisor.config import config
+from hcc_advisor.utils.central_connector import CentralConnector
+from hcc_advisor.utils.api_client import ORDSClient
 
 
 def test_database_connection():

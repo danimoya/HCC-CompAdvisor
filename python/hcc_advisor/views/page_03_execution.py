@@ -6,9 +6,9 @@ Execute compression recommendations
 import streamlit as st
 import pandas as pd
 import time
-from utils.central_queries import CentralQueries
-from utils.target_queries import TargetQueries
-from config import config
+from hcc_advisor.utils.central_queries import CentralQueries
+from hcc_advisor.utils.target_queries import TargetQueries
+from hcc_advisor.config import config
 
 
 def show_execution_page():

@@ -4,12 +4,29 @@ Oracle Hybrid Columnar Compression Analysis and Management Dashboard
 """
 
 import streamlit as st
+
+from hcc_advisor.config import config, Config
+from hcc_advisor import __version__
+
+# --- Pre-login deployment check (before set_page_config) ---
+_needs_setup = config.is_first_run()
+_needs_upgrade = False
+if not _needs_setup and config.CENTRAL_DB_PASSWORD:
+    if not st.session_state.get('setup_complete'):
+        _schema_ver = config.get_schema_version()
+        _needs_upgrade = (_schema_ver is None) or (_schema_ver != __version__)
+
+if (_needs_setup or _needs_upgrade) and not st.session_state.get('setup_complete'):
+    from hcc_advisor.views.page_00_setup import show_deployment_page
+    show_deployment_page(mode='setup' if _needs_setup else 'upgrade')
+    # show_deployment_page calls st.stop()
+
+# --- Normal dashboard ---
 from streamlit_option_menu import option_menu
-from auth import AuthManager, render_logout_button
-from config import config
-from utils.central_connector import CentralConnector
-from utils.central_queries import CentralQueries
-from utils.logger import get_recent_logs, get_error_logs
+from hcc_advisor.auth import AuthManager, render_logout_button
+from hcc_advisor.utils.central_connector import CentralConnector
+from hcc_advisor.utils.central_queries import CentralQueries
+from hcc_advisor.utils.logger import get_recent_logs, get_error_logs
 
 # Page configuration
 st.set_page_config(
@@ -303,25 +320,25 @@ def main():
     if selected == "Overview":
         show_dashboard()
     elif selected == "Run Analysis":
-        from views.page_01_analysis import show_analysis_page
+        from hcc_advisor.views.page_01_analysis import show_analysis_page
         show_analysis_page()
     elif selected == "View Recommendations":
-        from views.page_02_recommendations import show_recommendations_page
+        from hcc_advisor.views.page_02_recommendations import show_recommendations_page
         show_recommendations_page()
     elif selected == "Compress Tables":
-        from views.page_03_execution import show_execution_page
+        from hcc_advisor.views.page_03_execution import show_execution_page
         show_execution_page()
     elif selected == "Execution History":
-        from views.page_04_history import show_history_page
+        from hcc_advisor.views.page_04_history import show_history_page
         show_history_page()
     elif selected == "Session Browser":
-        from views.page_07_sessions import show_sessions_page
+        from hcc_advisor.views.page_07_sessions import show_sessions_page
         show_sessions_page()
     elif selected == "Compression Rules":
-        from views.page_05_strategies import show_strategies_page
+        from hcc_advisor.views.page_05_strategies import show_strategies_page
         show_strategies_page()
     elif selected == "DB Connections":
-        from views.page_06_connections import show_connections_page
+        from hcc_advisor.views.page_06_connections import show_connections_page
         show_connections_page()
 
 

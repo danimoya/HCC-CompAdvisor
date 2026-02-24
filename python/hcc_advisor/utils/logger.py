@@ -8,8 +8,22 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+
+def _get_log_dir() -> Path:
+    """Determine log directory: env var > /app/logs (Docker) > ~/.local/share/hcc-advisor/logs."""
+    env = os.getenv('HCC_ADVISOR_LOG_DIR')
+    if env:
+        return Path(env)
+
+    docker_path = Path("/app/logs")
+    if docker_path.exists() and os.access(str(docker_path), os.W_OK):
+        return docker_path
+
+    return Path.home() / '.local' / 'share' / 'hcc-advisor' / 'logs'
+
+
 # Create logs directory if it doesn't exist
-LOG_DIR = Path("/app/logs")
+LOG_DIR = _get_log_dir()
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # Log file path with date

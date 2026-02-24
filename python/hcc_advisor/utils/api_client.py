@@ -7,7 +7,7 @@ import requests
 import streamlit as st
 from typing import Dict, Any, Optional, List
 from requests.auth import HTTPBasicAuth
-from config import config
+from hcc_advisor.config import config
 import urllib3
 
 # Disable SSL warnings for self-signed certificates

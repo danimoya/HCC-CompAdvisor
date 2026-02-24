@@ -7,7 +7,7 @@ import streamlit as st
 from datetime import datetime, timedelta
 from typing import Optional
 import hashlib
-from config import config
+from hcc_advisor.config import config
 
 
 class AuthManager:

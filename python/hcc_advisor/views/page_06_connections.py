@@ -7,10 +7,10 @@ import streamlit as st
 import oracledb
 from typing import Dict, Optional, Tuple
 from datetime import datetime
-from utils.central_queries import CentralQueries
-from utils.target_connector import TargetConnector
-from utils.logger import log_error, log_info
-from config import config
+from hcc_advisor.utils.central_queries import CentralQueries
+from hcc_advisor.utils.target_connector import TargetConnector
+from hcc_advisor.utils.logger import log_error, log_info
+from hcc_advisor.config import config
 
 # Try to import cryptography for password encryption
 try:
