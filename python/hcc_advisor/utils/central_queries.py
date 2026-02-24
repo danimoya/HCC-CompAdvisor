@@ -1568,11 +1568,18 @@ class CentralQueries:
             df = CentralConnector.execute_query(query, {'database_id': database_id})
             if not df.empty:
                 row = {k.lower(): v for k, v in df.iloc[0].to_dict().items()}
-                # Map db_host -> host for connector compatibility
+                # Map column names for connector compatibility
                 if 'db_host' in row:
                     row['host'] = row['db_host']
                 if 'service_name' in row:
                     row['service'] = row['service_name']
+                # Decrypt password for target connector
+                if 'password_encrypted' in row and row['password_encrypted']:
+                    try:
+                        from hcc_advisor.views.page_06_connections import decrypt_password
+                        row['password'] = decrypt_password(row['password_encrypted'])
+                    except Exception:
+                        row['password'] = row['password_encrypted']
                 return row
         except Exception as e:
             log_error(e, "get_target_database", {'database_id': database_id})
