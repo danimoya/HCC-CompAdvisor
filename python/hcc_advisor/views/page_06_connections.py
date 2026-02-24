@@ -186,7 +186,7 @@ def show_connections_page():
                 password = st.text_input("Password *", type="password")
 
             with col2:
-                environment = st.selectbox("Environment", options=['PROD', 'DEV', 'TEST', 'UAT'])
+                environment = st.selectbox("Environment", options=['PRODUCTION', 'DEV', 'TEST', 'UAT', 'STAGING'])
                 platform_type = st.selectbox("Platform", options=['STANDARD', 'EXADATA'])
                 port = st.number_input("Port *", min_value=1, max_value=65535, value=1521)
                 username = st.text_input("Username *", placeholder="e.g., COMPRESSION_MGR")
