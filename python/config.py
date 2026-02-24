@@ -51,10 +51,29 @@ class Config:
     LAYOUT: str = "wide"
     INITIAL_SIDEBAR_STATE: str = "expanded"
 
-    # Database Connection Pool
+    # Central Database Configuration (stores analysis results from all targets)
+    # Falls back to DB_* vars for backward compatibility with single-DB deployments
+    CENTRAL_DB_HOST: str = os.getenv('CENTRAL_DB_HOST', os.getenv('DB_HOST', 'localhost'))
+    CENTRAL_DB_PORT: int = int(os.getenv('CENTRAL_DB_PORT', os.getenv('DB_PORT', '1521')))
+    CENTRAL_DB_SERVICE: str = os.getenv('CENTRAL_DB_SERVICE', os.getenv('DB_SERVICE', 'FREEPDB1'))
+    CENTRAL_DB_USER: str = os.getenv('CENTRAL_DB_USER', os.getenv('DB_USER', 'COMPRESSION_MGR'))
+    CENTRAL_DB_PASSWORD: str = os.getenv('CENTRAL_DB_PASSWORD', os.getenv('DB_PASSWORD', ''))
+
+    # Encryption key for target database password storage
+    ENCRYPTION_KEY: str = os.getenv('ENCRYPTION_KEY', '')
+
+    # Database Connection Pool (legacy, for backward compatibility)
     POOL_MIN: int = 2
     POOL_MAX: int = 10
     POOL_INCREMENT: int = 1
+
+    # Central Database Connection Pool
+    CENTRAL_POOL_MIN: int = 2
+    CENTRAL_POOL_MAX: int = 10
+
+    # Target Database Connection Pool (per-target defaults)
+    TARGET_POOL_MIN: int = 1
+    TARGET_POOL_MAX: int = 5
 
     # API Timeout
     API_TIMEOUT: int = 30  # seconds
@@ -83,8 +102,13 @@ class Config:
 
     @classmethod
     def get_db_connection_string(cls) -> str:
-        """Generate Oracle database connection string"""
+        """Generate Oracle database connection string (legacy)"""
         return f"{cls.DB_USER}/{cls.DB_PASSWORD}@{cls.DB_HOST}:{cls.DB_PORT}/{cls.DB_SERVICE}"
+
+    @classmethod
+    def get_central_db_dsn(cls) -> str:
+        """Generate central database DSN string"""
+        return f"{cls.CENTRAL_DB_HOST}:{cls.CENTRAL_DB_PORT}/{cls.CENTRAL_DB_SERVICE}"
 
     @classmethod
     def get_ssl_context(cls) -> Optional[tuple]:
@@ -102,11 +126,8 @@ class Config:
         """Validate configuration and return list of errors"""
         errors = []
 
-        if not cls.DB_PASSWORD:
-            errors.append("DB_PASSWORD not set")
-
-        if not cls.ORDS_PASSWORD:
-            errors.append("ORDS_PASSWORD not set")
+        if not cls.CENTRAL_DB_PASSWORD:
+            errors.append("CENTRAL_DB_PASSWORD (or DB_PASSWORD) not set")
 
         if cls.SSL_ENABLED:
             cert_path = Path(__file__).parent / cls.SSL_CERT_FILE

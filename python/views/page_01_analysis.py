@@ -7,7 +7,8 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime
-from utils.db_queries import CompressionQueries
+from utils.central_queries import CentralQueries
+from utils.target_queries import TargetQueries
 from config import config
 
 
@@ -32,13 +33,17 @@ def show_analysis_config():
     """Show analysis configuration and results"""
 
     # Analysis configuration
+    db_id = st.session_state.get('active_database_id')
+    if not db_id:
+        st.warning("Select a target database from the sidebar to run analysis.")
+        schemas = []
+    else:
+        schemas = TargetQueries.get_available_schemas(db_id)
+
     col1, col2 = st.columns([2, 1])
 
     with col1:
         st.subheader("Start New Analysis")
-
-        # Get available schemas for selector
-        schemas = CompressionQueries.get_available_schemas()
 
         with st.form("analysis_form"):
             # Schema selector
@@ -87,20 +92,33 @@ def show_analysis_config():
                 )
 
             if submit_button:
-                owner = None if selected_schema == "All Schemas" else selected_schema
-                with st.spinner("Running analysis (this may take a while)..."):
-                    result = CompressionQueries.start_analysis(
-                        owner=owner,
-                        strategy_id=selected_strategy,
-                        parallel_degree=parallel_degree
-                    )
+                if not db_id:
+                    st.error("Select a target database from the sidebar first.")
+                else:
+                    owner = None if selected_schema == "All Schemas" else selected_schema
+                    with st.spinner("Running analysis (this may take a while)..."):
+                        result = TargetQueries.start_analysis(
+                            db_id,
+                            owner=owner,
+                            strategy_id=selected_strategy,
+                            parallel_degree=parallel_degree
+                        )
 
-                    if result.get('success'):
-                        st.success(f"Analysis completed! Run ID: {result.get('run_id')}")
-                        st.session_state.current_analysis_id = result.get('run_id')
-                    else:
-                        st.warning(result.get('message', 'Analysis procedure not available'))
-                        st.info("Note: The analysis procedure may not be installed. Check the database packages.")
+                        if result.get('success'):
+                            run_id = result.get('run_id')
+                            st.success(f"Analysis completed! Run ID: {run_id}")
+                            # Pull results from target and store in central
+                            if run_id:
+                                run_data = TargetQueries.pull_advisor_run(db_id, run_id)
+                                if run_data:
+                                    CentralQueries.store_advisor_run(db_id, run_data)
+                                results_df = TargetQueries.pull_analysis_results(db_id, run_id)
+                                if not results_df.empty:
+                                    CentralQueries.store_analysis_results(db_id, run_id, results_df)
+                            st.session_state.current_analysis_id = run_id
+                        else:
+                            st.warning(result.get('message', 'Analysis procedure not available'))
+                            st.info("Note: The analysis procedure may not be installed. Check the database packages.")
 
     with col2:
         st.subheader("Analysis Parameters")
@@ -116,7 +134,7 @@ def show_analysis_config():
     # Latest analysis results
     st.subheader("Latest Analysis Results")
 
-    analysis_data = CompressionQueries.get_latest_analysis()
+    analysis_data = CentralQueries.get_latest_analysis(database_id=db_id)
 
     if not analysis_data:
         st.warning("No analysis results available. Start a new analysis above.")
@@ -210,7 +228,7 @@ def show_analysis_config():
     st.markdown("---")
     st.subheader("Top Compression Candidates")
 
-    recommendations_df = CompressionQueries.get_recommendations(limit=10, min_savings_pct=10.0)
+    recommendations_df = CentralQueries.get_recommendations(limit=10, min_savings_pct=10.0, database_id=db_id)
 
     if not recommendations_df.empty:
         # Normalize column names to lowercase
@@ -257,6 +275,8 @@ def show_analysis_monitor():
 
     st.subheader("Analysis Progress Monitor")
 
+    db_id = st.session_state.get('active_database_id')
+
     # Auto-refresh controls
     col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
@@ -276,7 +296,7 @@ def show_analysis_monitor():
     st.markdown("---")
 
     # Check for running analysis
-    running_ops = CompressionQueries.get_running_operations()
+    running_ops = CentralQueries.get_running_operations(database_id=db_id)
 
     if not running_ops.empty:
         running_ops.columns = [c.lower() for c in running_ops.columns]
@@ -309,7 +329,7 @@ def show_analysis_monitor():
                         st.progress(0, text="Analyzing tables...")
 
                     # Get detailed progress
-                    details = CompressionQueries.get_operation_progress('ANALYSIS', int(run_id))
+                    details = CentralQueries.get_operation_progress('ANALYSIS', int(run_id))
                     if details:
                         col1, col2, col3 = st.columns(3)
                         with col1:
@@ -334,7 +354,7 @@ def show_analysis_monitor():
     # Recent Analysis Runs
     st.markdown("### 📋 Recent Analysis Runs")
 
-    analysis_runs = CompressionQueries.get_analysis_runs(limit=10)
+    analysis_runs = CentralQueries.get_analysis_runs(limit=10, database_id=db_id)
 
     if not analysis_runs.empty:
         analysis_runs.columns = [c.lower() for c in analysis_runs.columns]

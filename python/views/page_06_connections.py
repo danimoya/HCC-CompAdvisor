@@ -1,62 +1,48 @@
 """
-Connection Manager Page - Manage database connections for HCC Compression Advisor
+Target Database Manager - HCC Compression Advisor
+Register and manage target Oracle databases for analysis
 """
 
 import streamlit as st
-import json
-import os
-from pathlib import Path
-from typing import Dict, List, Optional
-from datetime import datetime
 import oracledb
+from typing import Dict, Optional, Tuple
+from datetime import datetime
+from utils.central_queries import CentralQueries
+from utils.target_connector import TargetConnector
+from utils.logger import log_error, log_info
+from config import config
 
-# Connections storage file
-CONNECTIONS_FILE = Path(__file__).parent.parent / "data" / "connections.json"
+# Try to import cryptography for password encryption
+try:
+    from cryptography.fernet import Fernet
+    HAS_CRYPTO = True
+except ImportError:
+    HAS_CRYPTO = False
 
 
-def load_connections() -> Dict:
-    """Load saved connections from file"""
-    if CONNECTIONS_FILE.exists():
+def encrypt_password(password: str) -> str:
+    """Encrypt password for storage"""
+    key = config.ENCRYPTION_KEY
+    if key and HAS_CRYPTO:
+        f = Fernet(key.encode() if isinstance(key, str) else key)
+        return f.encrypt(password.encode()).decode()
+    return password  # Store plain if no encryption key
+
+
+def decrypt_password(encrypted: str) -> str:
+    """Decrypt stored password"""
+    key = config.ENCRYPTION_KEY
+    if key and HAS_CRYPTO:
         try:
-            with open(CONNECTIONS_FILE, 'r') as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError):
-            pass
-
-    # Return default structure with test connection pre-populated
-    return {
-        "connections": {
-            "Oracle Free 23c (Test)": {
-                "host": "hcc-oracle-23c",
-                "port": 1521,
-                "service": "FREEPDB1",
-                "username": "COMPRESSION_MGR",
-                "password": "Compress123",
-                "description": "Test Oracle Free 23c container for HCC testing",
-                "tested_ok": False,
-                "last_tested": None
-            }
-        },
-        "active_connection": "Oracle Free 23c (Test)"
-    }
+            f = Fernet(key.encode() if isinstance(key, str) else key)
+            return f.decrypt(encrypted.encode()).decode()
+        except Exception:
+            return encrypted  # Return as-is if decryption fails
+    return encrypted
 
 
-def save_connections(data: Dict) -> bool:
-    """Save connections to file"""
-    try:
-        # Ensure data directory exists
-        CONNECTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-        with open(CONNECTIONS_FILE, 'w') as f:
-            json.dump(data, f, indent=2)
-        return True
-    except IOError as e:
-        st.error(f"Failed to save connections: {e}")
-        return False
-
-
-def test_connection(conn_details: Dict) -> tuple:
-    """Test a database connection and return (success, message, version)"""
+def test_target_connection(conn_details: Dict) -> Tuple[bool, str, Optional[str]]:
+    """Test a target database connection directly"""
     try:
         dsn = f"{conn_details['host']}:{conn_details['port']}/{conn_details['service']}"
         connection = oracledb.connect(
@@ -64,350 +50,204 @@ def test_connection(conn_details: Dict) -> tuple:
             password=conn_details['password'],
             dsn=dsn
         )
-
-        # Test with simple query
         cursor = connection.cursor()
         cursor.execute("SELECT 1 FROM DUAL")
         cursor.fetchone()
         cursor.close()
 
-        # Get database version
         cursor = connection.cursor()
         cursor.execute("SELECT banner FROM v$version WHERE ROWNUM = 1")
         version = cursor.fetchone()[0]
         cursor.close()
-
         connection.close()
-        return True, f"Connected successfully!", version
+        return True, "Connected successfully!", version
     except oracledb.Error as e:
         return False, f"Connection failed: {str(e)}", None
 
 
-def get_active_connection() -> Optional[Dict]:
-    """Get the currently active connection details"""
-    data = load_connections()
-    active_name = data.get("active_connection")
-    if active_name and active_name in data.get("connections", {}):
-        conn = data["connections"][active_name].copy()
-        conn["name"] = active_name
-        return conn
-    return None
-
-
-def get_tested_connections(data: Dict) -> List[str]:
-    """Get list of connection names that have been tested OK"""
-    tested = []
-    for name, details in data.get("connections", {}).items():
-        if details.get("tested_ok", False):
-            tested.append(name)
-    return tested
-
-
 def show_connections_page():
-    """Display the connection manager page"""
+    """Display the target database manager page"""
 
-    st.markdown("## :link: Connection Manager")
-    st.markdown("Manage database connections for the HCC Compression Advisor")
+    st.markdown("## Target Database Manager")
+    st.markdown("Register and manage Oracle databases for compression analysis")
 
-    # Load current connections
-    data = load_connections()
-    connections = data.get("connections", {})
-    active_connection = data.get("active_connection")
+    # Load target databases from central DB
+    targets_df = CentralQueries.get_target_databases()
 
-    # =========================================================================
-    # ACTIVE CONNECTION BANNER (TOP)
-    # =========================================================================
-    active_conn = get_active_connection()
-
-    if active_conn:
-        # Status indicator
-        is_tested = active_conn.get("tested_ok", False)
-        status_color = "green" if is_tested else "orange"
-        status_text = "Tested OK" if is_tested else "Not Tested"
-
-        st.markdown(f"""
-        <div style="background: linear-gradient(90deg, #1a1a2e 0%, #16213e 100%);
-                    padding: 15px 20px; border-radius: 10px; margin-bottom: 20px;
-                    border-left: 4px solid {status_color};">
-            <div style="display: flex; justify-content: space-between; align-items: center;">
-                <div>
-                    <span style="color: #888; font-size: 12px;">ACTIVE CONNECTION</span>
-                    <h3 style="margin: 5px 0; color: white;">{active_conn.get('name', 'N/A')}</h3>
-                    <code style="color: #4fc3f7;">{active_conn.get('username')}@{active_conn.get('host')}:{active_conn.get('port')}/{active_conn.get('service')}</code>
-                </div>
-                <div style="text-align: right;">
-                    <span style="background: {status_color}; color: white; padding: 4px 12px;
-                                 border-radius: 12px; font-size: 12px;">{status_text}</span>
-                </div>
+    # Active database banner
+    active_db_id = st.session_state.get('active_database_id')
+    if active_db_id and not targets_df.empty:
+        targets_df.columns = [c.lower() for c in targets_df.columns]
+        active_row = targets_df[targets_df['database_id'] == active_db_id]
+        if not active_row.empty:
+            active = active_row.iloc[0]
+            st.markdown(f"""
+            <div style="background: linear-gradient(90deg, #1a1a2e 0%, #16213e 100%);
+                        padding: 15px 20px; border-radius: 10px; margin-bottom: 20px;
+                        border-left: 4px solid green;">
+                <span style="color: #888; font-size: 12px;">ACTIVE TARGET DATABASE</span>
+                <h3 style="margin: 5px 0; color: white;">{active.get('display_name', 'N/A')}</h3>
+                <code style="color: #4fc3f7;">{active.get('username', '')}@{active.get('host', '')}:{active.get('port', '')}/{active.get('service_name', '')}</code>
             </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        # Quick Switch Section
-        tested_connections = get_tested_connections(data)
-        other_tested = [c for c in tested_connections if c != active_connection]
-
-        if other_tested:
-            col1, col2, col3 = st.columns([2, 2, 1])
-            with col1:
-                switch_to = st.selectbox(
-                    "Quick Switch",
-                    options=other_tested,
-                    key="quick_switch",
-                    label_visibility="collapsed",
-                    help="Switch to another tested connection"
-                )
-            with col2:
-                if st.button("Switch Connection", use_container_width=True, type="primary"):
-                    data["active_connection"] = switch_to
-                    if save_connections(data):
-                        st.success(f"Switched to '{switch_to}'")
-                        st.rerun()
-            with col3:
-                if st.button("Test Current", use_container_width=True):
-                    with st.spinner("Testing..."):
-                        success, message, version = test_connection(active_conn)
-                        if success:
-                            # Update tested status
-                            data["connections"][active_connection]["tested_ok"] = True
-                            data["connections"][active_connection]["last_tested"] = datetime.now().isoformat()
-                            save_connections(data)
-                            st.success(f"{message}\n{version}")
-                        else:
-                            data["connections"][active_connection]["tested_ok"] = False
-                            save_connections(data)
-                            st.error(message)
-        else:
-            col1, col2 = st.columns([3, 1])
-            with col2:
-                if st.button("Test Current Connection", use_container_width=True):
-                    with st.spinner("Testing..."):
-                        success, message, version = test_connection(active_conn)
-                        if success:
-                            data["connections"][active_connection]["tested_ok"] = True
-                            data["connections"][active_connection]["last_tested"] = datetime.now().isoformat()
-                            save_connections(data)
-                            st.success(f"{message}\n{version}")
-                        else:
-                            data["connections"][active_connection]["tested_ok"] = False
-                            save_connections(data)
-                            st.error(message)
-            with col1:
-                st.info("No other tested connections available. Test a connection to enable quick switch.")
-    else:
-        st.warning("No active connection set. Please select or add a connection below.")
+            """, unsafe_allow_html=True)
 
     st.markdown("---")
 
-    # =========================================================================
-    # TABS FOR MANAGEMENT
-    # =========================================================================
-    tab1, tab2, tab3 = st.tabs(["Saved Connections", "Add New Connection", "Quick Test"])
+    # Tabs
+    tab1, tab2, tab3 = st.tabs(["Registered Databases", "Add New Database", "Quick Test"])
 
-    # Tab 1: Saved Connections
+    # Tab 1: Registered databases
     with tab1:
-        st.markdown("### Saved Connections")
+        st.markdown("### Registered Target Databases")
 
-        if not connections:
-            st.info("No saved connections. Add a new connection to get started.")
+        if targets_df.empty:
+            st.info("No target databases registered. Add one in the 'Add New Database' tab.")
         else:
-            for conn_name, conn_details in connections.items():
-                is_active = conn_name == active_connection
-                is_tested = conn_details.get("tested_ok", False)
-                last_tested = conn_details.get("last_tested")
+            if 'database_id' not in targets_df.columns:
+                targets_df.columns = [c.lower() for c in targets_df.columns]
 
-                # Status badges
-                badges = []
-                if is_active:
-                    badges.append("Active")
-                if is_tested:
-                    badges.append("Tested OK")
+            for _, db in targets_df.iterrows():
+                db_id = db.get('database_id')
+                db_name = db.get('display_name', db.get('database_name', 'Unknown'))
+                is_active = db_id == active_db_id
+                env = db.get('environment', 'N/A')
 
-                badge_str = " | ".join(badges) if badges else "Not Tested"
-                icon = "✓" if is_tested else "○"
+                icon = "●" if is_active else "○"
+                badge = " (Active)" if is_active else ""
 
-                with st.expander(
-                    f"{icon} {conn_name} ({badge_str})",
-                    expanded=is_active
-                ):
+                with st.expander(f"{icon} {db_name}{badge} - {env}", expanded=is_active):
                     col1, col2 = st.columns([3, 1])
 
                     with col1:
                         st.markdown(f"""
                         | Property | Value |
                         |----------|-------|
-                        | **Host** | `{conn_details.get('host', 'N/A')}` |
-                        | **Port** | `{conn_details.get('port', 'N/A')}` |
-                        | **Service** | `{conn_details.get('service', 'N/A')}` |
-                        | **Username** | `{conn_details.get('username', 'N/A')}` |
-                        | **Password** | `{'*' * 8}` |
-                        | **Description** | {conn_details.get('description', 'N/A')} |
-                        | **Last Tested** | {last_tested[:16].replace('T', ' ') if last_tested else 'Never'} |
+                        | **Host** | `{db.get('host', 'N/A')}` |
+                        | **Port** | `{db.get('port', 'N/A')}` |
+                        | **Service** | `{db.get('service_name', 'N/A')}` |
+                        | **Username** | `{db.get('username', 'N/A')}` |
+                        | **Environment** | {env} |
+                        | **Platform** | {db.get('platform_type', 'STANDARD')} |
+                        | **Oracle Version** | {db.get('oracle_version', 'Unknown')} |
+                        | **Description** | {db.get('description', 'N/A')} |
+                        | **Last Connected** | {str(db.get('last_connected', 'Never'))[:19] if db.get('last_connected') else 'Never'} |
                         """)
 
                     with col2:
                         st.markdown("**Actions**")
 
-                        # Test connection button
-                        if st.button("Test", key=f"test_{conn_name}", use_container_width=True):
-                            with st.spinner("Testing connection..."):
-                                success, message, version = test_connection(conn_details)
+                        if st.button("Test", key=f"test_{db_id}", use_container_width=True):
+                            pwd = decrypt_password(db.get('password_encrypted', ''))
+                            conn = {
+                                'host': db.get('host'),
+                                'port': int(db.get('port', 1521)),
+                                'service': db.get('service_name'),
+                                'username': db.get('username'),
+                                'password': pwd
+                            }
+                            with st.spinner("Testing..."):
+                                success, msg, version = test_target_connection(conn)
                                 if success:
-                                    # Update tested status
-                                    data["connections"][conn_name]["tested_ok"] = True
-                                    data["connections"][conn_name]["last_tested"] = datetime.now().isoformat()
-                                    save_connections(data)
-                                    st.success(f"{message}\n{version}")
-                                    st.rerun()
+                                    CentralQueries.update_target_last_connected(db_id)
+                                    if version:
+                                        CentralQueries.update_target_metadata(db_id, version, db.get('platform_type', 'STANDARD'))
+                                    st.success(f"{msg}\n{version}")
                                 else:
-                                    data["connections"][conn_name]["tested_ok"] = False
-                                    save_connections(data)
-                                    st.error(message)
+                                    st.error(msg)
 
-                        # Set as active button
                         if not is_active:
-                            btn_type = "primary" if is_tested else "secondary"
-                            if st.button(
-                                "Set Active",
-                                key=f"activate_{conn_name}",
-                                use_container_width=True,
-                                type=btn_type,
-                                disabled=not is_tested,
-                                help="Test connection first" if not is_tested else None
-                            ):
-                                data["active_connection"] = conn_name
-                                if save_connections(data):
-                                    st.success(f"'{conn_name}' is now the active connection")
-                                    st.rerun()
-
-                        # Delete button (disabled if active)
-                        if st.button(
-                            "Delete",
-                            key=f"delete_{conn_name}",
-                            use_container_width=True,
-                            disabled=is_active,
-                            help="Cannot delete active connection" if is_active else None
-                        ):
-                            del data["connections"][conn_name]
-                            if save_connections(data):
-                                st.success(f"Deleted '{conn_name}'")
+                            if st.button("Set Active", key=f"activate_{db_id}", use_container_width=True, type="primary"):
+                                st.session_state.active_database_id = db_id
+                                st.success(f"'{db_name}' is now active")
                                 st.rerun()
 
-    # Tab 2: Add New Connection
+                        if st.button("Remove", key=f"delete_{db_id}", use_container_width=True, disabled=is_active):
+                            success, msg = CentralQueries.delete_target_database(db_id)
+                            if success:
+                                if active_db_id == db_id:
+                                    st.session_state.active_database_id = None
+                                st.success(msg)
+                                st.rerun()
+                            else:
+                                st.error(msg)
+
+    # Tab 2: Add new database
     with tab2:
-        st.markdown("### Add New Connection")
+        st.markdown("### Add New Target Database")
 
-        with st.form("new_connection_form"):
-            conn_name = st.text_input(
-                "Connection Name *",
-                placeholder="e.g., Production DB, Dev Oracle"
-            )
-
+        with st.form("new_target_form"):
             col1, col2 = st.columns(2)
 
             with col1:
-                host = st.text_input(
-                    "Host *",
-                    placeholder="hostname or IP address"
-                )
-                service = st.text_input(
-                    "Service Name *",
-                    placeholder="e.g., FREEPDB1, XEPDB1, ORCL"
-                )
-                password = st.text_input(
-                    "Password *",
-                    type="password"
-                )
+                db_name = st.text_input("Database Name *", placeholder="e.g., prod-oracle-01")
+                display_name = st.text_input("Display Name *", placeholder="e.g., Production DB")
+                host = st.text_input("Host *", placeholder="hostname or IP")
+                service = st.text_input("Service Name *", placeholder="e.g., FREEPDB1")
+                password = st.text_input("Password *", type="password")
 
             with col2:
-                port = st.number_input(
-                    "Port *",
-                    min_value=1,
-                    max_value=65535,
-                    value=1521
-                )
-                username = st.text_input(
-                    "Username *",
-                    placeholder="database username"
-                )
-                description = st.text_input(
-                    "Description",
-                    placeholder="Optional description"
-                )
+                environment = st.selectbox("Environment", options=['PROD', 'DEV', 'TEST', 'UAT'])
+                platform_type = st.selectbox("Platform", options=['STANDARD', 'EXADATA'])
+                port = st.number_input("Port *", min_value=1, max_value=65535, value=1521)
+                username = st.text_input("Username *", placeholder="e.g., COMPRESSION_MGR")
+                description = st.text_input("Description", placeholder="Optional description")
 
-            set_active = st.checkbox("Set as active connection", value=True)
-
-            submitted = st.form_submit_button("Add Connection", use_container_width=True)
+            set_active = st.checkbox("Set as active database", value=True)
+            submitted = st.form_submit_button("Add Database", use_container_width=True)
 
             if submitted:
-                # Validate required fields
-                if not all([conn_name, host, service, username, password]):
-                    st.error("Please fill in all required fields (marked with *)")
-                elif conn_name in connections:
-                    st.error(f"A connection named '{conn_name}' already exists")
+                if not all([db_name, display_name, host, service, username, password]):
+                    st.error("Please fill in all required fields")
                 else:
-                    # Test connection first
-                    new_conn = {
-                        "host": host,
-                        "port": port,
-                        "service": service,
-                        "username": username,
-                        "password": password,
-                        "description": description,
-                        "tested_ok": False,
-                        "last_tested": None
-                    }
-
+                    # Test first
+                    test_conn = {'host': host, 'port': port, 'service': service, 'username': username, 'password': password}
                     with st.spinner("Testing connection..."):
-                        success, message, version = test_connection(new_conn)
+                        success, msg, version = test_target_connection(test_conn)
 
                     if success:
-                        new_conn["tested_ok"] = True
-                        new_conn["last_tested"] = datetime.now().isoformat()
-                        data["connections"][conn_name] = new_conn
-                        if set_active:
-                            data["active_connection"] = conn_name
-
-                        if save_connections(data):
-                            st.success(f"Connection '{conn_name}' added successfully!\n{version}")
+                        db_data = {
+                            'database_name': db_name,
+                            'display_name': display_name,
+                            'host': host,
+                            'port': port,
+                            'service_name': service,
+                            'username': username,
+                            'password_encrypted': encrypt_password(password),
+                            'description': description,
+                            'environment': environment,
+                            'platform_type': platform_type,
+                            'oracle_version': version
+                        }
+                        ok, result_msg, new_id = CentralQueries.add_target_database(db_data)
+                        if ok:
+                            if set_active and new_id:
+                                st.session_state.active_database_id = new_id
+                            st.success(f"Database added! {version}")
                             st.rerun()
+                        else:
+                            st.error(f"Failed to save: {result_msg}")
                     else:
-                        st.error(f"Connection test failed: {message}")
-                        st.warning("Connection was not saved. Please verify the details.")
+                        st.error(f"Connection test failed: {msg}")
 
-    # Tab 3: Quick Test
+    # Tab 3: Quick test
     with tab3:
-        st.markdown("### Quick Test")
-        st.markdown("Test connection details without saving them.")
+        st.markdown("### Quick Connection Test")
+        st.markdown("Test connection details without saving.")
 
         col1, col2 = st.columns(2)
-
         with col1:
-            test_host = st.text_input("Host", value="hcc-oracle-23c", key="test_host")
+            test_host = st.text_input("Host", value="localhost", key="test_host")
             test_service = st.text_input("Service Name", value="FREEPDB1", key="test_service")
-            test_password = st.text_input("Password", value="Compress123", type="password", key="test_password")
-
+            test_password = st.text_input("Password", type="password", key="test_password")
         with col2:
             test_port = st.number_input("Port", value=1521, key="test_port")
             test_username = st.text_input("Username", value="COMPRESSION_MGR", key="test_username")
 
         if st.button("Test Connection", key="quick_test", use_container_width=True, type="primary"):
-            test_conn = {
-                "host": test_host,
-                "port": test_port,
-                "service": test_service,
-                "username": test_username,
-                "password": test_password
-            }
-
-            with st.spinner("Testing connection..."):
-                success, message, version = test_connection(test_conn)
-
+            test_conn = {'host': test_host, 'port': test_port, 'service': test_service, 'username': test_username, 'password': test_password}
+            with st.spinner("Testing..."):
+                success, msg, version = test_target_connection(test_conn)
             if success:
-                st.success(f"{message}\n{version}")
+                st.success(f"{msg}\n{version}")
             else:
-                st.error(message)
-
-
-if __name__ == "__main__":
-    show_connections_page()
+                st.error(msg)

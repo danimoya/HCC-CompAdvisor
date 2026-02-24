@@ -11,41 +11,41 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import config
-from utils.db_connector import DatabaseConnector
+from utils.central_connector import CentralConnector
 from utils.api_client import ORDSClient
 
 
 def test_database_connection():
-    """Test database connection"""
+    """Test central database connection"""
     print("\n" + "="*60)
-    print("Testing Database Connection")
+    print("Testing Central Database Connection")
     print("="*60)
 
     try:
-        print(f"Host: {config.DB_HOST}")
-        print(f"Port: {config.DB_PORT}")
-        print(f"Service: {config.DB_SERVICE}")
-        print(f"User: {config.DB_USER}")
+        print(f"Host: {config.CENTRAL_DB_HOST}")
+        print(f"Port: {config.CENTRAL_DB_PORT}")
+        print(f"Service: {config.CENTRAL_DB_SERVICE}")
+        print(f"User: {config.CENTRAL_DB_USER}")
         print()
 
         # Initialize connection pool
-        DatabaseConnector.initialize_pool()
+        CentralConnector.initialize_pool()
         print("✓ Connection pool initialized")
 
         # Test connection
-        if DatabaseConnector.test_connection():
-            print("✓ Database connection successful")
+        if CentralConnector.test_connection():
+            print("✓ Central database connection successful")
 
             # Get version
             query = "SELECT BANNER FROM V$VERSION WHERE ROWNUM = 1"
-            df = DatabaseConnector.execute_query(query)
+            df = CentralConnector.execute_query(query)
 
             if not df.empty:
                 print(f"✓ Oracle Version: {df.iloc[0]['BANNER']}")
 
             return True
         else:
-            print("✗ Database connection failed")
+            print("✗ Central database connection failed")
             return False
 
     except Exception as e:

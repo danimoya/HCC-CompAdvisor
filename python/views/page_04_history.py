@@ -8,7 +8,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
-from utils.db_queries import CompressionQueries
+from utils.central_queries import CentralQueries
 from config import config
 
 
@@ -43,12 +43,13 @@ def show_history_page():
             step=10
         )
 
-    # Fetch history using direct database query
+    # Fetch history using central database query
     with st.spinner("Loading execution history..."):
-        df = CompressionQueries.get_execution_history(
+        df = CentralQueries.get_execution_history(
             start_date=start_date.isoformat(),
             end_date=end_date.isoformat(),
-            limit=limit
+            limit=limit,
+            database_id=st.session_state.get('active_database_id')
         )
 
     if df.empty:

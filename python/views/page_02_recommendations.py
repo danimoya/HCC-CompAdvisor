@@ -8,7 +8,8 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import io
-from utils.db_queries import CompressionQueries
+from utils.central_queries import CentralQueries
+from utils.target_queries import TargetQueries
 from config import config
 
 
@@ -19,11 +20,16 @@ def show_recommendations_page():
     st.markdown("View, filter, and execute compression candidates")
     st.markdown("---")
 
+    db_id = st.session_state.get('active_database_id')
+
     # Filters (outside tabs - always visible)
     st.subheader("Filters")
 
     # Get available schemas for filter
-    schemas = CompressionQueries.get_available_schemas()
+    if db_id:
+        schemas = TargetQueries.get_available_schemas(db_id)
+    else:
+        schemas = []
 
     col1, col2, col3, col4, col5 = st.columns(5)
 
@@ -74,12 +80,13 @@ def show_recommendations_page():
     schema_param = None if schema_filter == "All Schemas" else schema_filter
 
     with st.spinner("Loading recommendations..."):
-        df = CompressionQueries.get_recommendations(
+        df = CentralQueries.get_recommendations(
             schema=schema_param,
             strategy=strategy_param,
             min_savings_pct=min_savings,
             min_size_mb=min_size,
-            limit=limit
+            limit=limit,
+            database_id=db_id
         )
 
     if df.empty:
@@ -430,8 +437,10 @@ def show_detailed_tab(df: pd.DataFrame):
 def show_analysis_details(analysis_id: int):
     """Display detailed analysis information for justification"""
 
+    db_id = st.session_state.get('active_database_id')
+
     with st.spinner("Loading analysis details..."):
-        justification = CompressionQueries.build_recommendation_justification(analysis_id)
+        justification = CentralQueries.build_recommendation_justification(analysis_id)
 
     if justification.get('error'):
         st.error(justification['error'])
@@ -579,7 +588,7 @@ def show_analysis_details(analysis_id: int):
         parts = summary.get('table', '.').split('.')
         if len(parts) == 2:
             owner, table_name = parts
-            col_stats = CompressionQueries.get_table_column_info(owner, table_name)
+            col_stats = TargetQueries.get_table_column_info(db_id, owner, table_name) if db_id else pd.DataFrame()
 
             if not col_stats.empty:
                 col_stats.columns = [c.lower() for c in col_stats.columns]
@@ -627,7 +636,7 @@ def show_analysis_details(analysis_id: int):
                 # Try to get tablespace from summary table info
                 parts = summary.get('table', '.').split('.')
                 if len(parts) == 2:
-                    ts_info = CompressionQueries.get_table_tablespace(parts[0], parts[1])
+                    ts_info = TargetQueries.get_table_tablespace(db_id, parts[0], parts[1]) if db_id else None
                     tablespace = ts_info or 'N/A'
             st.metric("Tablespace", tablespace)
         with col2:
@@ -646,9 +655,138 @@ def show_analysis_details(analysis_id: int):
             else:
                 st.metric("Size", "N/A")
 
+    # Index Compression Analysis
+    parts = summary.get('table', '.').split('.')
+    if len(parts) == 2:
+        owner, table_name = parts
+
+        with st.expander("📇 Index Compression Analysis", expanded=False):
+            index_df = CentralQueries.get_index_compression_analysis(owner, table_name, database_id=db_id)
+
+            if not index_df.empty:
+                index_df.columns = [c.lower() for c in index_df.columns]
+
+                st.markdown("**Indexes on this table:**")
+
+                for _, idx in index_df.iterrows():
+                    idx_name = idx.get('index_name', 'Unknown')
+                    idx_type = idx.get('index_type', 'NORMAL')
+                    current_comp = idx.get('current_compression', 'NONE')
+                    advisable = idx.get('advisable_compression', 'N/A')
+                    savings = idx.get('projected_savings_mb', 0) or 0
+
+                    with st.container():
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.markdown(f"**{idx_name}**")
+                            st.caption(f"Type: {idx_type}")
+                        with col2:
+                            st.metric("Current", current_comp)
+                        with col3:
+                            st.metric("Recommended", advisable)
+                        with col4:
+                            st.metric("Potential Savings", f"{savings:.2f} MB")
+
+                        # Compression ratios
+                        prefix_ratio = idx.get('prefix_compression_ratio', 0) or 0
+                        adv_low_ratio = idx.get('advanced_low_ratio', 0) or 0
+                        adv_high_ratio = idx.get('advanced_high_ratio', 0) or 0
+
+                        if prefix_ratio > 0 or adv_low_ratio > 0 or adv_high_ratio > 0:
+                            ratio_cols = st.columns(3)
+                            with ratio_cols[0]:
+                                st.caption(f"Prefix Ratio: {prefix_ratio:.2f}x" if prefix_ratio else "Prefix: N/A")
+                            with ratio_cols[1]:
+                                st.caption(f"Adv Low: {adv_low_ratio:.2f}x" if adv_low_ratio else "Adv Low: N/A")
+                            with ratio_cols[2]:
+                                st.caption(f"Adv High: {adv_high_ratio:.2f}x" if adv_high_ratio else "Adv High: N/A")
+
+                        reason = idx.get('recommendation_reason', '')
+                        if reason:
+                            st.caption(f"Reason: {reason[:200]}")
+                        st.markdown("---")
+            else:
+                st.info("No index compression analysis available for this table.")
+
+        # LOB Compression Analysis
+        with st.expander("📦 LOB Compression Analysis", expanded=False):
+            lob_df = CentralQueries.get_lob_compression_analysis(owner, table_name, database_id=db_id)
+
+            if not lob_df.empty:
+                lob_df.columns = [c.lower() for c in lob_df.columns]
+
+                st.markdown("**LOB columns on this table:**")
+
+                for _, lob in lob_df.iterrows():
+                    col_name = lob.get('column_name', 'Unknown')
+                    data_type = lob.get('data_type', 'LOB')
+                    securefile = lob.get('securefile', 'NO')
+                    current_comp = lob.get('current_compression', 'NONE')
+                    advisable = lob.get('advisable_compression', 'N/A')
+                    savings = lob.get('projected_savings_mb', 0) or 0
+
+                    with st.container():
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.markdown(f"**{col_name}**")
+                            sf_badge = "✓ SecureFile" if securefile == 'YES' else "BasicFile"
+                            st.caption(f"{data_type} - {sf_badge}")
+                        with col2:
+                            st.metric("Current", current_comp)
+                        with col3:
+                            st.metric("Recommended", advisable)
+                        with col4:
+                            st.metric("Potential Savings", f"{savings:.2f} MB")
+
+                        # LOB metrics
+                        lob_size = lob.get('lob_size_mb', 0) or 0
+                        num_lobs = lob.get('num_lobs', 0) or 0
+                        avg_size = lob.get('avg_lob_size_kb', 0) or 0
+
+                        metric_cols = st.columns(4)
+                        with metric_cols[0]:
+                            st.caption(f"Total Size: {lob_size:.2f} MB")
+                        with metric_cols[1]:
+                            st.caption(f"LOB Count: {int(num_lobs):,}")
+                        with metric_cols[2]:
+                            st.caption(f"Avg Size: {avg_size:.2f} KB")
+                        with metric_cols[3]:
+                            dedup = lob.get('dedup_savings_pct', 0) or 0
+                            st.caption(f"Dedup Savings: {dedup:.1f}%")
+
+                        # Compression ratios
+                        low_ratio = lob.get('low_compression_ratio', 0) or 0
+                        med_ratio = lob.get('medium_compression_ratio', 0) or 0
+                        high_ratio = lob.get('high_compression_ratio', 0) or 0
+
+                        if low_ratio > 0 or med_ratio > 0 or high_ratio > 0:
+                            ratio_cols = st.columns(3)
+                            with ratio_cols[0]:
+                                st.caption(f"Low: {low_ratio:.2f}x" if low_ratio else "Low: N/A")
+                            with ratio_cols[1]:
+                                st.caption(f"Medium: {med_ratio:.2f}x" if med_ratio else "Medium: N/A")
+                            with ratio_cols[2]:
+                                st.caption(f"High: {high_ratio:.2f}x" if high_ratio else "High: N/A")
+
+                        reason = lob.get('recommendation_reason', '')
+                        if reason:
+                            st.caption(f"Reason: {reason[:200]}")
+
+                        # SecureFile upgrade recommendation
+                        if lob.get('recommend_securefile') == 'Y':
+                            st.warning("Consider upgrading to SecureFile for better compression options")
+                        st.markdown("---")
+            else:
+                st.info("No LOB compression analysis available for this table.")
+
 
 def execute_batch_compression(selected_df: pd.DataFrame, original_df: pd.DataFrame, dry_run: bool, parallel_degree: int):
     """Execute batch compression for selected tables"""
+
+    db_id = st.session_state.get('active_database_id')
+    if not db_id:
+        st.error("Select a target database from the sidebar first.")
+        return
 
     # Map selected rows back to original recommendation IDs
     if 'ID' not in selected_df.columns:
@@ -690,10 +828,13 @@ def execute_batch_compression(selected_df: pd.DataFrame, original_df: pd.DataFra
         status_text.text(f"Processing {i+1}/{len(selected_ids)}: {owner}.{table_name}...")
 
         try:
-            result = CompressionQueries.execute_compression(
-                analysis_id=int(rec_id),
-                dry_run=dry_run,
-                parallel_degree=parallel_degree
+            strategy = table_row.get('Strategy', 'QUERY HIGH')
+            result = TargetQueries.execute_compression(
+                db_id,
+                owner=owner,
+                table_name=table_name,
+                compression_type=strategy,
+                dry_run=dry_run
             )
 
             if result.get('error'):
