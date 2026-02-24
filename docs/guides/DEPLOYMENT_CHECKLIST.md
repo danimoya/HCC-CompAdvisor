@@ -12,6 +12,7 @@
 - [ ] Docker 20.10+ installed (if using Docker deployment)
 
 ### Database Prerequisites
+- [ ] Central database provisioned (Oracle 19c+ or 23c Free Edition)
 - [ ] Schema user created (COMPRESSION_MGR recommended)
 - [ ] Required privileges granted:
   - CREATE TABLE, CREATE SEQUENCE, CREATE PROCEDURE, CREATE VIEW
@@ -21,7 +22,9 @@
   - CREATE ANY INDEX (for index rebuilds)
   - ALTER ANY TABLE (for compression operations)
 - [ ] Sufficient tablespace quotas assigned
-- [ ] Network access configured (for ORDS if using REST API)
+- [ ] T_TARGET_DATABASES table created in central schema (for managing remote target databases)
+- [ ] Network access configured to reach remote target databases
+- [ ] Network access configured (for ORDS if using REST API - optional)
 
 ### Installation Files
 - [ ] All SQL scripts present in sql/ directory:
@@ -37,6 +40,14 @@
   - install_full.sql
   - validate_installation.sql (NEW)
   - uninstall.sql
+- [ ] Central schema files present:
+  - sql/central/01_central_schema.sql
+  - sql/central/02_seed_strategies.sql
+- [ ] Docker central init scripts present:
+  - docker/init-scripts-central/01-create-user.sql
+  - docker/init-scripts-central/02-grant-privileges.sql
+  - docker/init-scripts-central/03-create-tablespace.sql
+  - docker/init-scripts-central/04-run-installation.sh
 
 ## Installation Steps
 
@@ -46,22 +57,29 @@
 - [ ] Navigate to docker directory: `cd docker/`
 - [ ] Copy environment template: `cp .env.example .env`
 - [ ] Edit .env file with your settings:
-  - ORACLE_PASSWORD
-  - COMPRESSION_MGR_PASSWORD
+  - CENTRAL_DB_HOST
+  - CENTRAL_DB_PORT
+  - CENTRAL_DB_SERVICE
+  - CENTRAL_DB_USER
+  - CENTRAL_DB_PASSWORD
+  - CENTRAL_DB_SYS_PASSWORD
+  - ENCRYPTION_KEY (Fernet key for encrypting stored target DB passwords)
   - STREAMLIT_PASSWORD
-  - ORDS_PASSWORD (if using ORDS)
+  - ORDS_PASSWORD (if using ORDS - optional)
 
 #### Step 2: Launch Docker Environment
 - [ ] Run quick start script: `./quick-start.sh`
 - [ ] Wait for initialization (10-15 minutes first time)
 - [ ] Monitor logs: `docker-compose logs -f`
 - [ ] Verify containers running: `docker-compose ps`
+- [ ] Expected containers: `hcc-central-db` (central-db), `hcc-streamlit` (streamlit)
 
 #### Step 3: Verify Installation
 - [ ] Access Streamlit dashboard: https://localhost:8501
 - [ ] Login with configured password
-- [ ] Check database connection on Analysis page
-- [ ] Verify ORDS API (if configured): https://localhost:8080/ords
+- [ ] Check central database connection on Analysis page
+- [ ] Register target databases through Target DB Manager page
+- [ ] Verify ORDS API (if configured - optional): https://localhost:8080/ords
 
 ### Option 2: Manual Installation
 
@@ -114,11 +132,12 @@ streamlit run app.py --server.port=8501 --server.address=0.0.0.0
   ```sql
   SELECT object_name, status FROM user_objects WHERE object_type IN ('PACKAGE', 'PACKAGE BODY');
   ```
-- [ ] All tables created (4 tables):
+- [ ] All tables created (5+ tables):
   - T_COMPRESSION_ANALYSIS
   - T_COMPRESSION_HISTORY
   - T_COMPRESSION_STRATEGIES
   - T_STRATEGY_RULES
+  - T_TARGET_DATABASES
 - [ ] All views accessible (10 views):
   - V_COMPRESSION_CANDIDATES
   - V_COMPRESSION_SUMMARY
@@ -177,17 +196,21 @@ streamlit run app.py --server.port=8501 --server.address=0.0.0.0
 ### Dashboard Verification
 - [ ] Dashboard accessible on configured port
 - [ ] Authentication working
-- [ ] Database connection successful
-- [ ] All 5 pages load without errors:
+- [ ] Central database connection successful
+- [ ] All 7 pages load without errors:
   - Analysis
   - Recommendations
   - Execution
   - History
   - Strategies
+  - Target DB Manager
+  - Session Browser
 - [ ] Charts and visualizations render correctly
+- [ ] Target database registration and connectivity test working
 - [ ] API integration working (if ORDS configured)
 
-### ORDS API Verification (Optional)
+### ORDS API Verification (Optional - Not Required for Core Functionality)
+ORDS is optional and not required for the core dashboard or multi-database management features.
 - [ ] ORDS module installed and enabled
 - [ ] Test health endpoint:
   ```bash
@@ -219,11 +242,12 @@ streamlit run app.py --server.port=8501 --server.address=0.0.0.0
 
 ### Network Security
 - [ ] Firewall rules configured for required ports only:
-  - 1521 (Oracle Database) - internal only
-  - 8501 (Streamlit) - restricted access
+  - 1521 (Oracle Central Database) - internal only
+  - 8501 (Streamlit Dashboard) - main application port, restricted access
   - 8080 (ORDS) - optional, restricted access
 - [ ] Database listener configured securely
 - [ ] No default passwords in use
+- [ ] ENCRYPTION_KEY securely generated and stored for target database password encryption
 
 ## Performance Validation
 

@@ -1,6 +1,6 @@
 # HCC Compression Advisor - Streamlit Dashboard
 
-A Streamlit dashboard for managing Oracle Hybrid Columnar Compression (HCC) with SSL support and authentication.
+A Streamlit dashboard for centralized multi-database Oracle Hybrid Columnar Compression (HCC) management with SSL support and authentication.
 
 ## Features
 
@@ -19,8 +19,8 @@ A Streamlit dashboard for managing Oracle Hybrid Columnar Compression (HCC) with
 ### Prerequisites
 
 - Python 3.8 or higher
-- Oracle Database with HCC support
-- ORDS (Oracle REST Data Services) configured
+- Oracle 23c Free or higher (central database)
+- ORDS (Oracle REST Data Services) - optional, not required for core functionality
 - OpenSSL (for SSL certificate generation)
 
 ### Setup
@@ -71,17 +71,15 @@ Edit `.env` file with your configuration:
 # Authentication
 DASHBOARD_PASSWORD=YourSecurePassword123!
 
-# Database Connection
-DB_HOST=localhost
-DB_PORT=1521
-DB_SERVICE=XEPDB1
-DB_USER=hcc_advisor
-DB_PASSWORD=your_db_password
+# Central Database Connection
+CENTRAL_DB_HOST=localhost
+CENTRAL_DB_PORT=1521
+CENTRAL_DB_SERVICE=FREEPDB1
+CENTRAL_DB_USER=COMPRESSION_MGR
+CENTRAL_DB_PASSWORD=your_central_db_password
 
-# ORDS REST API
-ORDS_BASE_URL=https://localhost:8443/ords/hcc_advisor
-ORDS_USERNAME=hcc_advisor
-ORDS_PASSWORD=your_ords_password
+# Encryption key for target DB passwords
+ENCRYPTION_KEY=
 
 # SSL Configuration
 SSL_ENABLED=true
@@ -147,20 +145,23 @@ python/
 ├── config.py                   # Configuration management
 ├── requirements.txt            # Python dependencies
 ├── .env.example               # Environment template
-├── README.md                  # This file
-├── pages/                     # Application pages
-│   ├── page_01_analysis.py        # Analysis page
-│   ├── page_02_recommendations.py # Recommendations page
-│   ├── page_03_execution.py       # Execution page
-│   ├── page_04_history.py         # History page
-│   └── page_05_strategies.py      # Strategies page
+├── views/                     # Application pages
+│   ├── page_01_analysis.py        # Run compression analysis
+│   ├── page_02_recommendations.py # View recommendations
+│   ├── page_03_execution.py       # Execute compression
+│   ├── page_04_history.py         # Execution history
+│   ├── page_05_strategies.py      # Strategy management
+│   ├── page_06_connections.py     # Target database manager
+│   └── page_07_sessions.py        # Session browser
 ├── utils/                     # Utility modules
-│   ├── db_connector.py            # Database connector
-│   └── api_client.py              # ORDS API client
+│   ├── central_connector.py       # Central DB connection pool
+│   ├── target_connector.py        # Target DB connection pools
+│   ├── central_queries.py         # Central DB queries
+│   ├── target_queries.py          # Target DB queries
+│   ├── migration.py              # Data migration utility
+│   ├── api_client.py             # ORDS API client (optional)
+│   └── logger.py                 # Application logging
 └── ssl/                       # SSL certificates
-    ├── generate_cert.sh           # Certificate generator
-    ├── cert.pem                   # SSL certificate
-    └── key.pem                    # Private key
 ```
 
 ## Pages Overview
@@ -200,6 +201,16 @@ python/
 - Compare strategy performance
 - Table-specific comparison
 - Strategy selection guide
+
+### 7. Target Database Manager
+- Register and manage remote Oracle databases
+- Connection testing and validation
+- Encrypted credential storage
+
+### 8. Session Browser
+- Monitor active database sessions
+- View session details and statistics
+- Real-time session tracking
 
 ## Security
 
@@ -281,10 +292,11 @@ CHART_COLORS: dict = {
 - Check network connectivity
 - Ensure Oracle Instant Client is installed
 
-**ORDS API connection fails:**
+**ORDS API connection fails (optional -- not required for core functionality):**
 - Verify ORDS is running
 - Check ORDS URL and credentials
 - Test endpoint manually with curl
+- Note: The dashboard uses direct oracledb connections; ORDS is not required
 
 ### SSL Issues
 
@@ -316,7 +328,9 @@ cd ssl
 
 ## API Endpoints
 
-The dashboard uses these ORDS endpoints:
+> **Note:** ORDS endpoints are optional and not required for core functionality. The dashboard uses direct oracledb connections to the central and target databases.
+
+The following ORDS endpoints can optionally be used:
 
 - `GET /analysis/latest` - Latest analysis results
 - `POST /analysis/start` - Start new analysis

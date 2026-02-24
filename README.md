@@ -1,17 +1,19 @@
 # HCC Compression Advisor
 
-An Oracle Database compression analysis and management system adapted for Oracle 23c Free Edition.
+A centralized Oracle Database compression analysis and management system that manages multiple remote Oracle databases from a single server, adapted for Oracle 23c Free Edition.
 
 ## 🎯 Project Overview
 
-This system provides comprehensive database compression analysis, intelligent recommendations, and execution capabilities for Oracle databases. Originally designed for Exadata HCC (Hybrid Columnar Compression), it has been adapted to work with Oracle 23c Free Edition using standard compression techniques.
+This system provides a centralized architecture for managing compression analysis, intelligent recommendations, and execution capabilities across multiple remote Oracle databases. A central database stores all results, strategies, and target database configurations, while connecting to remote targets for analysis and execution. Originally designed for Exadata HCC (Hybrid Columnar Compression), it has been adapted to work with Oracle 23c Free Edition using standard compression techniques.
 
 ### Key Features
 
+- **Multi-Database Management** (manage multiple remote Oracle databases from one server)
+- **Centralized Results Store** (all analysis results, strategies, and history in a central database)
 - **3 Configurable Compression Strategies** (table-driven, runtime modifiable)
 - **Comprehensive Object Analysis** (tables, indexes, LOBs, IOTs, partitions)
 - **Intelligent Recommendations** (hotness scoring, DML pattern analysis)
-- **ORDS REST API** (complete RESTful interface with 10 endpoints)
+- **ORDS REST API** (optional RESTful interface with 10 endpoints)
 - **Streamlit Dashboard** (modern web UI with SSL support)
 - **Docker Environment** (Oracle 23c Free ready-to-run)
 - **Complete Audit Trail** (execution history, rollback support)
@@ -20,29 +22,46 @@ This system provides comprehensive database compression analysis, intelligent re
 
 ```
 HCC-CompAdvisor/
-├── sql/                        # Database implementation
+├── sql/                        # Database implementation (target DB scripts)
 │   ├── 01_schema.sql          # Tables, sequences, indexes (1004 lines)
 │   ├── 02_strategies.sql      # 3 compression strategies with rules
 │   ├── 03_advisor_pkg.sql     # PKG_COMPRESSION_ADVISOR (analysis engine)
 │   ├── 04_executor_pkg.sql    # PKG_COMPRESSION_EXECUTOR (execution engine)
 │   ├── 05_views.sql           # 10 reporting views
-│   ├── 06_ords.sql            # REST API configuration
+│   ├── 06_ords.sql            # REST API configuration (optional)
 │   ├── install_full.sql       # Master installation script
-│   └── uninstall.sql          # Clean uninstallation
+│   ├── uninstall.sql          # Clean uninstallation
+│   └── central/               # Central database schema
+│       ├── 01_central_schema.sql   # Central tables and indexes
+│       └── 02_seed_strategies.sql  # Default strategy data
 │
 ├── python/                     # Streamlit Dashboard
 │   ├── app.py                 # Main application
 │   ├── auth.py                # Authentication
 │   ├── config.py              # Configuration
-│   ├── pages/                 # 5 interactive pages
-│   ├── utils/                 # Database & API clients
+│   ├── views/                 # 7 interactive pages
+│   │   ├── page_01_analysis.py
+│   │   ├── page_02_recommendations.py
+│   │   ├── page_03_execution.py
+│   │   ├── page_04_history.py
+│   │   ├── page_05_strategies.py
+│   │   ├── page_06_target_manager.py
+│   │   └── page_07_sessions.py
+│   ├── utils/                 # Database connectors & utilities
+│   │   ├── central_connector.py    # Central DB connection
+│   │   ├── target_connector.py     # Remote target DB connections
+│   │   ├── central_queries.py      # Central DB queries
+│   │   ├── target_queries.py       # Target DB queries
+│   │   ├── migration.py            # Schema migration utilities
+│   │   ├── api_client.py           # ORDS API client (optional)
+│   │   └── logger.py               # Application logging
 │   └── ssl/                   # SSL certificate generation
 │
 ├── docker/                     # Docker Environment
 │   ├── Dockerfile             # Oracle 23c Free image
-│   ├── docker-compose.yml     # Complete stack
-│   ├── init-scripts/          # Automated setup
-│   ├── quick-start.sh         # One-command startup
+│   ├── docker-compose.yml     # Centralized deployment (central-db + dashboard)
+│   ├── docker-compose.dev.yml # Local development environment
+│   ├── init-scripts-central/  # Central DB automated setup
 │   └── README.md              # Docker documentation
 │
 └── docs/                       # Documentation
@@ -66,13 +85,13 @@ HCC-CompAdvisor/
 # 1. Navigate to project
 cd HCC-CompAdvisor/docker
 
-# 2. Run quick start script
-./quick-start.sh
+# 2. Start the centralized deployment (central-db + streamlit-dashboard)
+docker compose up -d
 
 # 3. Wait for initialization (~10-15 minutes first time)
 
 # 4. Access the dashboard
-open https://localhost:8501
+open http://localhost:8501
 ```
 
 ### Manual Installation (Without Docker)
@@ -134,6 +153,8 @@ cd python && ./start.sh
 - **[Operations Runbook](docs/reference/operations-runbook.md)** - Operational procedures and troubleshooting
 
 ## 🔌 REST API Endpoints
+
+> **Note**: ORDS is optional and not required for core functionality. The dashboard communicates directly with the central and target databases. ORDS endpoints are available when Oracle REST Data Services is configured on a target database.
 
 Base URL: `https://server:8080/ords/compression/compression/v1/`
 
@@ -205,26 +226,26 @@ EXEC PKG_COMPRESSION_EXECUTOR.execute_recommendations(
 3. **Execution** - Execute compression operations with dry-run
 4. **History** - Execution timeline and analytics
 5. **Strategies** - Compare and manage compression strategies
+6. **Target Database Manager** - Register, edit, and test remote Oracle database connections
+7. **Session Browser** - Browse and inspect active database sessions
 
 ## 🔧 Configuration
 
 ### Environment Variables
 
 ```bash
-# Database Connection
-ORACLE_HOST=localhost
-ORACLE_PORT=1521
-ORACLE_SERVICE=FREEPDB1
-ORACLE_USER=COMPRESSION_MGR
-ORACLE_PASSWORD=YourPassword
-
-# ORDS Configuration
-ORDS_BASE_URL=http://localhost:8080/ords
+# Central Database Connection
+CENTRAL_DB_HOST=localhost
+CENTRAL_DB_PORT=1521
+CENTRAL_DB_SERVICE=FREEPDB1
+CENTRAL_DB_USER=COMPRESSION_MGR
+CENTRAL_DB_PASSWORD=your_password
 
 # Dashboard
-STREAMLIT_PASSWORD=YourDashboardPassword
-SSL_CERT_PATH=/path/to/cert.pem
-SSL_KEY_PATH=/path/to/key.pem
+DASHBOARD_PASSWORD=YourDashboardPassword
+
+# Encryption (for target DB passwords)
+ENCRYPTION_KEY=your_fernet_key
 ```
 
 ## 🛠️ Development
@@ -245,8 +266,9 @@ python -m pytest tests/
 
 ```bash
 cd docker
-docker-compose build
-docker-compose up -d
+docker compose up -d          # Centralized deployment
+# OR for local development:
+docker compose -f docker-compose.dev.yml up -d
 ```
 
 ## 📦 System Requirements
@@ -304,8 +326,8 @@ Check the following logs:
 - **Python Modules**: 20+ files
 - **Documentation**: 10 comprehensive guides
 - **Docker Configuration**: Complete environment
-- **REST API Endpoints**: 10 endpoints
-- **Dashboard Pages**: 5 interactive pages
+- **REST API Endpoints**: 10 endpoints (optional, via ORDS)
+- **Dashboard Pages**: 7 interactive pages (including target DB management)
 - **Compression Strategies**: 3 pre-configured
 - **Database Objects**: 30+ (tables, views, packages)
 

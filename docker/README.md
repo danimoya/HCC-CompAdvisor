@@ -1,9 +1,10 @@
 # HCC Compression Advisor - Docker Environment
 
-Complete Docker environment for Oracle 23c Free with HCC Compression Advisor pre-configured for development and testing.
+Complete Docker environment for centralized multi-database management. A central Oracle 23c Free instance stores analysis results, metadata, and compression recommendations gathered from all registered target databases.
 
 ## Table of Contents
 
+- [Architecture](#architecture)
 - [Prerequisites](#prerequisites)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
@@ -16,6 +17,38 @@ Complete Docker environment for Oracle 23c Free with HCC Compression Advisor pre
 - [Advanced Configuration](#advanced-configuration)
 - [Cleanup](#cleanup)
 
+## Architecture
+
+```
++------------------------------------------------------+
+|                    Docker Stack                       |
+|                                                       |
+|  +------------------+      +---------------------+   |
+|  | Central Oracle   |      | Streamlit Dashboard |   |
+|  | 23c Free DB      |<---->| (hcc-streamlit)     |   |
+|  | (hcc-central-db) |      |                     |   |
+|  |                  |      |  Connects to central |   |
+|  | Stores:          |      |  DB + remote targets |   |
+|  | - Analysis runs  |      +--------|------------+   |
+|  | - Recommendations|               |                |
+|  | - Target DB info |               |                |
+|  +------------------+               |                |
++--------------------------------------|---------------+
+                                       |
+                      +----------------+----------------+
+                      |                |                |
+               +------+------+  +------+------+  +-----+-------+
+               | Remote      |  | Remote      |  | Remote      |
+               | Target DB 1 |  | Target DB 2 |  | Target DB N |
+               | (registered |  | (registered |  | (registered |
+               |  via UI)    |  |  via UI)    |  |  via UI)    |
+               +-------------+  +-------------+  +-------------+
+```
+
+The **Central Oracle 23c DB** runs locally in Docker and persists all analysis metadata.
+**Remote Target Databases** are production or test Oracle instances registered through
+the Streamlit dashboard. They are not part of the Docker stack.
+
 ## Prerequisites
 
 ### Required Software
@@ -27,7 +60,7 @@ Complete Docker environment for Oracle 23c Free with HCC Compression Advisor pre
 
 2. **Docker Compose** (v2.0+)
    - Usually included with Docker Desktop
-   - Verify: `docker-compose --version`
+   - Verify: `docker compose version`
 
 3. **Oracle Container Registry Account**
    - Sign up: https://container-registry.oracle.com
@@ -83,10 +116,10 @@ chmod -R 777 data logs  # Ensure Oracle user can write
 
 ```bash
 # Build and start all services
-docker-compose up -d
+docker compose up -d
 
 # View logs
-docker-compose logs -f oracle-db
+docker compose logs -f central-db
 ```
 
 ### 6. Wait for Database Initialization
@@ -95,17 +128,17 @@ First startup takes 5-10 minutes for database creation and initialization.
 
 ```bash
 # Check database status
-docker-compose exec oracle-db /opt/oracle/checkDBStatus.sh
+docker compose exec central-db /opt/oracle/checkDBStatus.sh
 
 # Watch initialization logs
-docker-compose logs -f oracle-db | grep -i "database is ready"
+docker compose logs -f central-db | grep -i "database is ready"
 ```
 
 ### 7. Connect to Database
 
 ```bash
 # Using Docker exec
-docker-compose exec oracle-db sqlplus COMPRESSION_MGR/Compress123@FREEPDB1
+docker compose exec central-db sqlplus COMPRESSION_MGR/Compress123@FREEPDB1
 
 # Using SQL*Plus from host (if installed)
 sqlplus COMPRESSION_MGR/Compress123@localhost:1521/FREEPDB1
@@ -125,9 +158,10 @@ sqlplus COMPRESSION_MGR/Compress123@localhost:1521/FREEPDB1
 Key configuration options:
 
 ```bash
-# Database Passwords
-ORACLE_PWD=Welcome123              # SYS/SYSTEM password
-COMPRESSION_PWD=Compress123        # Application user password
+# Central Database Passwords
+CENTRAL_DB_PWD=Welcome123          # SYS/SYSTEM password for central DB
+CENTRAL_DB_USER=COMPRESSION_MGR    # Application user
+CENTRAL_DB_USER_PWD=Compress123    # Application user password
 
 # Performance Tuning
 INIT_SGA_SIZE=2048                 # SGA size in MB
@@ -138,6 +172,9 @@ SCRATCH_TS_SIZE=10240              # Scratch tablespace size in MB
 
 # Dashboard
 STREAMLIT_PASSWORD=Dashboard123    # Dashboard access password
+
+# Security
+ENCRYPTION_KEY=<generate-a-key>   # Key for encrypting stored target DB credentials
 ```
 
 ### Custom SQL Scripts
@@ -158,9 +195,8 @@ Scripts are executed alphabetically after main installation.
 
 | Service | Internal Port | External Port | Description |
 |---------|--------------|---------------|-------------|
-| Oracle Database | 1521 | 1521 | TNS Listener |
+| Central Oracle Database | 1521 | 1521 | TNS Listener |
 | Enterprise Manager | 5500 | 5500 | EM Express Web UI |
-| ORDS | 8080 | 8081 | REST Data Services |
 | Streamlit | 8501 | 8501 | Dashboard UI |
 
 ### Accessing Services
@@ -181,12 +217,7 @@ Scripts are executed alphabetically after main installation.
    Password: Welcome123
    ```
 
-3. **ORDS REST Services**:
-   ```
-   http://localhost:8081/ords/
-   ```
-
-4. **Streamlit Dashboard**:
+3. **Streamlit Dashboard**:
    ```
    http://localhost:8501
    Password: Dashboard123
@@ -206,7 +237,6 @@ Scripts are executed alphabetically after main installation.
 
 | Service | Username | Password |
 |---------|----------|----------|
-| ORDS | ORDS_PUBLIC_USER | Welcome123 |
 | Streamlit | N/A | Dashboard123 |
 
 **⚠️ Security Warning**: Change all default passwords in production environments!
@@ -215,17 +245,20 @@ Scripts are executed alphabetically after main installation.
 
 ```
 docker/
-├── Dockerfile                 # Oracle Database image definition
-├── docker-compose.yml         # Service orchestration
+├── Dockerfile                 # Central Oracle Database image definition
+├── docker-compose.yml         # Centralized production orchestration
+├── docker-compose.dev.yml     # Local development overrides
 ├── .env                       # Environment configuration (gitignored)
 ├── .env.example              # Environment template
 ├── README.md                 # This file
 │
-├── init-scripts/             # Database initialization
+├── init-scripts-central/     # Central database initialization
 │   ├── 01-create-user.sql
 │   ├── 02-grant-privileges.sql
 │   ├── 03-create-tablespace.sql
 │   └── 04-run-installation.sh
+│
+├── ../sql/central/           # Central schema definitions (mounted)
 │
 ├── custom-scripts/           # User-defined SQL scripts
 │   └── (your custom .sql files)
@@ -244,7 +277,7 @@ docker/
 
 ```bash
 # From within container
-docker-compose exec oracle-db sqlplus COMPRESSION_MGR/Compress123@FREEPDB1
+docker compose exec central-db sqlplus COMPRESSION_MGR/Compress123@FREEPDB1
 
 # From host (if SQL*Plus installed)
 sqlplus COMPRESSION_MGR/Compress123@localhost:1521/FREEPDB1
@@ -254,57 +287,57 @@ sqlplus COMPRESSION_MGR/Compress123@localhost:1521/FREEPDB1
 
 ```bash
 # Copy script into container
-docker cp my-script.sql hcc-oracle-23c:/tmp/
+docker cp my-script.sql hcc-central-db:/tmp/
 
 # Execute script
-docker-compose exec oracle-db sqlplus COMPRESSION_MGR/Compress123@FREEPDB1 @/tmp/my-script.sql
+docker compose exec central-db sqlplus COMPRESSION_MGR/Compress123@FREEPDB1 @/tmp/my-script.sql
 ```
 
 ### View Logs
 
 ```bash
 # All services
-docker-compose logs -f
+docker compose logs -f
 
-# Oracle Database only
-docker-compose logs -f oracle-db
+# Central Database only
+docker compose logs -f central-db
 
 # Last 100 lines
-docker-compose logs --tail=100 oracle-db
+docker compose logs --tail=100 central-db
 
 # Installation log
-docker-compose exec oracle-db cat /opt/oracle/oradata/logs/hcc_installation_*.log
+docker compose exec central-db cat /opt/oracle/oradata/logs/hcc_installation_*.log
 ```
 
 ### Database Operations
 
 ```bash
 # Stop database (data persists)
-docker-compose stop
+docker compose stop
 
 # Start database
-docker-compose start
+docker compose start
 
 # Restart database
-docker-compose restart oracle-db
+docker compose restart central-db
 
 # Rebuild and restart
-docker-compose up -d --build
+docker compose up -d --build
 
 # Remove everything (including data)
-docker-compose down -v
+docker compose down -v
 ```
 
 ### Backup Database
 
 ```bash
 # Export data directory
-docker-compose stop oracle-db
+docker compose stop central-db
 tar -czf oracle-backup-$(date +%Y%m%d).tar.gz data/
-docker-compose start oracle-db
+docker compose start central-db
 
 # Export using DataPump
-docker-compose exec oracle-db expdp COMPRESSION_MGR/Compress123@FREEPDB1 \
+docker compose exec central-db expdp COMPRESSION_MGR/Compress123@FREEPDB1 \
   directory=COMPRESSION_DIR \
   dumpfile=backup.dmp \
   logfile=backup.log \
@@ -315,12 +348,12 @@ docker-compose exec oracle-db expdp COMPRESSION_MGR/Compress123@FREEPDB1 \
 
 ```bash
 # Restore data directory
-docker-compose down
+docker compose down
 tar -xzf oracle-backup-20250113.tar.gz
-docker-compose up -d
+docker compose up -d
 
 # Import using DataPump
-docker-compose exec oracle-db impdp COMPRESSION_MGR/Compress123@FREEPDB1 \
+docker compose exec central-db impdp COMPRESSION_MGR/Compress123@FREEPDB1 \
   directory=COMPRESSION_DIR \
   dumpfile=backup.dmp \
   logfile=restore.log \
@@ -336,10 +369,10 @@ docker-compose exec oracle-db impdp COMPRESSION_MGR/Compress123@FREEPDB1 \
 **Solutions**:
 ```bash
 # 1. Check logs
-docker-compose logs oracle-db | grep -i error
+docker compose logs central-db | grep -i error
 
 # 2. Verify health status
-docker inspect hcc-oracle-23c | grep -A 10 Health
+docker inspect hcc-central-db | grep -A 10 Health
 
 # 3. Increase Docker resources
 # Docker Desktop -> Settings -> Resources -> Increase RAM to 8GB
@@ -359,16 +392,16 @@ docker system prune -a --volumes
 **Solutions**:
 ```bash
 # 1. Verify listener is running
-docker-compose exec oracle-db lsnrctl status
+docker compose exec central-db lsnrctl status
 
 # 2. Check if PDB is open
-docker-compose exec oracle-db sqlplus sys/Welcome123@FREE as sysdba
+docker compose exec central-db sqlplus sys/Welcome123@FREE as sysdba
 SQL> show pdbs;
 SQL> alter pluggable database FREEPDB1 open;
 
 # 3. Restart listener
-docker-compose exec oracle-db lsnrctl stop
-docker-compose exec oracle-db lsnrctl start
+docker compose exec central-db lsnrctl stop
+docker compose exec central-db lsnrctl start
 ```
 
 ### Out of Memory
@@ -385,8 +418,8 @@ INIT_PGA_SIZE=512
 # Edit docker-compose.yml -> deploy.resources.limits.memory
 
 # 3. Restart services
-docker-compose down
-docker-compose up -d
+docker compose down
+docker compose up -d
 ```
 
 ### Slow Performance
@@ -396,11 +429,11 @@ docker-compose up -d
 **Solutions**:
 ```bash
 # 1. Enable statistics gathering
-docker-compose exec oracle-db sqlplus COMPRESSION_MGR/Compress123@FREEPDB1
+docker compose exec central-db sqlplus COMPRESSION_MGR/Compress123@FREEPDB1
 SQL> exec DBMS_STATS.GATHER_SCHEMA_STATS('COMPRESSION_MGR');
 
 # 2. Check system resources
-docker stats hcc-oracle-23c
+docker stats hcc-central-db
 
 # 3. Increase shared pool
 # Edit .env: SHARED_POOL_SIZE=1024
@@ -417,19 +450,19 @@ SQL> [your query]
 **Solutions**:
 ```bash
 # 1. Check installation log
-docker-compose exec oracle-db cat /opt/oracle/oradata/logs/hcc_installation_*.log
+docker compose exec central-db cat /opt/oracle/oradata/logs/hcc_installation_*.log
 
 # 2. Manually run scripts
-docker-compose exec oracle-db bash
+docker compose exec central-db bash
 cd /opt/oracle/scripts/setup
 sqlplus sys/Welcome123@FREE as sysdba @01-create-user.sql
 
 # 3. Re-run installation
-docker-compose exec oracle-db bash /opt/oracle/scripts/setup/04-run-installation.sh
+docker compose exec central-db bash /opt/oracle/scripts/setup/04-run-installation.sh
 
 # 4. Complete rebuild
-docker-compose down -v
-docker-compose up -d
+docker compose down -v
+docker compose up -d
 ```
 
 ### Permission Denied
@@ -443,7 +476,7 @@ sudo chown -R 54321:54321 data logs  # Oracle UID:GID
 chmod -R 755 data logs
 
 # Or run with proper user
-docker-compose run --user 54321:54321 oracle-db
+docker compose run --user 54321:54321 central-db
 ```
 
 ## Known Limitations
@@ -474,6 +507,14 @@ docker-compose run --user 54321:54321 oracle-db
    - Free for development, testing, and prototyping
    - NOT licensed for production use
    - See Oracle Technology Network License Agreement
+
+### Target Database Connectivity
+
+1. **Remote Targets Only**:
+   - Target Oracle databases are remote and are NOT included in this Docker stack
+   - They are registered through the Streamlit dashboard UI
+   - Network connectivity from the Docker host to each target database is required
+   - Firewall rules must allow outbound connections on the target listener port (typically 1521)
 
 ### Docker-Specific Limitations
 
@@ -518,7 +559,7 @@ docker-compose run --user 54321:54321 oracle-db
 ENABLE_ARCHIVELOG=true
 
 # Restart database
-docker-compose restart oracle-db
+docker compose restart central-db
 ```
 
 ### Configure Custom Tablespace
@@ -543,18 +584,8 @@ ALTER USER COMPRESSION_MGR QUOTA UNLIMITED ON my_data;
 ENABLE_SAMPLE_SCHEMAS=true
 
 # Rebuild
-docker-compose down
-docker-compose up -d --build
-```
-
-### Configure ORDS
-
-```bash
-# Install ORDS in container
-docker-compose exec oracle-db bash
-
-# Follow Oracle documentation for ORDS configuration
-# https://docs.oracle.com/en/database/oracle/oracle-rest-data-services/
+docker compose down
+docker compose up -d --build
 ```
 
 ### Performance Tuning
@@ -582,18 +613,18 @@ STARTUP;
 ### Remove Containers Only (Keep Data)
 
 ```bash
-docker-compose down
+docker compose down
 ```
 
 ### Remove Everything (Including Data)
 
 ```bash
-# ⚠️ WARNING: This deletes all database data!
-docker-compose down -v
+# WARNING: This deletes all database data!
+docker compose down -v
 rm -rf data logs
 
 # Remove images
-docker rmi hcc-oracle-23c
+docker rmi hcc-central-db
 docker rmi container-registry.oracle.com/database/free:latest
 ```
 
@@ -616,7 +647,6 @@ docker system df
 
 - **Oracle 23c Free**: https://docs.oracle.com/en/database/oracle/oracle-database/23/
 - **Docker Guide**: https://github.com/oracle/docker-images/tree/main/OracleDatabase
-- **ORDS**: https://docs.oracle.com/en/database/oracle/oracle-rest-data-services/
 
 ### HCC Compression Resources
 
@@ -632,6 +662,6 @@ docker system df
 
 ---
 
-**Last Updated**: 2025-01-13
-**Version**: 1.0.0
+**Last Updated**: 2026-02-24
+**Version**: 2.0.0
 **Maintainer**: HCC Compression Advisor Team

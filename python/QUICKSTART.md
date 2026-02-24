@@ -33,17 +33,12 @@ nano .env
 # Authentication
 DASHBOARD_PASSWORD=MySecurePassword123!
 
-# Database
-DB_HOST=localhost
-DB_PORT=1521
-DB_SERVICE=XEPDB1
-DB_USER=hcc_advisor
-DB_PASSWORD=your_db_password
-
-# ORDS API
-ORDS_BASE_URL=https://localhost:8443/ords/hcc_advisor
-ORDS_USERNAME=hcc_advisor
-ORDS_PASSWORD=your_ords_password
+# Central Database
+CENTRAL_DB_HOST=localhost
+CENTRAL_DB_PORT=1521
+CENTRAL_DB_SERVICE=FREEPDB1
+CENTRAL_DB_USER=COMPRESSION_MGR
+CENTRAL_DB_PASSWORD=your_central_db_password
 ```
 
 ### Step 3: Generate SSL Certificates (Optional but Recommended)
@@ -64,8 +59,7 @@ python test_connection.py
 Expected output:
 ```
 ✓ SSL Configuration: PASS
-✓ Database Connection: PASS
-✓ ORDS API Connection: PASS
+✓ Central Database Connection: PASS
 ```
 
 ### Step 5: Start the Dashboard
@@ -98,18 +92,18 @@ Before you begin, ensure you have:
    python3 --version
    ```
 
-2. **Oracle Database** with HCC support
-   - ExaData, ZFS Storage Appliance, or Pillar Axiom Storage
+2. **Oracle 23c Free or higher** (central database)
+   - Stores metadata, recommendations, and target database registry
 
 3. **HCC Advisor Schema** installed
    ```bash
    cd ../sql
-   sqlplus sys/password@XEPDB1 as sysdba @install_all.sql
+   sqlplus sys/password@FREEPDB1 as sysdba @install_all.sql
    ```
 
-4. **ORDS** configured and running
+4. **ORDS** (optional) - not required for core functionality
    ```bash
-   # Verify ORDS is running
+   # Verify ORDS is running (if using ORDS)
    curl -k https://localhost:8443/ords/hcc_advisor/health
    ```
 
@@ -131,9 +125,9 @@ sqlplus sys/password@XEPDB1 as sysdba
 @05_sample_data.sql
 ```
 
-### ORDS Configuration
+### ORDS Configuration (Optional)
 
-Ensure ORDS modules are enabled:
+If using ORDS, ensure modules are enabled:
 
 ```sql
 -- Connect as HCC_ADVISOR user
@@ -156,10 +150,9 @@ Navigate to the dashboard URL and enter your password.
 ### 2. Verify Connections
 
 Check the sidebar for connection status:
-- ✓ API (green) - ORDS connection OK
-- ✓ Database (green) - Database connection OK
+- Central DB Connected (green) - Central database connection OK
 
-If either shows red (✗), check your configuration.
+If it shows disconnected (red), check your `CENTRAL_DB_*` configuration in `.env`.
 
 ### 3. Run Your First Analysis
 
@@ -198,14 +191,12 @@ If either shows red (✗), check your configuration.
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
 | `DASHBOARD_PASSWORD` | Login password | `admin123` | Yes |
-| `DB_HOST` | Database host | `localhost` | Yes |
-| `DB_PORT` | Database port | `1521` | Yes |
-| `DB_SERVICE` | Database service | `XEPDB1` | Yes |
-| `DB_USER` | Database user | `hcc_advisor` | Yes |
-| `DB_PASSWORD` | Database password | - | Yes |
-| `ORDS_BASE_URL` | ORDS base URL | - | Yes |
-| `ORDS_USERNAME` | ORDS username | `hcc_advisor` | Yes |
-| `ORDS_PASSWORD` | ORDS password | - | Yes |
+| `CENTRAL_DB_HOST` | Central database host | `localhost` | Yes |
+| `CENTRAL_DB_PORT` | Central database port | `1521` | Yes |
+| `CENTRAL_DB_SERVICE` | Central database service | `FREEPDB1` | Yes |
+| `CENTRAL_DB_USER` | Central database user | `COMPRESSION_MGR` | Yes |
+| `CENTRAL_DB_PASSWORD` | Central database password | - | Yes |
+| `ENCRYPTION_KEY` | Key for target DB password encryption | - | No |
 | `SSL_ENABLED` | Enable SSL | `true` | No |
 | `SESSION_TIMEOUT_MINUTES` | Session timeout | `30` | No |
 | `MAX_LOGIN_ATTEMPTS` | Max login tries | `3` | No |
@@ -298,18 +289,18 @@ sudo ufw allow from 192.168.1.0/24 to any port 8501
 
 ### Connection Errors
 
-**Database connection fails:**
+**Central database connection fails:**
 ```bash
-# Test database connection
-sqlplus hcc_advisor/password@localhost:1521/XEPDB1
+# Test central database connection
+sqlplus COMPRESSION_MGR/password@localhost:1521/FREEPDB1
 
 # Check listener
 lsnrctl status
 ```
 
-**ORDS API fails:**
+**ORDS API fails (optional -- not required for core functionality):**
 ```bash
-# Test ORDS endpoint
+# Test ORDS endpoint (if using ORDS)
 curl -k https://localhost:8443/ords/hcc_advisor/health
 
 # Check ORDS status
@@ -428,8 +419,8 @@ Before going to production:
 
 - [ ] Changed default password
 - [ ] SSL certificates generated
-- [ ] Database connection tested
-- [ ] ORDS API connection tested
+- [ ] Central database connection tested
+- [ ] ORDS API connection tested (if using ORDS)
 - [ ] Firewall rules configured
 - [ ] Backup procedures in place
 - [ ] Monitoring configured

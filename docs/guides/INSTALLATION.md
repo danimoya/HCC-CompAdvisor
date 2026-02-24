@@ -154,14 +154,16 @@ cd docker
 
 # Create .env file (or use provided template)
 cat > .env << 'EOF'
-# Oracle Database Configuration
-ORACLE_PWD=YourStrongPassword123!
-ORACLE_EDITION=free
-ORACLE_CHARACTERSET=AL32UTF8
+# Central Database Configuration
+CENTRAL_DB_HOST=localhost
+CENTRAL_DB_PORT=1521
+CENTRAL_DB_SERVICE=FREEPDB1
+CENTRAL_DB_USER=COMPRESSION_MGR
+CENTRAL_DB_PASSWORD=YourStrongPassword123!
+CENTRAL_DB_SYS_PASSWORD=SysPassword123!
 
-# Compression Manager User
-COMPRESSION_USER=COMPRESSION_MGR
-COMPRESSION_PASSWORD=CompressPass123!
+# Encryption Key (for stored target database passwords)
+ENCRYPTION_KEY=your-fernet-key-here
 
 # Streamlit Dashboard
 STREAMLIT_PASSWORD=DashboardPass123!
@@ -211,15 +213,18 @@ chmod +x quick-start.sh
 docker-compose ps
 
 # Expected output:
-# NAME                 SERVICE    STATUS      PORTS
-# oracle-23c-free      oracle     running     0.0.0.0:1521->1521/tcp
-# streamlit-dashboard  dashboard  running     0.0.0.0:8501->8501/tcp
+# NAME                 SERVICE       STATUS      PORTS
+# hcc-central-db       central-db    running     0.0.0.0:1521->1521/tcp
+# hcc-streamlit        streamlit     running     0.0.0.0:8501->8501/tcp
+#
+# Note: Target databases are remote and registered through the dashboard's
+# Target DB Manager page. They are not deployed as local containers.
 
 # Check database logs
-docker-compose logs -f oracle
+docker-compose logs -f central-db
 
 # Check dashboard logs
-docker-compose logs -f dashboard
+docker-compose logs -f streamlit
 ```
 
 ### Step 5: Access the System
@@ -233,7 +238,7 @@ open https://localhost:8501
 # Password: <STREAMLIT_PASSWORD>
 
 # Test database connection
-docker exec -it oracle-23c-free sqlplus COMPRESSION_MGR/CompressPass123!@FREEPDB1
+docker exec -it hcc-central-db sqlplus COMPRESSION_MGR/YourStrongPassword123!@FREEPDB1
 ```
 
 ---
@@ -352,6 +357,7 @@ pip list
 # plotly>=5.17.0
 # requests>=2.31.0
 # python-dotenv>=1.0.0
+# cryptography>=41.0.0
 ```
 
 ### Step 4: Configure Python Application
@@ -362,12 +368,15 @@ cd /path/to/HCC-CompAdvisor/python
 
 # Create .env file
 cat > .env << 'EOF'
-# Oracle Database Connection
-ORACLE_HOST=localhost
-ORACLE_PORT=1521
-ORACLE_SERVICE=FREEPDB1
-ORACLE_USER=COMPRESSION_MGR
-ORACLE_PASSWORD=YourPassword123!
+# Central Database Connection
+CENTRAL_DB_HOST=localhost
+CENTRAL_DB_PORT=1521
+CENTRAL_DB_SERVICE=FREEPDB1
+CENTRAL_DB_USER=COMPRESSION_MGR
+CENTRAL_DB_PASSWORD=YourPassword123!
+
+# Encryption Key (for stored target database passwords)
+ENCRYPTION_KEY=your-fernet-key-here
 
 # ORDS Configuration (Optional)
 ORDS_BASE_URL=http://localhost:8080/ords
@@ -714,18 +723,22 @@ WHERE recommendation_date > SYSDATE - 1;
 # Open browser to dashboard
 open https://localhost:8501
 
-# Navigate through all pages:
+# Navigate through all 7 pages:
 # 1. Analysis page - trigger analysis
 # 2. Recommendations page - view results
 # 3. Execution page - test dry-run mode
 # 4. History page - check execution log
 # 5. Strategies page - compare strategies
+# 6. Target DB Manager page - register and manage remote target databases
+# 7. Session Browser page - monitor active database sessions
 
 # Check logs
 tail -f /path/to/HCC-CompAdvisor/python/logs/app.log
 ```
 
-### 3. API Verification (if ORDS configured)
+### 3. API Verification (Optional - if ORDS configured)
+
+ORDS is optional and not required for core dashboard functionality.
 
 ```bash
 # Test ORDS endpoints
@@ -956,11 +969,11 @@ cd /path/to/HCC-CompAdvisor/docker
 docker-compose down -v
 
 # Remove volumes (WARNING: This deletes all data)
-docker volume rm hcc-advisor_oracle-data
-docker volume rm hcc-advisor_streamlit-data
+docker volume rm hcc-advisor_central-data
+docker volume rm hcc-advisor_streamlit-logs
 
 # Remove images (optional)
-docker rmi oracle-23c-free:latest
+docker rmi hcc-central-db:latest
 docker rmi hcc-advisor-dashboard:latest
 ```
 

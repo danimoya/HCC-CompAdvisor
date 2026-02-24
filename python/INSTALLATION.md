@@ -81,6 +81,7 @@ pip list
 - oracledb
 - pandas
 - plotly
+- cryptography
 - requests
 - python-dotenv
 - And 9 more dependencies
@@ -101,22 +102,26 @@ nano .env
 # Authentication - CHANGE THIS!
 DASHBOARD_PASSWORD=YourSecurePassword123!
 
-# Database Connection
-DB_HOST=localhost
-DB_PORT=1521
-DB_SERVICE=XEPDB1
-DB_USER=hcc_advisor
-DB_PASSWORD=your_actual_db_password
+# Central Database Connection (stores all analysis results)
+CENTRAL_DB_HOST=localhost
+CENTRAL_DB_PORT=1521
+CENTRAL_DB_SERVICE=FREEPDB1
+CENTRAL_DB_USER=COMPRESSION_MGR
+CENTRAL_DB_PASSWORD=your_central_db_password
 
-# ORDS REST API
-ORDS_BASE_URL=https://localhost:8443/ords/hcc_advisor
-ORDS_USERNAME=hcc_advisor
-ORDS_PASSWORD=your_actual_ords_password
+# Encryption key for target database password storage
+# Generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+ENCRYPTION_KEY=
 
 # SSL Configuration
 SSL_ENABLED=true
 SSL_CERT_FILE=ssl/cert.pem
 SSL_KEY_FILE=ssl/key.pem
+
+# ORDS REST API (optional - not required for core functionality)
+#ORDS_BASE_URL=https://localhost:8443/ords/compression_mgr
+#ORDS_USERNAME=COMPRESSION_MGR
+#ORDS_PASSWORD=your_ords_password
 ```
 
 #### Step 4: Generate SSL Certificates
@@ -159,38 +164,29 @@ Private Key: /path/to/ssl/key.pem
 ✓ SSL private key found
 
 ============================================================
-Testing Database Connection
+Testing Central Database Connection
 ============================================================
 Host: localhost
 Port: 1521
-Service: XEPDB1
-User: hcc_advisor
+Service: FREEPDB1
+User: COMPRESSION_MGR
 
 ✓ Connection pool initialized
-✓ Database connection successful
+✓ Central database connection successful
 ✓ Oracle Version: Oracle Database 23ai ...
-
-============================================================
-Testing ORDS API Connection
-============================================================
-Base URL: https://localhost:8443/ords/hcc_advisor
-Username: hcc_advisor
-
-✓ ORDS API connection successful
-✓ Strategies endpoint working (4 strategies)
-✓ Statistics endpoint working
 
 ============================================================
 Test Summary
 ============================================================
 SSL Configuration: ✓ PASS
 Database Connection: ✓ PASS
-ORDS API Connection: ✓ PASS
 
 ✓ All tests passed! Ready to start the dashboard.
 
 Run: ./start.sh
 ```
+
+> **Note:** ORDS API is optional. If configured, ORDS connectivity will also be tested.
 
 #### Step 6: Start Application
 
@@ -236,75 +232,51 @@ http://localhost:8501
 
 ## 🔧 Configuration Details
 
-### Database Configuration
+### Central Database Configuration
 
-Ensure the HCC Advisor schema is installed:
+The central Oracle 23c Free database stores all analysis results, strategies, and target database registrations. When using Docker, the schema is created automatically. For manual setup:
 
 ```bash
-# Navigate to SQL directory
-cd ../sql
+# Navigate to central SQL directory
+cd ../sql/central
 
-# Connect to database
-sqlplus sys/password@XEPDB1 as sysdba
+# Connect to central database
+sqlplus sys/password@FREEPDB1 as sysdba
 
-# Run installation
-@install_all.sql
+# Run central schema creation
+@01_central_schema.sql
+
+# Seed default strategies
+@02_seed_strategies.sql
 ```
 
 **Verify installation:**
 
 ```sql
--- Connect as hcc_advisor
-CONNECT hcc_advisor/password@XEPDB1
+-- Connect as COMPRESSION_MGR
+CONNECT COMPRESSION_MGR/password@FREEPDB1
 
 -- Check tables
-SELECT table_name FROM user_tables;
+SELECT table_name FROM user_tables ORDER BY table_name;
 
 -- Should show:
--- HCC_ANALYSIS_RUNS
--- HCC_COMPRESSION_CANDIDATES
--- HCC_EXECUTION_LOG
--- HCC_STRATEGIES
+-- T_ADVISOR_RUN
+-- T_COMPRESSION_ANALYSIS
+-- T_COMPRESSION_HISTORY
+-- T_COMPRESSION_STRATEGIES
+-- T_INDEX_COMPRESSION_ANALYSIS
+-- T_LOB_COMPRESSION_ANALYSIS
+-- T_STRATEGY_RULES
+-- T_TARGET_DATABASES
 ```
 
-### ORDS Configuration
+### Target Database Registration
 
-Verify ORDS is configured:
+Target Oracle databases are registered through the dashboard's **Target Database Manager** (page 6). No manual configuration is needed — simply provide the host, port, service name, and credentials through the UI.
 
-```bash
-# Test ORDS health endpoint
-curl -k -u hcc_advisor:password \
-  https://localhost:8443/ords/hcc_advisor/health
+### ORDS Configuration (Optional)
 
-# Expected response:
-# {"status":"healthy","version":"1.0"}
-```
-
-**Check ORDS modules:**
-
-```sql
--- Connect as hcc_advisor
-CONNECT hcc_advisor/password@XEPDB1
-
--- List modules
-SELECT module_name, uri_prefix, status
-FROM user_ords_modules;
-
--- Expected:
--- hcc.advisor  /hcc_advisor  PUBLISHED
-```
-
-**Verify endpoints:**
-
-```bash
-# Test strategies endpoint
-curl -k -u hcc_advisor:password \
-  https://localhost:8443/ords/hcc_advisor/strategies
-
-# Test statistics endpoint
-curl -k -u hcc_advisor:password \
-  https://localhost:8443/ords/hcc_advisor/statistics/compression
-```
+ORDS is **not required** for core functionality. All analysis and data retrieval uses direct `oracledb` connections. If you wish to use ORDS, configure it separately.
 
 ### Network Configuration
 
@@ -499,9 +471,9 @@ After installation, verify:
 1. **Application starts:** No errors in console
 2. **URL accessible:** Can open in browser
 3. **Login works:** Can authenticate
-4. **Database connected:** Green checkmark in sidebar
-5. **API connected:** Green checkmark in sidebar
-6. **Pages load:** All 6 pages accessible
+4. **Central DB connected:** Green checkmark in sidebar
+5. **Pages load:** All 7 pages accessible
+6. **Target DB registered:** Can add target databases via Connection Manager
 7. **Charts render:** Visualizations display
 8. **Export works:** Can download CSV/Excel
 
@@ -548,18 +520,14 @@ echo 'export LD_LIBRARY_PATH=/opt/oracle/instantclient_21_9:$LD_LIBRARY_PATH' >>
 ### Connection Test Fails
 
 ```bash
-# Test database directly
-sqlplus hcc_advisor/password@localhost:1521/XEPDB1
-
-# Test ORDS directly
-curl -k -u hcc_advisor:password \
-  https://localhost:8443/ords/hcc_advisor/health
+# Test central database directly
+sqlplus COMPRESSION_MGR/password@localhost:1521/FREEPDB1
 
 # Check listener
 lsnrctl status
 
-# Check ORDS
-ps aux | grep ords
+# Check Docker container health
+docker inspect --format='{{.State.Health.Status}}' hcc-central-db
 ```
 
 ### SSL Certificate Issues
