@@ -182,3 +182,22 @@ def get_error_logs(lines: int = 50) -> str:
         return f"Error reading logs: {e}"
 
     return "No error logs available"
+
+
+def clear_logs() -> str:
+    """
+    Clear all log files in the log directory.
+
+    Returns:
+        Status message
+    """
+    try:
+        cleared = 0
+        for log_file in LOG_DIR.glob("hcc_advisor_*.log"):
+            log_file.unlink()
+            cleared += 1
+        if cleared > 0:
+            return f"Cleared {cleared} log file(s)"
+        return "No log files to clear"
+    except Exception as e:
+        return f"Error clearing logs: {e}"

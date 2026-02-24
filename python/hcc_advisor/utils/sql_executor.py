@@ -10,7 +10,7 @@ from typing import List, Tuple, Callable, Optional, Union
 
 # SQL*Plus directives to strip (case-insensitive, line-level)
 _SQLPLUS_DIRECTIVES = re.compile(
-    r'^\s*(SET\s+|PROMPT\s|SPOOL\s|@@|WHENEVER\s|EXIT\b|QUIT\b|DEFINE\s|ACCEPT\s|COLUMN\s|SHOW\s|HOST\s)',
+    r'^\s*(SET\s+|PROMPT\b|SPOOL\s|@@|WHENEVER\s|EXIT\b|QUIT\b|DEFINE\s|ACCEPT\s|COLUMN\s|SHOW\s|HOST\s)',
     re.IGNORECASE
 )
 

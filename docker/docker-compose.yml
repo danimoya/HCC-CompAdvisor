@@ -85,6 +85,59 @@ services:
     networks:
       - hcc-network
 
+  # Target Oracle Database (test instance with ~1GB sample data)
+  target-db:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hcc-target-db
+    hostname: target-db
+    restart: unless-stopped
+
+    ports:
+      - "1522:1521"
+
+    env_file:
+      - .env
+
+    environment:
+      - ORACLE_PWD=${ORACLE_PWD:-Welcome123}
+      - ORACLE_CHARACTERSET=AL32UTF8
+      - ENABLE_ARCHIVELOG=false
+      - ENABLE_FORCE_LOGGING=false
+      - COMPRESSION_USER=${COMPRESSION_USER:-COMPRESSION_MGR}
+      - COMPRESSION_PWD=${COMPRESSION_PWD:-Compress123}
+
+      # Smaller SGA for test instance
+      - INIT_SGA_SIZE=1024
+      - INIT_PGA_SIZE=512
+
+    volumes:
+      - target-data:/opt/oracle/oradata
+      - ./init-scripts-target:/opt/oracle/scripts/setup
+      - ./logs:/opt/oracle/oradata/logs
+
+    shm_size: 1gb
+
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 2G
+
+    healthcheck:
+      test: ["CMD", "/opt/oracle/checkDBStatus.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+    networks:
+      - hcc-network
+
   # Streamlit Dashboard
   streamlit-dashboard:
     build:
@@ -126,6 +179,8 @@ services:
     # Volume mounts
     volumes:
       - streamlit-logs:/app/logs
+      # Central schema SQL files for deployment wizard
+      - ../sql/central:/app/hcc_advisor/sql/central:ro
 
     # Depends on Central Database
     depends_on:
@@ -148,6 +203,9 @@ services:
 # Named volumes for data persistence
 volumes:
   central-data:
+    driver: local
+
+  target-data:
     driver: local
 
   streamlit-logs:

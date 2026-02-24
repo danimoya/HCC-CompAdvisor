@@ -9,6 +9,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application package
 COPY hcc_advisor/ ./hcc_advisor/
 
+# Ensure hcc_advisor is importable as a package
+ENV PYTHONPATH=/app
+
 # Create logs directory
 RUN mkdir -p logs
 

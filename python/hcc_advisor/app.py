@@ -14,7 +14,8 @@ _needs_upgrade = False
 if not _needs_setup and config.CENTRAL_DB_PASSWORD:
     if not st.session_state.get('setup_complete'):
         _schema_ver = config.get_schema_version()
-        _needs_upgrade = (_schema_ver is None) or (_schema_ver != __version__)
+        _schema_deployed = config.is_schema_deployed()
+        _needs_upgrade = (not _schema_deployed) or (_schema_ver is None) or (_schema_ver != __version__)
 
 if (_needs_setup or _needs_upgrade) and not st.session_state.get('setup_complete'):
     from hcc_advisor.views.page_00_setup import show_deployment_page
@@ -26,7 +27,7 @@ from streamlit_option_menu import option_menu
 from hcc_advisor.auth import AuthManager, render_logout_button
 from hcc_advisor.utils.central_connector import CentralConnector
 from hcc_advisor.utils.central_queries import CentralQueries
-from hcc_advisor.utils.logger import get_recent_logs, get_error_logs
+from hcc_advisor.utils.logger import get_recent_logs, get_error_logs, clear_logs
 
 # Page configuration
 st.set_page_config(
@@ -509,8 +510,15 @@ def show_dashboard():
                 key="log_lines_input"
             )
         with col3:
-            if st.button("Refresh Logs", key="refresh_logs_btn"):
-                st.rerun()
+            btn_col1, btn_col2 = st.columns(2)
+            with btn_col1:
+                if st.button("Refresh Logs", key="refresh_logs_btn", use_container_width=True):
+                    st.rerun()
+            with btn_col2:
+                if st.button("Clear Logs", key="clear_logs_btn", use_container_width=True, type="secondary"):
+                    result = clear_logs()
+                    st.toast(result)
+                    st.rerun()
 
         # Fetch and display logs
         if log_type == "Error Logs":

@@ -87,7 +87,7 @@ def show_connections_page():
                         border-left: 4px solid green;">
                 <span style="color: #888; font-size: 12px;">ACTIVE TARGET DATABASE</span>
                 <h3 style="margin: 5px 0; color: white;">{active.get('display_name', 'N/A')}</h3>
-                <code style="color: #4fc3f7;">{active.get('username', '')}@{active.get('host', '')}:{active.get('port', '')}/{active.get('service_name', '')}</code>
+                <code style="color: #4fc3f7;">{active.get('username', '')}@{active.get('db_host', '')}:{active.get('port', '')}/{active.get('service_name', '')}</code>
             </div>
             """, unsafe_allow_html=True)
 
@@ -122,7 +122,7 @@ def show_connections_page():
                         st.markdown(f"""
                         | Property | Value |
                         |----------|-------|
-                        | **Host** | `{db.get('host', 'N/A')}` |
+                        | **Host** | `{db.get('db_host', 'N/A')}` |
                         | **Port** | `{db.get('port', 'N/A')}` |
                         | **Service** | `{db.get('service_name', 'N/A')}` |
                         | **Username** | `{db.get('username', 'N/A')}` |
@@ -139,7 +139,7 @@ def show_connections_page():
                         if st.button("Test", key=f"test_{db_id}", use_container_width=True):
                             pwd = decrypt_password(db.get('password_encrypted', ''))
                             conn = {
-                                'host': db.get('host'),
+                                'host': db.get('db_host'),
                                 'port': int(db.get('port', 1521)),
                                 'service': db.get('service_name'),
                                 'username': db.get('username'),
@@ -208,7 +208,7 @@ def show_connections_page():
                         db_data = {
                             'database_name': db_name,
                             'display_name': display_name,
-                            'host': host,
+                            'db_host': host,
                             'port': port,
                             'service_name': service,
                             'username': username,

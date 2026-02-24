@@ -1521,7 +1521,7 @@ class CentralQueries:
                 database_id,
                 database_name,
                 display_name,
-                host,
+                db_host,
                 port,
                 service_name,
                 username,
@@ -1566,7 +1566,13 @@ class CentralQueries:
         try:
             df = CentralConnector.execute_query(query, {'database_id': database_id})
             if not df.empty:
-                return df.iloc[0].to_dict()
+                row = {k.lower(): v for k, v in df.iloc[0].to_dict().items()}
+                # Map db_host -> host for connector compatibility
+                if 'db_host' in row:
+                    row['host'] = row['db_host']
+                if 'service_name' in row:
+                    row['service'] = row['service_name']
+                return row
         except Exception as e:
             log_error(e, "get_target_database", {'database_id': database_id})
 
@@ -1579,7 +1585,7 @@ class CentralQueries:
 
         Args:
             db_data: Dictionary with database connection details:
-                - database_name, display_name, host, port, service_name,
+                - database_name, display_name, db_host, port, service_name,
                   username, password_encrypted, description, environment,
                   platform_type
 
@@ -1588,13 +1594,13 @@ class CentralQueries:
         """
         insert_query = """
             INSERT INTO t_target_databases (
-                database_name, display_name, host, port, service_name,
+                database_name, display_name, db_host, port, service_name,
                 username, password_encrypted, description, environment,
-                platform_type, is_active, created_date, created_by
+                platform_type, oracle_version, is_active, created_date, created_by
             ) VALUES (
-                :database_name, :display_name, :host, :port, :service_name,
+                :database_name, :display_name, :db_host, :port, :service_name,
                 :username, :password_encrypted, :description, :environment,
-                :platform_type, 'Y', SYSDATE, USER
+                :platform_type, :oracle_version, 'Y', SYSDATE, USER
             )
         """
 
@@ -1633,7 +1639,7 @@ class CentralQueries:
         query = """
             UPDATE t_target_databases SET
                 display_name = :display_name,
-                host = :host,
+                db_host = :db_host,
                 port = :port,
                 service_name = :service_name,
                 username = :username,

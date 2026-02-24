@@ -63,7 +63,7 @@ CREATE TABLE T_TARGET_DATABASES (
     -- Database Connection Details
     DATABASE_NAME           VARCHAR2(100) NOT NULL,
     DISPLAY_NAME            VARCHAR2(200),
-    HOST                    VARCHAR2(255) NOT NULL,
+    DB_HOST                 VARCHAR2(255) NOT NULL,
     PORT                    NUMBER DEFAULT 1521,
     SERVICE_NAME            VARCHAR2(128) NOT NULL,
     USERNAME                VARCHAR2(128) NOT NULL,
@@ -103,7 +103,7 @@ COMMENT ON COLUMN T_TARGET_DATABASES.PLATFORM_TYPE IS 'Oracle platform type: STA
 -- Indexes for T_TARGET_DATABASES
 CREATE INDEX IDX_TARGET_DB_ENVIRONMENT ON T_TARGET_DATABASES(ENVIRONMENT);
 CREATE INDEX IDX_TARGET_DB_ACTIVE ON T_TARGET_DATABASES(IS_ACTIVE);
-CREATE INDEX IDX_TARGET_DB_HOST ON T_TARGET_DATABASES(HOST, PORT);
+CREATE INDEX IDX_TARGET_DB_HOST ON T_TARGET_DATABASES(DB_HOST, PORT);
 
 -- ============================================================================
 -- SECTION 2: STRATEGY CONFIGURATION TABLES (Global - shared across databases)
@@ -367,9 +367,7 @@ CREATE INDEX IDX_COMP_ANALYSIS_RUN ON T_COMPRESSION_ANALYSIS(
 CREATE INDEX IDX_COMP_ANALYSIS_RECOMMENDATION ON T_COMPRESSION_ANALYSIS(
     ADVISABLE_COMPRESSION
 );
-CREATE BITMAP INDEX IDX_COMP_ANALYSIS_TYPE_BMP ON T_COMPRESSION_ANALYSIS(
-    ADVISABLE_COMPRESSION
-);
+-- Removed: redundant bitmap index on ADVISABLE_COMPRESSION (already has B-tree index above)
 -- Removed: HOTNESS_CATEGORY is a virtual generated column and cannot be indexed in Oracle
 -- Filtering by hotness_category should use HOTNESS_SCORE ranges via views instead
 -- ----------------------------------------------------------------------------
@@ -645,9 +643,10 @@ CREATE TABLE T_COMPRESSION_HISTORY (
 COMMENT ON TABLE T_COMPRESSION_HISTORY IS 'Complete audit trail of compression execution operations (centralized, per-database)';
 COMMENT ON COLUMN T_COMPRESSION_HISTORY.DATABASE_ID IS 'Reference to the target database this history belongs to';
 -- Indexes
+-- Oracle allows multiple NULLs in unique indexes, so no WHERE clause needed
 CREATE UNIQUE INDEX UNQ_HISTORY_EXECUTION ON T_COMPRESSION_HISTORY(
     EXECUTION_ID
-) WHERE EXECUTION_ID IS NOT NULL;
+);
 CREATE INDEX IDX_HISTORY_DB ON T_COMPRESSION_HISTORY(
     DATABASE_ID
 );

@@ -179,18 +179,18 @@ def register_target_database(
 
     insert_sql = """
         INSERT INTO t_target_databases (
-            database_name, display_name, host, port, service_name,
+            database_name, display_name, db_host, port, service_name,
             username, password_encrypted, description, environment,
             platform_type, is_active, created_date, created_by
         ) VALUES (
-            :database_name, :display_name, :host, :port, :service_name,
+            :database_name, :display_name, :db_host, :port, :service_name,
             :username, :password_encrypted, :description, :environment,
             :platform_type, 'Y', SYSDATE, USER
         )
     """
     params = {
         "database_name": db_name, "display_name": args.name,
-        "host": args.host, "port": args.port, "service_name": args.service,
+        "db_host": args.host, "port": args.port, "service_name": args.service,
         "username": args.username, "password_encrypted": enc_pwd,
         "description": args.description or f"Migrated from {args.host}:{args.port}/{args.service}",
         "environment": args.environment, "platform_type": args.platform,

@@ -180,13 +180,17 @@ class Config:
 
     @classmethod
     def is_schema_deployed(cls) -> bool:
-        """Check if the central schema is deployed by testing for T_TARGET_DATABASES."""
+        """Check if the central schema is deployed and has correct structure."""
         try:
             import oracledb
             dsn = cls.get_central_db_dsn()
             conn = oracledb.connect(user=cls.CENTRAL_DB_USER, password=cls.CENTRAL_DB_PASSWORD, dsn=dsn)
             cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM user_tables WHERE table_name = 'T_TARGET_DATABASES'")
+            # Verify table exists AND has the DB_HOST column (renamed from HOST in 2.0.0)
+            cur.execute("""
+                SELECT COUNT(*) FROM user_tab_columns
+                WHERE table_name = 'T_TARGET_DATABASES' AND column_name = 'DB_HOST'
+            """)
             count = cur.fetchone()[0]
             cur.close()
             conn.close()
