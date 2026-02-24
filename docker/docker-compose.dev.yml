@@ -1,35 +1,22 @@
 version: '3.8'
 
-# =============================================================================
-# HCC Compression Advisor - Centralized Server Deployment
-# =============================================================================
-# Central server architecture: Oracle 23c Free stores analysis results from
-# all target databases. Target Oracle databases are remote and registered
-# through the dashboard UI.
-#
-# Usage:
-#   docker compose up -d
-#
-# For local development with bundled target DB, use:
-#   docker compose -f docker-compose.dev.yml up -d
-# =============================================================================
-
 services:
-  # Central Oracle Database (metadata store for all target DB results)
-  central-db:
+  # Oracle Database 23c Free Edition
+  oracle-db:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: hcc-central-db
-    hostname: central-db
+    container_name: hcc-oracle-23c
+    hostname: oracle-db
     restart: unless-stopped
 
     # Port mappings
     ports:
       - "1521:1521"   # Oracle Database listener
       - "5500:5500"   # Oracle Enterprise Manager Express
+      - "8081:8080"   # ORDS (Oracle REST Data Services)
 
-    # Environment variables
+    # Environment variables from .env file
     env_file:
       - .env
 
@@ -40,10 +27,13 @@ services:
       - ENABLE_ARCHIVELOG=false
       - ENABLE_FORCE_LOGGING=false
 
-      # Compression Advisor central user
+      # Compression Advisor configuration
       - COMPRESSION_USER=${COMPRESSION_USER:-COMPRESSION_MGR}
       - COMPRESSION_PWD=${COMPRESSION_PWD:-Compress123}
       - COMPRESSION_TS=${COMPRESSION_TS:-SCRATCH_TS}
+
+      # ORDS configuration
+      - ORDS_PWD=${ORDS_PWD:-Welcome123}
 
       # Performance tuning
       - INIT_SGA_SIZE=2048
@@ -52,16 +42,19 @@ services:
     # Volume mounts for persistence
     volumes:
       # Persistent database files
-      - central-data:/opt/oracle/oradata
+      - oracle-data:/opt/oracle/oradata
 
-      # Central DB initialization scripts
-      - ./init-scripts-central:/opt/oracle/scripts/startup
+      # Initialization scripts (auto-run on first startup)
+      - ./init-scripts:/opt/oracle/scripts/startup
 
-      # Central schema SQL files
-      - ../sql/central:/opt/oracle/compression_advisor/central:ro
+      # Compression Advisor installation files
+      - ../install:/opt/oracle/compression_advisor/install:ro
 
       # Diagnostic logs
       - ./logs:/opt/oracle/oradata/logs
+
+      # Custom SQL scripts
+      - ./custom-scripts:/opt/oracle/scripts/custom:ro
 
     # Shared memory configuration for Oracle SGA
     shm_size: 2gb
@@ -87,11 +80,9 @@ services:
     networks:
       - hcc-network
 
-  # Streamlit Dashboard
+  # Streamlit Dashboard (optional - for testing)
   streamlit-dashboard:
-    build:
-      context: ../python
-      dockerfile: Dockerfile
+    image: python:3.11-slim
     container_name: hcc-streamlit
     hostname: streamlit
     restart: unless-stopped
@@ -102,43 +93,38 @@ services:
 
     # Environment variables
     environment:
-      # Central DB connection
-      - CENTRAL_DB_HOST=central-db
-      - CENTRAL_DB_PORT=1521
-      - CENTRAL_DB_SERVICE=FREEPDB1
-      - CENTRAL_DB_USER=${COMPRESSION_USER:-COMPRESSION_MGR}
-      - CENTRAL_DB_PASSWORD=${COMPRESSION_PWD:-Compress123}
-
-      # Legacy DB vars (fallback, point to central)
-      - DB_HOST=central-db
-      - DB_PORT=1521
-      - DB_SERVICE=FREEPDB1
-      - DB_USER=${COMPRESSION_USER:-COMPRESSION_MGR}
-      - DB_PASSWORD=${COMPRESSION_PWD:-Compress123}
-
-      # Encryption key for target DB passwords
-      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-}
-
-      # Dashboard authentication
-      - DASHBOARD_PASSWORD=${DASHBOARD_PASSWORD:-Dashboard123!}
-
-      # SSL disabled in Docker
-      - SSL_ENABLED=false
+      - ORACLE_HOST=oracle-db
+      - ORACLE_PORT=1521
+      - ORACLE_SERVICE=FREEPDB1
+      - ORACLE_USER=${COMPRESSION_USER:-COMPRESSION_MGR}
+      - ORACLE_PASSWORD=${COMPRESSION_PWD:-Compress123}
+      - STREAMLIT_PASSWORD=${STREAMLIT_PASSWORD:-Dashboard123}
 
     # Volume mounts
     volumes:
-      - streamlit-logs:/app/logs
+      - ../dashboard:/app:ro
+      - ./streamlit-logs:/logs
 
-    # Depends on Central Database
+    # Working directory
+    working_dir: /app
+
+    # Install dependencies and run Streamlit
+    command: >
+      bash -c "
+        pip install --no-cache-dir -r requirements.txt &&
+        streamlit run app.py --server.port=8501 --server.address=0.0.0.0
+      "
+
+    # Depends on Oracle Database
     depends_on:
-      central-db:
+      oracle-db:
         condition: service_healthy
 
     # Resource limits
     deploy:
       resources:
         limits:
-          cpus: '2'
+          cpus: '1'
           memory: 1G
         reservations:
           cpus: '0.5'
@@ -149,15 +135,12 @@ services:
 
 # Named volumes for data persistence
 volumes:
-  central-data:
+  oracle-data:
     driver: local
     driver_opts:
       type: none
       o: bind
       device: ./data
-
-  streamlit-logs:
-    driver: local
 
 # Custom network for container communication
 networks:

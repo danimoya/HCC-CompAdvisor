@@ -6,7 +6,8 @@ Execute compression recommendations
 import streamlit as st
 import pandas as pd
 import time
-from utils.db_queries import CompressionQueries
+from utils.central_queries import CentralQueries
+from utils.target_queries import TargetQueries
 from config import config
 
 
@@ -35,8 +36,10 @@ def show_single_execution():
 
     st.subheader("Execute Single Table Compression")
 
-    # Fetch recommendations using direct database query
-    df = CompressionQueries.get_recommendations(limit=100, min_savings_pct=10.0)
+    db_id = st.session_state.get('active_database_id')
+
+    # Fetch recommendations using central database query
+    df = CentralQueries.get_recommendations(limit=100, min_savings_pct=10.0, database_id=db_id)
 
     if df.empty:
         st.warning("No recommendations available. Run an analysis first.")
@@ -131,7 +134,7 @@ def show_single_execution():
     table_name = selected_row['table_name']
     partition_name = selected_row.get('partition_name')
 
-    ddl = CompressionQueries.generate_ddl(owner, table_name, recommended_strategy, partition_name)
+    ddl = TargetQueries.generate_ddl(owner, table_name, recommended_strategy, partition_name)
     st.code(ddl, language="sql")
 
     # Execute button
@@ -150,27 +153,32 @@ def show_single_execution():
         )
 
     if execute_button:
-        analysis_id = selected_row.get('recommendation_id')
-        if analysis_id:
-            with st.spinner("Executing compression..."):
-                result = CompressionQueries.execute_compression(
-                    analysis_id=int(analysis_id),
-                    dry_run=dry_run,
-                    parallel_degree=parallel_degree
-                )
-
-                if result.get('error'):
-                    st.error(f"Execution failed: {result['error']}")
-                elif result.get('dry_run'):
-                    st.success("DDL generated successfully (dry run)")
-                    st.code(result.get('ddl', ''), language='sql')
-                elif result.get('success'):
-                    st.success(f"Execution started! ID: {result.get('execution_id')}")
-                    st.session_state.last_execution_id = result.get('execution_id')
-                else:
-                    st.warning("Execution completed with unknown result")
+        if not db_id:
+            st.error("Select a target database from the sidebar first.")
         else:
-            st.error("No valid recommendation ID found")
+            analysis_id = selected_row.get('recommendation_id')
+            if analysis_id:
+                with st.spinner("Executing compression..."):
+                    result = TargetQueries.execute_compression(
+                        db_id,
+                        owner=owner,
+                        table_name=table_name,
+                        compression_type=recommended_strategy,
+                        dry_run=dry_run
+                    )
+
+                    if result.get('error'):
+                        st.error(f"Execution failed: {result['error']}")
+                    elif result.get('dry_run'):
+                        st.success("DDL generated successfully (dry run)")
+                        st.code(result.get('ddl', ''), language='sql')
+                    elif result.get('success'):
+                        st.success(f"Execution started! ID: {result.get('execution_id')}")
+                        st.session_state.last_execution_id = result.get('execution_id')
+                    else:
+                        st.warning("Execution completed with unknown result")
+            else:
+                st.error("No valid recommendation ID found")
 
 
 def show_batch_execution():
@@ -178,8 +186,10 @@ def show_batch_execution():
 
     st.subheader("Batch Compression Execution")
 
-    # Fetch recommendations using direct database query
-    df = CompressionQueries.get_recommendations(limit=100, min_savings_pct=10.0)
+    db_id = st.session_state.get('active_database_id')
+
+    # Fetch recommendations using central database query
+    df = CentralQueries.get_recommendations(limit=100, min_savings_pct=10.0, database_id=db_id)
 
     if df.empty:
         st.warning("No recommendations available. Run an analysis first.")
@@ -240,22 +250,28 @@ def show_batch_execution():
 
         with col2:
             if st.button("Execute Batch", use_container_width=True):
-                with st.spinner(f"Executing {len(selected_tables)} compressions..."):
-                    result = CompressionQueries.batch_execute(
-                        analysis_ids=selected_tables,
-                        dry_run=batch_dry_run,
-                        parallel_degree=batch_parallel
-                    )
+                if not db_id:
+                    st.error("Select a target database from the sidebar first.")
+                else:
+                    with st.spinner(f"Executing {len(selected_tables)} compressions..."):
+                        result = TargetQueries.batch_execute(
+                            db_id,
+                            analysis_ids=selected_tables,
+                            dry_run=batch_dry_run,
+                            parallel_degree=batch_parallel
+                        )
 
-                    if result.get('errors', 0) > 0:
-                        st.warning(f"Batch completed with {result.get('errors')} errors")
-                    st.success(f"Batch execution: {result.get('success', 0)} success, {result.get('errors', 0)} errors")
+                        if result.get('errors', 0) > 0:
+                            st.warning(f"Batch completed with {result.get('errors')} errors")
+                        st.success(f"Batch execution: {result.get('success', 0)} success, {result.get('errors', 0)} errors")
 
 
 def show_execution_monitor():
     """Show execution monitoring interface with auto-refresh"""
 
     st.subheader("Operation Monitor")
+
+    db_id = st.session_state.get('active_database_id')
 
     # Auto-refresh toggle
     col1, col2, col3 = st.columns([1, 1, 2])
@@ -278,7 +294,7 @@ def show_execution_monitor():
     # Running Operations Section
     st.markdown("### 🔄 Running Operations")
 
-    running_ops = CompressionQueries.get_running_operations()
+    running_ops = CentralQueries.get_running_operations(database_id=db_id)
 
     if not running_ops.empty:
         running_ops.columns = [c.lower() for c in running_ops.columns]
@@ -312,7 +328,7 @@ def show_execution_monitor():
 
                 # Get more details
                 if st.button(f"View Details", key=f"detail_{op_type}_{op_id}"):
-                    details = CompressionQueries.get_operation_progress(op_type, int(op_id))
+                    details = CentralQueries.get_operation_progress(op_type, int(op_id))
                     if details:
                         st.json(details)
     else:
@@ -322,7 +338,7 @@ def show_execution_monitor():
     st.markdown("---")
     st.markdown("### ⏳ Long-Running Database Operations")
 
-    long_ops = CompressionQueries.get_long_operations()
+    long_ops = TargetQueries.get_long_operations(db_id) if db_id else pd.DataFrame()
 
     if not long_ops.empty:
         long_ops.columns = [c.lower() for c in long_ops.columns]
@@ -354,7 +370,7 @@ def show_execution_monitor():
     # Recent Operations Section
     st.markdown("### 📋 Recent Operations")
 
-    recent_ops = CompressionQueries.get_recent_operations(limit=15)
+    recent_ops = CentralQueries.get_recent_operations(limit=15, database_id=db_id)
 
     if not recent_ops.empty:
         recent_ops.columns = [c.lower() for c in recent_ops.columns]

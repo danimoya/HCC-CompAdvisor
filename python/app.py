@@ -7,8 +7,8 @@ import streamlit as st
 from streamlit_option_menu import option_menu
 from auth import AuthManager, render_logout_button
 from config import config
-from utils.db_connector import get_db_connector
-from utils.db_queries import CompressionQueries
+from utils.central_connector import CentralConnector
+from utils.central_queries import CentralQueries
 from utils.logger import get_recent_logs, get_error_logs
 
 # Page configuration
@@ -190,18 +190,22 @@ def main():
     # Require authentication
     AuthManager.require_authentication()
 
-    # Initialize DB connector
-    db_connector = get_db_connector()
+    # Initialize Central DB connector
+    try:
+        CentralConnector.initialize_pool()
+    except Exception as e:
+        st.error(f"Failed to connect to central database: {e}")
 
     # Handle session state navigation (from buttons on other pages)
     default_page_index = 0
     if 'selected_page' in st.session_state and st.session_state.selected_page:
         page_mapping = {
             "Overview": 0, "Run Analysis": 1, "View Recommendations": 2,
-            "Compress Tables": 3, "Execution History": 4, "Compression Rules": 5, "DB Connections": 6,
+            "Compress Tables": 3, "Execution History": 4, "Session Browser": 5,
+            "Compression Rules": 6, "DB Connections": 7,
             # Legacy mappings for compatibility
             "Dashboard": 0, "Analysis": 1, "Recommendations": 2,
-            "Execution": 3, "History": 4, "Strategies": 5, "Connections": 6
+            "Execution": 3, "History": 4, "Sessions": 5, "Strategies": 6, "Connections": 7
         }
         default_page_index = page_mapping.get(st.session_state.selected_page, 0)
         st.session_state.selected_page = None  # Clear after use
@@ -219,6 +223,7 @@ def main():
                 "View Recommendations",
                 "Compress Tables",
                 "Execution History",
+                "Session Browser",
                 "Compression Rules",
                 "DB Connections"
             ],
@@ -228,6 +233,7 @@ def main():
                 "stars",               # View Recommendations - suggestions
                 "box-arrow-in-down",   # Compress Tables - compression action
                 "journal-text",        # Execution History - log/history
+                "binoculars-fill",     # Session Browser - monitoring
                 "gear-fill",           # Compression Rules - settings/config
                 "plug-fill"            # DB Connections - connectivity
             ],
@@ -247,14 +253,48 @@ def main():
             }
         )
 
+        # Database selector
+        st.markdown("---")
+        st.subheader("Target Database")
+
+        # Initialize session state
+        if 'active_database_id' not in st.session_state:
+            st.session_state.active_database_id = None
+
+        # Fetch registered target databases
+        target_dbs = CentralQueries.get_target_databases()
+
+        if not target_dbs.empty:
+            target_dbs.columns = [c.lower() for c in target_dbs.columns]
+            db_options = {"All Databases": None}
+            for _, db in target_dbs.iterrows():
+                db_options[db.get('display_name', db.get('database_name', 'Unknown'))] = db.get('database_id')
+
+            current_label = "All Databases"
+            for label, db_id in db_options.items():
+                if db_id == st.session_state.active_database_id:
+                    current_label = label
+                    break
+
+            selected_db = st.selectbox(
+                "Active Database",
+                options=list(db_options.keys()),
+                index=list(db_options.keys()).index(current_label),
+                key="db_selector"
+            )
+            st.session_state.active_database_id = db_options[selected_db]
+        else:
+            st.info("No target databases registered")
+            st.session_state.active_database_id = None
+
         # Connection status
         st.markdown("---")
         st.subheader("Connection Status")
 
-        if db_connector.test_connection():
-            st.success("Database Connected")
+        if CentralConnector.test_connection():
+            st.success("Central DB Connected")
         else:
-            st.error("Database Disconnected")
+            st.error("Central DB Disconnected")
 
         # Logout button
         render_logout_button()
@@ -274,6 +314,9 @@ def main():
     elif selected == "Execution History":
         from views.page_04_history import show_history_page
         show_history_page()
+    elif selected == "Session Browser":
+        from views.page_07_sessions import show_sessions_page
+        show_sessions_page()
     elif selected == "Compression Rules":
         from views.page_05_strategies import show_strategies_page
         show_strategies_page()
@@ -289,7 +332,7 @@ def show_dashboard():
     st.markdown("---")
 
     # Fetch statistics using direct database queries
-    stats = CompressionQueries.get_dashboard_summary()
+    stats = CentralQueries.get_dashboard_summary(database_id=st.session_state.get('active_database_id'))
 
     # Top metrics
     col1, col2, col3, col4 = st.columns(4)
@@ -333,7 +376,7 @@ def show_dashboard():
     with col1:
         st.subheader("Savings by Strategy")
 
-        strategy_df = CompressionQueries.get_savings_by_strategy()
+        strategy_df = CentralQueries.get_savings_by_strategy(database_id=st.session_state.get('active_database_id'))
 
         if not strategy_df.empty:
             import plotly.graph_objects as go
@@ -366,7 +409,7 @@ def show_dashboard():
     with col2:
         st.subheader("Recent Executions")
 
-        history_df = CompressionQueries.get_recent_executions(limit=5)
+        history_df = CentralQueries.get_recent_executions(limit=5, database_id=st.session_state.get('active_database_id'))
 
         if not history_df.empty:
             # Handle column name case
