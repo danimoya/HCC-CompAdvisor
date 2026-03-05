@@ -71,6 +71,11 @@ def show_sessions_page():
 def show_long_operations():
     """Display V$SESSION_LONGOPS for compression-related operations"""
 
+    db_id = st.session_state.get('active_database_id')
+    if not db_id:
+        st.warning("No active database selected.")
+        return
+
     st.subheader("Long-Running Operations")
     st.caption("Operations from V$SESSION_LONGOPS related to compression activities")
 
@@ -230,6 +235,11 @@ def show_operation_card(op):
 def show_compression_sessions():
     """Display active sessions running compression operations"""
 
+    db_id = st.session_state.get('active_database_id')
+    if not db_id:
+        st.warning("No active database selected.")
+        return
+
     st.subheader("Active Compression Sessions")
     st.caption("Sessions currently executing compression-related SQL")
 
@@ -309,6 +319,11 @@ def show_session_card(session):
 
 def show_all_active_sessions():
     """Display all active long operations (not just compression)"""
+
+    db_id = st.session_state.get('active_database_id')
+    if not db_id:
+        st.warning("No active database selected.")
+        return
 
     st.subheader("All Active Long Operations")
     st.caption("All operations from V$SESSION_LONGOPS regardless of type")

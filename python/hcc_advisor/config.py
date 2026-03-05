@@ -113,12 +113,10 @@ class Config:
     COMPRESSION_STRATEGIES: list = [
         'BASIC',
         'OLTP',
-        'ADV_LOW',
-        'ADV_HIGH',
         'QUERY LOW',
         'QUERY HIGH',
         'ARCHIVE LOW',
-        'ARCHIVE HIGH'
+        'ARCHIVE HIGH',
     ]
 
     # Chart Colors

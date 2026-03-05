@@ -106,19 +106,10 @@ def show_analysis_config():
 
                         if result.get('success'):
                             run_id = result.get('run_id')
-                            st.success(f"Analysis completed! Run ID: {run_id}")
-                            # Pull results from target and store in central
-                            if run_id:
-                                run_data = TargetQueries.pull_advisor_run(db_id, run_id)
-                                if run_data:
-                                    CentralQueries.store_advisor_run(db_id, run_data)
-                                results_df = TargetQueries.pull_analysis_results(db_id, run_id)
-                                if not results_df.empty:
-                                    CentralQueries.store_analysis_results(db_id, run_id, results_df)
+                            st.success(result.get('message', f"Analysis completed! Run ID: {run_id}"))
                             st.session_state.current_analysis_id = run_id
                         else:
-                            st.warning(result.get('message', 'Analysis procedure not available'))
-                            st.info("Note: The analysis procedure may not be installed. Check the database packages.")
+                            st.error(result.get('message', 'Analysis failed'))
 
     with col2:
         st.subheader("Analysis Parameters")

@@ -384,7 +384,12 @@ class CentralQueries:
                 size_mb - projected_savings_mb as estimated_size_mb,
                 projected_savings_pct as savings_pct,
                 best_ratio as compression_ratio,
+                basic_ratio,
+                oltp_ratio,
+                adv_low_ratio as query_low_ratio,
+                adv_high_ratio as query_high_ratio,
                 hotness_score,
+                hotness_category,
                 recommendation_reason
             FROM t_compression_analysis
             WHERE advisable_compression IS NOT NULL

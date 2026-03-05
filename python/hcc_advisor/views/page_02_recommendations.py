@@ -193,17 +193,53 @@ def show_overview_tab(df: pd.DataFrame):
 
     st.markdown("---")
 
-    # Top recommendations bar chart
-    st.subheader("Top Recommendations by Savings")
+    # Compression Ratios Comparison Chart
+    st.subheader("Compression Ratios by Table")
 
     top_n = st.slider("Show top N tables", min_value=5, max_value=50, value=10, step=5)
 
     if 'savings_pct' in df.columns and 'table_name' in df.columns:
         top_df = df.nlargest(top_n, 'savings_pct')
 
+        # Multi-bar chart showing all compression type ratios per table
         fig = go.Figure()
 
-        fig.add_trace(go.Bar(
+        ratio_cols = [
+            ('basic_ratio', 'BASIC', '#636EFA'),
+            ('oltp_ratio', 'OLTP', '#00CC96'),
+            ('query_low_ratio', 'QUERY LOW', '#EF553B'),
+            ('query_high_ratio', 'QUERY HIGH', '#AB63FA'),
+        ]
+
+        for col, label, color in ratio_cols:
+            if col in top_df.columns:
+                values = top_df[col].fillna(0)
+                if values.sum() > 0:
+                    fig.add_trace(go.Bar(
+                        x=top_df['table_name'],
+                        y=values,
+                        name=label,
+                        marker_color=color,
+                        text=values.round(2),
+                        textposition='auto',
+                        hovertemplate=f'<b>%{{x}}</b><br>{label}: %{{y:.2f}}x<extra></extra>'
+                    ))
+
+        fig.update_layout(
+            xaxis_title="Table Name",
+            yaxis_title="Compression Ratio (higher = better)",
+            height=400,
+            barmode='group',
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Also show savings bar chart
+        st.subheader("Projected Savings")
+
+        fig2 = go.Figure()
+        fig2.add_trace(go.Bar(
             x=top_df['table_name'],
             y=top_df['savings_pct'],
             marker_color=config.CHART_COLORS['success'],
@@ -212,16 +248,16 @@ def show_overview_tab(df: pd.DataFrame):
             hovertemplate='<b>%{x}</b><br>Savings: %{y:.1f}%<extra></extra>'
         ))
 
-        fig.update_layout(
+        fig2.update_layout(
             xaxis_title="Table Name",
             yaxis_title="Savings (%)",
-            height=400,
+            height=300,
             showlegend=False
         )
 
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig2, use_container_width=True)
     else:
-        st.info("Insufficient data for top recommendations chart")
+        st.info("Insufficient data for compression ratio charts")
 
 
 def show_detailed_tab(df: pd.DataFrame):
@@ -236,11 +272,18 @@ def show_detailed_tab(df: pd.DataFrame):
         'table_owner': 'Owner',
         'table_name': 'Table',
         'current_size_mb': 'Current (MB)',
-        'recommended_strategy': 'Strategy',
-        'estimated_size_mb': 'Compressed (MB)',
+        'recommended_strategy': 'Advised',
+        'estimated_size_mb': 'Est. Size (MB)',
         'savings_pct': 'Savings %',
-        'compression_ratio': 'Ratio',
-        'estimated_rows': 'Rows'
+        'basic_ratio': 'BASIC',
+        'oltp_ratio': 'OLTP',
+        'query_low_ratio': 'Q.LOW',
+        'query_high_ratio': 'Q.HIGH',
+        'compression_ratio': 'Best Ratio',
+        'hotness_score': 'Hotness',
+        'hotness_category': 'Heat',
+        'estimated_rows': 'Rows',
+        'recommendation_reason': 'Reason'
     }
 
     # Filter to available columns
@@ -251,14 +294,14 @@ def show_detailed_tab(df: pd.DataFrame):
     display_df.insert(0, 'select', False)
 
     # Format numbers
-    if 'current_size_mb' in display_df.columns:
-        display_df['current_size_mb'] = display_df['current_size_mb'].round(2)
-    if 'estimated_size_mb' in display_df.columns:
-        display_df['estimated_size_mb'] = display_df['estimated_size_mb'].round(2)
+    for col in ['current_size_mb', 'estimated_size_mb']:
+        if col in display_df.columns:
+            display_df[col] = display_df[col].round(2)
     if 'savings_pct' in display_df.columns:
         display_df['savings_pct'] = display_df['savings_pct'].round(1)
-    if 'compression_ratio' in display_df.columns:
-        display_df['compression_ratio'] = display_df['compression_ratio'].round(2)
+    for col in ['compression_ratio', 'basic_ratio', 'oltp_ratio', 'query_low_ratio', 'query_high_ratio']:
+        if col in display_df.columns:
+            display_df[col] = display_df[col].round(2)
 
     # Rename columns for display
     rename_map = {'select': 'Select'}
@@ -278,14 +321,21 @@ def show_detailed_tab(df: pd.DataFrame):
                 width="small"
             ),
             "ID": st.column_config.NumberColumn("ID", width="small"),
-            "Owner": st.column_config.TextColumn("Owner", width="medium"),
+            "Owner": st.column_config.TextColumn("Owner", width="small"),
             "Table": st.column_config.TextColumn("Table", width="medium"),
             "Current (MB)": st.column_config.NumberColumn("Current (MB)", format="%.2f"),
-            "Compressed (MB)": st.column_config.NumberColumn("Compressed (MB)", format="%.2f"),
+            "Advised": st.column_config.TextColumn("Advised", width="small"),
+            "Est. Size (MB)": st.column_config.NumberColumn("Est. Size (MB)", format="%.2f"),
             "Savings %": st.column_config.NumberColumn("Savings %", format="%.1f%%"),
-            "Strategy": st.column_config.TextColumn("Strategy", width="medium"),
-            "Ratio": st.column_config.NumberColumn("Ratio", format="%.2f"),
+            "BASIC": st.column_config.NumberColumn("BASIC", format="%.2fx", help="BASIC compression ratio"),
+            "OLTP": st.column_config.NumberColumn("OLTP", format="%.2fx", help="OLTP/Advanced compression ratio"),
+            "Q.LOW": st.column_config.NumberColumn("Q.LOW", format="%.2fx", help="HCC Query Low ratio (Exadata)"),
+            "Q.HIGH": st.column_config.NumberColumn("Q.HIGH", format="%.2fx", help="HCC Query High ratio (Exadata)"),
+            "Best Ratio": st.column_config.NumberColumn("Best Ratio", format="%.2fx"),
+            "Hotness": st.column_config.NumberColumn("Hotness", format="%.1f", help="DML activity score 0-100"),
+            "Heat": st.column_config.TextColumn("Heat", width="small", help="HOT/WARM/COOL/COLD"),
             "Rows": st.column_config.NumberColumn("Rows", format="%d"),
+            "Reason": st.column_config.TextColumn("Reason", width="large"),
         },
         disabled=[col for col in display_df.columns if col != "Select"],
         key="recommendations_table"
