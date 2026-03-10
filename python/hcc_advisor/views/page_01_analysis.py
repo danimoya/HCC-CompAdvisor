@@ -77,6 +77,12 @@ def show_analysis_config():
                 help="Number of parallel workers for analysis"
             )
 
+            include_partitions = st.checkbox(
+                "Include Partition Analysis",
+                value=False,
+                help="Analyze individual partitions and subpartitions (slower for highly partitioned tables)"
+            )
+
             col_a, col_b = st.columns(2)
 
             with col_a:
@@ -101,7 +107,8 @@ def show_analysis_config():
                             db_id,
                             owner=owner,
                             strategy_id=selected_strategy,
-                            parallel_degree=parallel_degree
+                            parallel_degree=parallel_degree,
+                            include_partitions=include_partitions
                         )
 
                         if result.get('success'):

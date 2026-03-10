@@ -19,12 +19,16 @@ class TargetQueries:
     # ANALYSIS EXECUTION (Python-driven, uses DBMS_COMPRESSION on target, HCC-aware)
     # ============================================================================
 
+    # Maximum partitions to analyze per table (safety cap)
+    MAX_PARTITIONS_PER_TABLE = 50
+
     @staticmethod
     def start_analysis(
         database_id: int,
         owner: Optional[str] = None,
         strategy_id: int = 2,
-        parallel_degree: int = 4
+        parallel_degree: int = 4,
+        include_partitions: bool = False
     ) -> Dict[str, Any]:
         """
         Run compression analysis on target database using DBMS_COMPRESSION directly.
@@ -35,6 +39,7 @@ class TargetQueries:
             owner: Schema owner to analyze (None for all schemas)
             strategy_id: Strategy ID (1=Aggressive, 2=Balanced, 3=Conservative)
             parallel_degree: Number of parallel workers
+            include_partitions: If True, also analyze individual partitions/subpartitions
 
         Returns:
             dict with success, run_id, message
@@ -60,7 +65,8 @@ class TargetQueries:
                 'schema_filter': owner,
                 'strategy_id': strategy_id,
                 'parallel_degree': parallel_degree,
-                'analysis_mode': 'FULL'
+                'analysis_mode': 'FULL',
+                'include_partitions': 'Y' if include_partitions else 'N'
             }
             ok, run_id = CentralQueries.store_advisor_run(database_id, run_data)
             if not ok or not run_id:
@@ -208,6 +214,158 @@ class TargetQueries:
                     ratio_str = ' '.join(f'{k}={v:.2f}x' for k, v in ratios.items() if v and v > 0)
                     log_debug(f"Analyzed {tbl_owner}.{tbl_name}: {ratio_str} rec={recommended}")
 
+                    # --- Partition-level analysis (opt-in) ---
+                    if include_partitions:
+                        partitions = TargetQueries._discover_partitions(database_id, tbl_owner, tbl_name)
+                        if partitions:
+                            if len(partitions) > TargetQueries.MAX_PARTITIONS_PER_TABLE:
+                                log_warning(
+                                    f"{tbl_owner}.{tbl_name} has {len(partitions)} partitions "
+                                    f"(>{TargetQueries.MAX_PARTITIONS_PER_TABLE}), skipping partition-level analysis"
+                                )
+                            else:
+                                log_info(f"Analyzing {len(partitions)} partitions for {tbl_owner}.{tbl_name}")
+                                part_dml = TargetQueries._get_batch_partition_dml_stats(
+                                    database_id, tbl_owner, tbl_name
+                                )
+
+                                for part_info in partitions:
+                                    part_name = part_info['partition_name']
+                                    try:
+                                        part_ratios = TargetQueries._get_compression_ratios(
+                                            database_id, tbl_owner, tbl_name, platform_type,
+                                            partition_name=part_name
+                                        )
+                                        part_dml_info = part_dml.get(part_name, {})
+                                        part_hotness = part_dml_info.get('hotness_score', 0)
+                                        part_recommended = TargetQueries._evaluate_strategy(
+                                            strategy_rules, 'TABLE', part_hotness, part_ratios
+                                        )
+                                        part_ratio_key = TargetQueries._COMP_TYPE_RATIO_KEY.get(part_recommended)
+                                        part_rec_ratio = (part_ratios.get(part_ratio_key) if part_ratio_key else None) or 1
+                                        part_size_mb = part_info.get('size_mb', 0)
+                                        part_rec_size = round(part_size_mb / part_rec_ratio, 2) if part_rec_ratio > 0 else part_size_mb
+                                        part_savings_mb = part_size_mb - part_rec_size
+                                        part_savings_pct = round((part_savings_mb / part_size_mb) * 100, 2) if part_size_mb > 0 else 0
+                                        part_current_comp = part_info.get('compress_for') or part_info.get('compression', 'NONE')
+                                        if part_current_comp in ('DISABLED', None, ''):
+                                            part_current_comp = 'NONE'
+
+                                        part_rationale = TargetQueries._generate_rationale(
+                                            part_size_mb, part_hotness, part_ratios, part_recommended
+                                        )
+
+                                        part_result = {
+                                            'OWNER': tbl_owner,
+                                            'OBJECT_NAME': tbl_name,
+                                            'OBJECT_TYPE': 'PARTITION',
+                                            'PARTITION_NAME': part_name,
+                                            'SUBPARTITION_NAME': None,
+                                            'SIZE_BYTES': part_info.get('size_bytes', 0),
+                                            'ROW_COUNT': part_info.get('num_rows'),
+                                            'BLOCK_COUNT': part_info.get('blocks'),
+                                            'AVG_ROW_LENGTH': None,
+                                            'BASIC_RATIO': part_ratios.get('basic') or 1,
+                                            'OLTP_RATIO': part_ratios.get('oltp') or 1,
+                                            'ADV_LOW_RATIO': part_ratios.get('query_low'),
+                                            'ADV_HIGH_RATIO': part_ratios.get('query_high'),
+                                            'BLKCNT_UNCMP_BASIC': None, 'BLKCNT_CMP_BASIC': None,
+                                            'BLKCNT_UNCMP_OLTP': None, 'BLKCNT_CMP_OLTP': None,
+                                            'BLKCNT_UNCMP_ADV_LOW': None, 'BLKCNT_CMP_ADV_LOW': None,
+                                            'BLKCNT_UNCMP_ADV_HIGH': None, 'BLKCNT_CMP_ADV_HIGH': None,
+                                            'INSERT_COUNT': part_dml_info.get('inserts', 0),
+                                            'UPDATE_COUNT': part_dml_info.get('updates', 0),
+                                            'DELETE_COUNT': part_dml_info.get('deletes', 0),
+                                            'LOGICAL_READS': None, 'PHYSICAL_READS': None,
+                                            'ACCESS_FREQUENCY': None, 'LAST_ACCESS_DATE': None,
+                                            'HOTNESS_SCORE': part_hotness,
+                                            'READ_RATIO': None, 'WRITE_RATIO': None,
+                                            'DML_24H_RATE': None,
+                                            'LAST_ANALYZED': None, 'DATA_AGE_DAYS': None,
+                                            'CURRENT_COMPRESSION': part_current_comp,
+                                            'ADVISABLE_COMPRESSION': part_recommended,
+                                            'RECOMMENDATION_REASON': part_rationale,
+                                            'CONFIDENCE_SCORE': None,
+                                            'PROJECTED_SAVINGS_BYTES': int(part_savings_mb * 1024 * 1024),
+                                            'PROJECTED_SAVINGS_PCT': part_savings_pct,
+                                            'ANALYSIS_DURATION_SEC': None,
+                                            'SAMPLE_SIZE_ROWS': None,
+                                        }
+                                        results.append(part_result)
+                                        tables_analyzed += 1
+                                        log_debug(f"Analyzed partition {tbl_owner}.{tbl_name}.{part_name}: rec={part_recommended}")
+
+                                        # Subpartition analysis for composite partitions
+                                        if part_info.get('composite') == 'YES':
+                                            subparts = TargetQueries._discover_subpartitions(
+                                                database_id, tbl_owner, tbl_name, part_name
+                                            )
+                                            for subpart_info in subparts:
+                                                sub_name = subpart_info['subpartition_name']
+                                                try:
+                                                    sub_ratios = TargetQueries._get_compression_ratios(
+                                                        database_id, tbl_owner, tbl_name, platform_type,
+                                                        partition_name=sub_name
+                                                    )
+                                                    sub_recommended = TargetQueries._evaluate_strategy(
+                                                        strategy_rules, 'TABLE', 0, sub_ratios
+                                                    )
+                                                    sub_ratio_key = TargetQueries._COMP_TYPE_RATIO_KEY.get(sub_recommended)
+                                                    sub_rec_ratio = (sub_ratios.get(sub_ratio_key) if sub_ratio_key else None) or 1
+                                                    sub_size_mb = subpart_info.get('size_mb', 0)
+                                                    sub_rec_size = round(sub_size_mb / sub_rec_ratio, 2) if sub_rec_ratio > 0 else sub_size_mb
+                                                    sub_savings_mb = sub_size_mb - sub_rec_size
+                                                    sub_savings_pct = round((sub_savings_mb / sub_size_mb) * 100, 2) if sub_size_mb > 0 else 0
+                                                    sub_current_comp = subpart_info.get('compress_for') or subpart_info.get('compression', 'NONE')
+                                                    if sub_current_comp in ('DISABLED', None, ''):
+                                                        sub_current_comp = 'NONE'
+
+                                                    sub_result = {
+                                                        'OWNER': tbl_owner,
+                                                        'OBJECT_NAME': tbl_name,
+                                                        'OBJECT_TYPE': 'SUBPARTITION',
+                                                        'PARTITION_NAME': part_name,
+                                                        'SUBPARTITION_NAME': sub_name,
+                                                        'SIZE_BYTES': subpart_info.get('size_bytes', 0),
+                                                        'ROW_COUNT': subpart_info.get('num_rows'),
+                                                        'BLOCK_COUNT': subpart_info.get('blocks'),
+                                                        'AVG_ROW_LENGTH': None,
+                                                        'BASIC_RATIO': sub_ratios.get('basic') or 1,
+                                                        'OLTP_RATIO': sub_ratios.get('oltp') or 1,
+                                                        'ADV_LOW_RATIO': sub_ratios.get('query_low'),
+                                                        'ADV_HIGH_RATIO': sub_ratios.get('query_high'),
+                                                        'BLKCNT_UNCMP_BASIC': None, 'BLKCNT_CMP_BASIC': None,
+                                                        'BLKCNT_UNCMP_OLTP': None, 'BLKCNT_CMP_OLTP': None,
+                                                        'BLKCNT_UNCMP_ADV_LOW': None, 'BLKCNT_CMP_ADV_LOW': None,
+                                                        'BLKCNT_UNCMP_ADV_HIGH': None, 'BLKCNT_CMP_ADV_HIGH': None,
+                                                        'INSERT_COUNT': 0, 'UPDATE_COUNT': 0, 'DELETE_COUNT': 0,
+                                                        'LOGICAL_READS': None, 'PHYSICAL_READS': None,
+                                                        'ACCESS_FREQUENCY': None, 'LAST_ACCESS_DATE': None,
+                                                        'HOTNESS_SCORE': 0,
+                                                        'READ_RATIO': None, 'WRITE_RATIO': None,
+                                                        'DML_24H_RATE': None,
+                                                        'LAST_ANALYZED': None, 'DATA_AGE_DAYS': None,
+                                                        'CURRENT_COMPRESSION': sub_current_comp,
+                                                        'ADVISABLE_COMPRESSION': sub_recommended,
+                                                        'RECOMMENDATION_REASON': TargetQueries._generate_rationale(
+                                                            sub_size_mb, 0, sub_ratios, sub_recommended
+                                                        ),
+                                                        'CONFIDENCE_SCORE': None,
+                                                        'PROJECTED_SAVINGS_BYTES': int(sub_savings_mb * 1024 * 1024),
+                                                        'PROJECTED_SAVINGS_PCT': sub_savings_pct,
+                                                        'ANALYSIS_DURATION_SEC': None,
+                                                        'SAMPLE_SIZE_ROWS': None,
+                                                    }
+                                                    results.append(sub_result)
+                                                    tables_analyzed += 1
+                                                except Exception as sub_e:
+                                                    tables_failed += 1
+                                                    log_warning(f"Failed to analyze subpartition {tbl_owner}.{tbl_name}.{part_name}.{sub_name}: {sub_e}")
+
+                                    except Exception as part_e:
+                                        tables_failed += 1
+                                        log_warning(f"Failed to analyze partition {tbl_owner}.{tbl_name}.{part_name}: {part_e}")
+
                 except Exception as e:
                     tables_failed += 1
                     log_warning(f"Failed to analyze {tbl_owner}.{tbl_name}: {e}")
@@ -303,8 +461,143 @@ class TargetQueries:
             return []
 
     @staticmethod
+    def _discover_partitions(
+        database_id: int, owner: str, table_name: str
+    ) -> List[Dict]:
+        """Discover partitions for a partitioned table on the target."""
+        query = """
+            SELECT p.partition_name, p.composite,
+                   p.compression, p.compress_for,
+                   p.num_rows, p.blocks,
+                   NVL(s.bytes, 0) as size_bytes,
+                   ROUND(NVL(s.bytes, 0) / 1024 / 1024, 2) as size_mb
+            FROM dba_tab_partitions p
+            LEFT JOIN dba_segments s
+                ON s.owner = p.table_owner
+                AND s.segment_name = p.table_name
+                AND s.partition_name = p.partition_name
+                AND s.segment_type = 'TABLE PARTITION'
+            WHERE p.table_owner = :owner
+              AND p.table_name = :table_name
+            ORDER BY p.partition_position
+        """
+        try:
+            df = TargetConnector.execute_query(database_id, query, {'owner': owner, 'table_name': table_name})
+            if df.empty:
+                return []
+            parts = []
+            for _, row in df.iterrows():
+                parts.append({
+                    'partition_name': row['PARTITION_NAME'],
+                    'composite': row.get('COMPOSITE', 'NO'),
+                    'compression': row.get('COMPRESSION', 'NONE'),
+                    'compress_for': row.get('COMPRESS_FOR'),
+                    'num_rows': int(row.get('NUM_ROWS') or 0),
+                    'blocks': int(row.get('BLOCKS') or 0),
+                    'size_bytes': int(row.get('SIZE_BYTES') or 0),
+                    'size_mb': float(row.get('SIZE_MB') or 0),
+                })
+            return parts
+        except Exception as e:
+            log_warning(f"Failed to discover partitions for {owner}.{table_name}: {e}")
+            return []
+
+    @staticmethod
+    def _discover_subpartitions(
+        database_id: int, owner: str, table_name: str, partition_name: str
+    ) -> List[Dict]:
+        """Discover subpartitions within a partition on the target."""
+        query = """
+            SELECT sp.subpartition_name,
+                   sp.compression, sp.compress_for,
+                   sp.num_rows, sp.blocks,
+                   NVL(s.bytes, 0) as size_bytes,
+                   ROUND(NVL(s.bytes, 0) / 1024 / 1024, 2) as size_mb
+            FROM dba_tab_subpartitions sp
+            LEFT JOIN dba_segments s
+                ON s.owner = sp.table_owner
+                AND s.segment_name = sp.table_name
+                AND s.partition_name = sp.subpartition_name
+                AND s.segment_type = 'TABLE SUBPARTITION'
+            WHERE sp.table_owner = :owner
+              AND sp.table_name = :table_name
+              AND sp.partition_name = :partition_name
+            ORDER BY sp.subpartition_position
+        """
+        try:
+            df = TargetConnector.execute_query(
+                database_id, query,
+                {'owner': owner, 'table_name': table_name, 'partition_name': partition_name}
+            )
+            if df.empty:
+                return []
+            subparts = []
+            for _, row in df.iterrows():
+                subparts.append({
+                    'subpartition_name': row['SUBPARTITION_NAME'],
+                    'compression': row.get('COMPRESSION', 'NONE'),
+                    'compress_for': row.get('COMPRESS_FOR'),
+                    'num_rows': int(row.get('NUM_ROWS') or 0),
+                    'blocks': int(row.get('BLOCKS') or 0),
+                    'size_bytes': int(row.get('SIZE_BYTES') or 0),
+                    'size_mb': float(row.get('SIZE_MB') or 0),
+                })
+            return subparts
+        except Exception as e:
+            log_warning(f"Failed to discover subpartitions for {owner}.{table_name}.{partition_name}: {e}")
+            return []
+
+    @staticmethod
+    def _get_batch_partition_dml_stats(
+        database_id: int, owner: str, table_name: str
+    ) -> Dict[str, Dict]:
+        """Fetch partition-level DML stats. Returns dict keyed by partition_name."""
+        import math
+
+        query = """
+            SELECT partition_name,
+                   NVL(inserts, 0) as inserts,
+                   NVL(updates, 0) as updates,
+                   NVL(deletes, 0) as deletes
+            FROM all_tab_modifications
+            WHERE table_owner = :owner
+              AND table_name = :table_name
+              AND partition_name IS NOT NULL
+              AND subpartition_name IS NULL
+        """
+        try:
+            df = TargetConnector.execute_query(
+                database_id, query, {'owner': owner, 'table_name': table_name}
+            )
+            raw = {}
+            if not df.empty:
+                for _, row in df.iterrows():
+                    pname = row['PARTITION_NAME']
+                    ins = int(row.get('INSERTS', 0) or 0)
+                    upd = int(row.get('UPDATES', 0) or 0)
+                    dlt = int(row.get('DELETES', 0) or 0)
+                    raw[pname] = {'inserts': ins, 'updates': upd, 'deletes': dlt,
+                                  'total_dml': ins + upd + dlt}
+
+            # Log-relative hotness normalization
+            max_dml = max((v['total_dml'] for v in raw.values()), default=0)
+            log_max = math.log10(max_dml + 1) if max_dml > 0 else 1
+            for key, v in raw.items():
+                total = v['total_dml']
+                if total > 0 and max_dml > 0:
+                    v['hotness_score'] = round((math.log10(total + 1) / log_max) * 100, 2)
+                else:
+                    v['hotness_score'] = 0
+
+            return raw
+        except Exception:
+            return {}
+
+    @staticmethod
     def _get_compression_ratios(
-        database_id: int, owner: str, table_name: str, platform_type: str = 'STANDARD'
+        database_id: int, owner: str, table_name: str,
+        platform_type: str = 'STANDARD',
+        partition_name: Optional[str] = None
     ) -> Dict[str, Any]:
         """Get compression ratios using DBMS_COMPRESSION.GET_COMPRESSION_RATIO.
 
@@ -319,6 +612,7 @@ class TargetQueries:
             owner: Schema owner
             table_name: Table name
             platform_type: 'STANDARD' or 'EXADATA'
+            partition_name: Optional partition/subpartition name (None for whole table)
 
         Returns:
             dict with keys: basic, oltp, query_low, query_high, archive_low, archive_high
@@ -341,7 +635,7 @@ class TargetQueries:
             -- BASIC (DBMS_COMPRESSION.COMP_BASIC = 4096)
             BEGIN
                 DBMS_COMPRESSION.GET_COMPRESSION_RATIO(
-                    v_tbs, :owner, :table_name, NULL, 4096,
+                    v_tbs, :owner, :table_name, :partition_name, 4096,
                     v_bc, v_bu, v_rc, v_ru, v_ratio, v_str);
                 :basic_ratio := ROUND(v_ratio, 2);
             EXCEPTION WHEN OTHERS THEN :basic_ratio := -1; END;
@@ -349,7 +643,7 @@ class TargetQueries:
             -- OLTP (DBMS_COMPRESSION.COMP_FOR_OLTP = 2)
             BEGIN
                 DBMS_COMPRESSION.GET_COMPRESSION_RATIO(
-                    v_tbs, :owner, :table_name, NULL, 2,
+                    v_tbs, :owner, :table_name, :partition_name, 2,
                     v_bc, v_bu, v_rc, v_ru, v_ratio, v_str);
                 :oltp_ratio := ROUND(v_ratio, 2);
             EXCEPTION WHEN OTHERS THEN :oltp_ratio := -1; END;
@@ -357,7 +651,7 @@ class TargetQueries:
             -- QUERY LOW (DBMS_COMPRESSION.COMP_FOR_QUERY_LOW = 4) - HCC/Exadata
             BEGIN
                 DBMS_COMPRESSION.GET_COMPRESSION_RATIO(
-                    v_tbs, :owner, :table_name, NULL, 4,
+                    v_tbs, :owner, :table_name, :partition_name, 4,
                     v_bc, v_bu, v_rc, v_ru, v_ratio, v_str);
                 :query_low_ratio := ROUND(v_ratio, 2);
             EXCEPTION WHEN OTHERS THEN :query_low_ratio := NULL; END;
@@ -365,7 +659,7 @@ class TargetQueries:
             -- QUERY HIGH (DBMS_COMPRESSION.COMP_FOR_QUERY_HIGH = 8) - HCC/Exadata
             BEGIN
                 DBMS_COMPRESSION.GET_COMPRESSION_RATIO(
-                    v_tbs, :owner, :table_name, NULL, 8,
+                    v_tbs, :owner, :table_name, :partition_name, 8,
                     v_bc, v_bu, v_rc, v_ru, v_ratio, v_str);
                 :query_high_ratio := ROUND(v_ratio, 2);
             EXCEPTION WHEN OTHERS THEN :query_high_ratio := NULL; END;
@@ -373,7 +667,7 @@ class TargetQueries:
             -- ARCHIVE LOW (DBMS_COMPRESSION.COMP_FOR_ARCHIVE_LOW = 16) - HCC/Exadata
             BEGIN
                 DBMS_COMPRESSION.GET_COMPRESSION_RATIO(
-                    v_tbs, :owner, :table_name, NULL, 16,
+                    v_tbs, :owner, :table_name, :partition_name, 16,
                     v_bc, v_bu, v_rc, v_ru, v_ratio, v_str);
                 :archive_low_ratio := ROUND(v_ratio, 2);
             EXCEPTION WHEN OTHERS THEN :archive_low_ratio := NULL; END;
@@ -381,7 +675,7 @@ class TargetQueries:
             -- ARCHIVE HIGH (DBMS_COMPRESSION.COMP_FOR_ARCHIVE_HIGH = 32) - HCC/Exadata
             BEGIN
                 DBMS_COMPRESSION.GET_COMPRESSION_RATIO(
-                    v_tbs, :owner, :table_name, NULL, 32,
+                    v_tbs, :owner, :table_name, :partition_name, 32,
                     v_bc, v_bu, v_rc, v_ru, v_ratio, v_str);
                 :archive_high_ratio := ROUND(v_ratio, 2);
             EXCEPTION WHEN OTHERS THEN :archive_high_ratio := NULL; END;
@@ -400,7 +694,7 @@ class TargetQueries:
         try:
             result = TargetConnector.execute_procedure_with_output(
                 database_id, plsql,
-                in_params={'owner': owner, 'table_name': table_name},
+                in_params={'owner': owner, 'table_name': table_name, 'partition_name': partition_name},
                 out_params=out_params
             )
 
@@ -1151,7 +1445,8 @@ class TargetQueries:
         owner: str,
         table_name: str,
         compression_type: str,
-        partition_name: Optional[str] = None
+        partition_name: Optional[str] = None,
+        subpartition_name: Optional[str] = None
     ) -> str:
         """
         Generate DDL statement for compression. Static utility - no database connection needed.
@@ -1161,6 +1456,7 @@ class TargetQueries:
             table_name: Table name
             compression_type: Target compression type
             partition_name: Optional partition name
+            subpartition_name: Optional subpartition name
 
         Returns:
             DDL statement string
@@ -1188,7 +1484,12 @@ class TargetQueries:
             f'COMPRESS FOR {compression_type}'
         )
 
-        if partition_name:
+        if subpartition_name:
+            ddl = f"""ALTER TABLE {owner}.{table_name}
+MOVE SUBPARTITION {subpartition_name}
+{compression_clause}
+ONLINE PARALLEL 4;"""
+        elif partition_name:
             ddl = f"""ALTER TABLE {owner}.{table_name}
 MOVE PARTITION {partition_name}
 {compression_clause}

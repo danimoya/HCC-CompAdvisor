@@ -199,7 +199,22 @@ def show_overview_tab(df: pd.DataFrame):
     top_n = st.slider("Show top N tables", min_value=5, max_value=50, value=10, step=5)
 
     if 'savings_pct' in df.columns and 'table_name' in df.columns:
-        top_df = df.nlargest(top_n, 'savings_pct')
+        top_df = df.nlargest(top_n, 'savings_pct').copy()
+
+        # Create display label that includes partition info
+        if 'partition_name' in top_df.columns:
+            top_df['display_label'] = top_df.apply(
+                lambda r: (
+                    f"{r['table_name']}.{r['subpartition_name']}"
+                    if pd.notna(r.get('subpartition_name'))
+                    else f"{r['table_name']}.{r['partition_name']}"
+                    if pd.notna(r.get('partition_name'))
+                    else r['table_name']
+                ),
+                axis=1
+            )
+        else:
+            top_df['display_label'] = top_df['table_name']
 
         # Multi-bar chart showing all compression type ratios per table
         fig = go.Figure()
@@ -216,7 +231,7 @@ def show_overview_tab(df: pd.DataFrame):
                 values = top_df[col].fillna(0)
                 if values.sum() > 0:
                     fig.add_trace(go.Bar(
-                        x=top_df['table_name'],
+                        x=top_df['display_label'],
                         y=values,
                         name=label,
                         marker_color=color,
@@ -226,7 +241,7 @@ def show_overview_tab(df: pd.DataFrame):
                     ))
 
         fig.update_layout(
-            xaxis_title="Table Name",
+            xaxis_title="Table / Partition",
             yaxis_title="Compression Ratio (higher = better)",
             height=400,
             barmode='group',
@@ -240,7 +255,7 @@ def show_overview_tab(df: pd.DataFrame):
 
         fig2 = go.Figure()
         fig2.add_trace(go.Bar(
-            x=top_df['table_name'],
+            x=top_df['display_label'],
             y=top_df['savings_pct'],
             marker_color=config.CHART_COLORS['success'],
             text=top_df['savings_pct'].round(1),
@@ -249,7 +264,7 @@ def show_overview_tab(df: pd.DataFrame):
         ))
 
         fig2.update_layout(
-            xaxis_title="Table Name",
+            xaxis_title="Table / Partition",
             yaxis_title="Savings (%)",
             height=300,
             showlegend=False
@@ -271,6 +286,9 @@ def show_detailed_tab(df: pd.DataFrame):
         'recommendation_id': 'ID',
         'table_owner': 'Owner',
         'table_name': 'Table',
+        'object_type': 'Type',
+        'partition_name': 'Partition',
+        'subpartition_name': 'Subpartition',
         'current_size_mb': 'Current (MB)',
         'recommended_strategy': 'Advised',
         'estimated_size_mb': 'Est. Size (MB)',
@@ -323,6 +341,9 @@ def show_detailed_tab(df: pd.DataFrame):
             "ID": st.column_config.NumberColumn("ID", width="small"),
             "Owner": st.column_config.TextColumn("Owner", width="small"),
             "Table": st.column_config.TextColumn("Table", width="medium"),
+            "Type": st.column_config.TextColumn("Type", width="small", help="TABLE, PARTITION, or SUBPARTITION"),
+            "Partition": st.column_config.TextColumn("Partition", width="small"),
+            "Subpartition": st.column_config.TextColumn("Subpartition", width="small"),
             "Current (MB)": st.column_config.NumberColumn("Current (MB)", format="%.2f"),
             "Advised": st.column_config.TextColumn("Advised", width="small"),
             "Est. Size (MB)": st.column_config.NumberColumn("Est. Size (MB)", format="%.2f"),
@@ -878,12 +899,18 @@ def execute_batch_compression(selected_df: pd.DataFrame, original_df: pd.DataFra
         status_text.text(f"Processing {i+1}/{len(selected_ids)}: {owner}.{table_name}...")
 
         try:
-            strategy = table_row.get('Strategy', 'QUERY HIGH')
+            strategy = table_row.get('Advised', table_row.get('Strategy', 'QUERY HIGH'))
+            partition = table_row.get('Partition')
+            if pd.notna(partition) and partition:
+                partition = str(partition)
+            else:
+                partition = None
             result = TargetQueries.execute_compression(
                 db_id,
                 owner=owner,
                 table_name=table_name,
                 compression_type=strategy,
+                partition_name=partition,
                 dry_run=dry_run
             )
 

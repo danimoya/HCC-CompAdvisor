@@ -377,6 +377,7 @@ class CentralQueries:
                 object_name as table_name,
                 object_type,
                 partition_name,
+                subpartition_name,
                 size_mb as current_size_mb,
                 row_count as estimated_rows,
                 current_compression,
