@@ -28,6 +28,7 @@ from hcc_advisor.auth import AuthManager, render_logout_button
 from hcc_advisor.utils.central_connector import CentralConnector
 from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.logger import get_recent_logs, get_error_logs, clear_logs
+from hcc_advisor.utils.sql_debug import get_sql_log, clear_sql_log, is_debug_enabled
 
 # Page configuration
 st.set_page_config(
@@ -314,6 +315,10 @@ def main():
         else:
             st.error("Central DB Disconnected")
 
+        # SQL Debug toggle
+        st.markdown("---")
+        st.checkbox("SQL Debug Console", key='sql_debug_enabled', value=False)
+
         # Logout button
         render_logout_button()
 
@@ -341,6 +346,57 @@ def main():
     elif selected == "DB Connections":
         from hcc_advisor.views.page_06_connections import show_connections_page
         show_connections_page()
+
+    # SQL Debug Console (visible on all pages when enabled)
+    if is_debug_enabled():
+        render_sql_debug_console()
+
+
+def render_sql_debug_console():
+    """Render the SQL debug console panel at the bottom of any page."""
+    st.markdown("---")
+    with st.expander("SQL Debug Console", expanded=True):
+        col1, col2, col3 = st.columns([1, 1, 2])
+        with col1:
+            filter_db = st.selectbox("Database", ["All", "central", "target"],
+                                     key="sql_debug_filter_db")
+        with col2:
+            filter_op = st.selectbox("Operation",
+                                     ["All", "SELECT", "DML", "PLSQL", "PROCEDURE", "FUNCTION"],
+                                     key="sql_debug_filter_op")
+        with col3:
+            btn1, btn2 = st.columns(2)
+            with btn1:
+                if st.button("Refresh", key="sql_debug_refresh"):
+                    st.rerun()
+            with btn2:
+                if st.button("Clear", key="sql_debug_clear"):
+                    clear_sql_log()
+                    st.rerun()
+
+        entries = get_sql_log()
+
+        if filter_db != "All":
+            entries = [e for e in entries if filter_db in e['database']]
+        if filter_op != "All":
+            entries = [e for e in entries if e['operation'] == filter_op]
+
+        if entries:
+            st.caption(f"{len(entries)} queries captured")
+            for i, entry in enumerate(entries):
+                status_icon = "🔴" if entry['status'] == 'ERROR' else "🟢"
+                duration = f"{entry['duration_ms']:.0f}ms" if entry['duration_ms'] else "?"
+                rows = f"{entry['rows']} rows" if entry['rows'] is not None else ""
+                header = (f"{status_icon} `{entry['timestamp']}` **{entry['operation']}** "
+                          f"on `{entry['database']}` — {duration} {rows}")
+                with st.expander(header, expanded=False):
+                    st.code(entry['sql'], language='sql')
+                    if entry['params']:
+                        st.json(entry['params'])
+                    if entry['error']:
+                        st.error(entry['error'])
+        else:
+            st.info("No SQL queries captured yet. Interact with the dashboard to see queries here.")
 
 
 def show_dashboard():

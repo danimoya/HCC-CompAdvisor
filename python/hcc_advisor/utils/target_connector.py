@@ -6,11 +6,13 @@ Supports multiple simultaneous connections keyed by database_id.
 
 import oracledb
 import pandas as pd
+import time
 from typing import Optional, Dict, Any, List
 from contextlib import contextmanager
 import streamlit as st
 from hcc_advisor.config import config
 from hcc_advisor.utils.logger import log_db_error, log_info, log_debug, log_error
+from hcc_advisor.utils.sql_debug import capture_sql, is_debug_enabled
 
 
 class TargetConnector:
@@ -107,6 +109,7 @@ class TargetConnector:
         Returns:
             pd.DataFrame: Query results
         """
+        _t0 = time.perf_counter() if is_debug_enabled() else None
         try:
             log_debug(f"[Target db_id={database_id}] Executing query", query_preview=query[:200])
             with cls.get_connection(database_id, conn_config) as conn:
@@ -123,9 +126,15 @@ class TargetConnector:
 
                 cursor.close()
                 log_debug(f"[Target db_id={database_id}] Query returned {len(df)} rows")
+                if _t0 is not None:
+                    capture_sql(f'target(id={database_id})', 'SELECT', query, params,
+                                rows_affected=len(df), duration_ms=(time.perf_counter() - _t0) * 1000)
                 return df
 
         except oracledb.Error as e:
+            if _t0 is not None:
+                capture_sql(f'target(id={database_id})', 'SELECT', query, params,
+                            status='ERROR', error=str(e), duration_ms=(time.perf_counter() - _t0) * 1000)
             log_db_error(e, query, params)
             st.error(f"Target database (id={database_id}) query error: {e}")
             return pd.DataFrame()
@@ -152,6 +161,7 @@ class TargetConnector:
         Returns:
             int: Number of rows affected
         """
+        _t0 = time.perf_counter() if is_debug_enabled() else None
         try:
             log_debug(f"[Target db_id={database_id}] Executing DML", statement_preview=statement[:200])
             with cls.get_connection(database_id, conn_config) as conn:
@@ -169,9 +179,15 @@ class TargetConnector:
 
                 cursor.close()
                 log_debug(f"[Target db_id={database_id}] DML affected {rows_affected} rows")
+                if _t0 is not None:
+                    capture_sql(f'target(id={database_id})', 'DML', statement, params,
+                                rows_affected=rows_affected, duration_ms=(time.perf_counter() - _t0) * 1000)
                 return rows_affected
 
         except oracledb.Error as e:
+            if _t0 is not None:
+                capture_sql(f'target(id={database_id})', 'DML', statement, params,
+                            status='ERROR', error=str(e), duration_ms=(time.perf_counter() - _t0) * 1000)
             log_db_error(e, statement, params)
             st.error(f"Target database (id={database_id}) DML error: {e}")
             return 0
@@ -198,6 +214,7 @@ class TargetConnector:
         Returns:
             bool: True if successful
         """
+        _t0 = time.perf_counter() if is_debug_enabled() else None
         try:
             log_debug(f"[Target db_id={database_id}] Executing PL/SQL block", block_preview=plsql_block[:200])
             with cls.get_connection(database_id, conn_config) as conn:
@@ -213,9 +230,15 @@ class TargetConnector:
 
                 cursor.close()
                 log_info(f"[Target db_id={database_id}] PL/SQL block executed successfully")
+                if _t0 is not None:
+                    capture_sql(f'target(id={database_id})', 'PLSQL', plsql_block, params,
+                                duration_ms=(time.perf_counter() - _t0) * 1000)
                 return True
 
         except oracledb.Error as e:
+            if _t0 is not None:
+                capture_sql(f'target(id={database_id})', 'PLSQL', plsql_block, params,
+                            status='ERROR', error=str(e), duration_ms=(time.perf_counter() - _t0) * 1000)
             log_db_error(e, plsql_block, params)
             st.error(f"Target database (id={database_id}) PL/SQL execution error: {e}")
             return False
@@ -240,6 +263,7 @@ class TargetConnector:
         Returns:
             Any: Procedure result
         """
+        _t0 = time.perf_counter() if is_debug_enabled() else None
         try:
             log_debug(f"[Target db_id={database_id}] Executing procedure: {procedure_name}")
             with cls.get_connection(database_id, conn_config) as conn:
@@ -254,9 +278,15 @@ class TargetConnector:
                 cursor.close()
 
                 log_info(f"[Target db_id={database_id}] Procedure {procedure_name} executed successfully")
+                if _t0 is not None:
+                    capture_sql(f'target(id={database_id})', 'PROCEDURE', f"CALL {procedure_name}",
+                                duration_ms=(time.perf_counter() - _t0) * 1000)
                 return result
 
         except oracledb.Error as e:
+            if _t0 is not None:
+                capture_sql(f'target(id={database_id})', 'PROCEDURE', f"CALL {procedure_name}",
+                            status='ERROR', error=str(e), duration_ms=(time.perf_counter() - _t0) * 1000)
             log_error(e, f"TargetConnector.execute_procedure(db_id={database_id}, proc={procedure_name})")
             st.error(f"Target database (id={database_id}) procedure execution error: {e}")
             return None
@@ -299,6 +329,7 @@ class TargetConnector:
                 out_params={'output_val': int}
             )
         """
+        _t0 = time.perf_counter() if is_debug_enabled() else None
         try:
             log_debug(f"[Target db_id={database_id}] Executing PL/SQL with output", block_preview=plsql_block[:200])
             with cls.get_connection(database_id, conn_config) as conn:
@@ -342,9 +373,15 @@ class TargetConnector:
 
                 cursor.close()
                 log_debug(f"[Target db_id={database_id}] PL/SQL with output returned: {list(result.keys())}")
+                if _t0 is not None:
+                    capture_sql(f'target(id={database_id})', 'PLSQL', plsql_block, in_params,
+                                duration_ms=(time.perf_counter() - _t0) * 1000)
                 return result
 
         except oracledb.Error as e:
+            if _t0 is not None:
+                capture_sql(f'target(id={database_id})', 'PLSQL', plsql_block, in_params,
+                            status='ERROR', error=str(e), duration_ms=(time.perf_counter() - _t0) * 1000)
             log_db_error(e, plsql_block, in_params)
             st.error(f"Target database (id={database_id}) PL/SQL execution error: {e}")
             raise
@@ -376,6 +413,7 @@ class TargetConnector:
                 params={'owner': 'HR'}
             )
         """
+        _t0 = time.perf_counter() if is_debug_enabled() else None
         try:
             log_debug(f"[Target db_id={database_id}] Calling function cursor: {function_call}")
             with cls.get_connection(database_id, conn_config) as conn:
@@ -408,9 +446,15 @@ class TargetConnector:
                 cursor.close()
 
                 log_debug(f"[Target db_id={database_id}] Function cursor returned {len(rows)} rows")
+                if _t0 is not None:
+                    capture_sql(f'target(id={database_id})', 'FUNCTION', f"CURSOR: {function_call}", params,
+                                rows_affected=len(rows), duration_ms=(time.perf_counter() - _t0) * 1000)
                 return pd.DataFrame(rows, columns=columns)
 
         except oracledb.Error as e:
+            if _t0 is not None:
+                capture_sql(f'target(id={database_id})', 'FUNCTION', f"CURSOR: {function_call}", params,
+                            status='ERROR', error=str(e), duration_ms=(time.perf_counter() - _t0) * 1000)
             log_error(e, f"TargetConnector.call_function_cursor(db_id={database_id}, func={function_call})")
             st.error(f"Target database (id={database_id}) function cursor execution error: {e}")
             return pd.DataFrame()

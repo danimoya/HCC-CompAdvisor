@@ -6,11 +6,13 @@ all analysis results, strategies, and target database registrations.
 
 import oracledb
 import pandas as pd
+import time
 from typing import Optional, Dict, Any, List
 from contextlib import contextmanager
 import streamlit as st
 from hcc_advisor.config import config
 from hcc_advisor.utils.logger import log_db_error, log_info, log_debug, log_error
+from hcc_advisor.utils.sql_debug import capture_sql, is_debug_enabled
 
 
 class CentralConnector:
@@ -82,6 +84,7 @@ class CentralConnector:
         Returns:
             pd.DataFrame: Query results
         """
+        _t0 = time.perf_counter() if is_debug_enabled() else None
         try:
             log_debug(f"[Central] Executing query", query_preview=query[:200])
             with cls.get_connection() as conn:
@@ -98,9 +101,15 @@ class CentralConnector:
 
                 cursor.close()
                 log_debug(f"[Central] Query returned {len(df)} rows")
+                if _t0 is not None:
+                    capture_sql('central', 'SELECT', query, params,
+                                rows_affected=len(df), duration_ms=(time.perf_counter() - _t0) * 1000)
                 return df
 
         except oracledb.Error as e:
+            if _t0 is not None:
+                capture_sql('central', 'SELECT', query, params,
+                            status='ERROR', error=str(e), duration_ms=(time.perf_counter() - _t0) * 1000)
             log_db_error(e, query, params)
             st.error(f"Central database query error: {e}")
             return pd.DataFrame()
@@ -118,6 +127,7 @@ class CentralConnector:
         Returns:
             int: Number of rows affected
         """
+        _t0 = time.perf_counter() if is_debug_enabled() else None
         try:
             log_debug(f"[Central] Executing DML", statement_preview=statement[:200])
             with cls.get_connection() as conn:
@@ -135,9 +145,15 @@ class CentralConnector:
 
                 cursor.close()
                 log_debug(f"[Central] DML affected {rows_affected} rows")
+                if _t0 is not None:
+                    capture_sql('central', 'DML', statement, params,
+                                rows_affected=rows_affected, duration_ms=(time.perf_counter() - _t0) * 1000)
                 return rows_affected
 
         except oracledb.Error as e:
+            if _t0 is not None:
+                capture_sql('central', 'DML', statement, params,
+                            status='ERROR', error=str(e), duration_ms=(time.perf_counter() - _t0) * 1000)
             log_db_error(e, statement, params)
             st.error(f"Central database DML error: {e}")
             return 0
@@ -155,6 +171,7 @@ class CentralConnector:
         Returns:
             bool: True if successful
         """
+        _t0 = time.perf_counter() if is_debug_enabled() else None
         try:
             log_debug(f"[Central] Executing PL/SQL block", block_preview=plsql_block[:200])
             with cls.get_connection() as conn:
@@ -170,9 +187,15 @@ class CentralConnector:
 
                 cursor.close()
                 log_info("[Central] PL/SQL block executed successfully")
+                if _t0 is not None:
+                    capture_sql('central', 'PLSQL', plsql_block, params,
+                                duration_ms=(time.perf_counter() - _t0) * 1000)
                 return True
 
         except oracledb.Error as e:
+            if _t0 is not None:
+                capture_sql('central', 'PLSQL', plsql_block, params,
+                            status='ERROR', error=str(e), duration_ms=(time.perf_counter() - _t0) * 1000)
             log_db_error(e, plsql_block, params)
             st.error(f"Central database PL/SQL execution error: {e}")
             return False
@@ -189,6 +212,7 @@ class CentralConnector:
         Returns:
             Any: Procedure result
         """
+        _t0 = time.perf_counter() if is_debug_enabled() else None
         try:
             log_debug(f"[Central] Executing procedure: {procedure_name}")
             with cls.get_connection() as conn:
@@ -203,9 +227,15 @@ class CentralConnector:
                 cursor.close()
 
                 log_info(f"[Central] Procedure {procedure_name} executed successfully")
+                if _t0 is not None:
+                    capture_sql('central', 'PROCEDURE', f"CALL {procedure_name}",
+                                duration_ms=(time.perf_counter() - _t0) * 1000)
                 return result
 
         except oracledb.Error as e:
+            if _t0 is not None:
+                capture_sql('central', 'PROCEDURE', f"CALL {procedure_name}",
+                            status='ERROR', error=str(e), duration_ms=(time.perf_counter() - _t0) * 1000)
             log_error(e, f"CentralConnector.execute_procedure({procedure_name})")
             st.error(f"Central database procedure execution error: {e}")
             return None
@@ -243,6 +273,7 @@ class CentralConnector:
                 out_params={'output_val': int}
             )
         """
+        _t0 = time.perf_counter() if is_debug_enabled() else None
         try:
             log_debug(f"[Central] Executing PL/SQL with output", block_preview=plsql_block[:200])
             with cls.get_connection() as conn:
@@ -286,9 +317,15 @@ class CentralConnector:
 
                 cursor.close()
                 log_debug(f"[Central] PL/SQL with output returned: {list(result.keys())}")
+                if _t0 is not None:
+                    capture_sql('central', 'PLSQL', plsql_block, in_params,
+                                duration_ms=(time.perf_counter() - _t0) * 1000)
                 return result
 
         except oracledb.Error as e:
+            if _t0 is not None:
+                capture_sql('central', 'PLSQL', plsql_block, in_params,
+                            status='ERROR', error=str(e), duration_ms=(time.perf_counter() - _t0) * 1000)
             log_db_error(e, plsql_block, in_params)
             st.error(f"Central database PL/SQL execution error: {e}")
             raise
@@ -311,6 +348,7 @@ class CentralConnector:
                 {'owner': 'HR'}
             )
         """
+        _t0 = time.perf_counter() if is_debug_enabled() else None
         try:
             log_debug(f"[Central] Calling function cursor: {function_call}")
             with cls.get_connection() as conn:
@@ -343,9 +381,15 @@ class CentralConnector:
                 cursor.close()
 
                 log_debug(f"[Central] Function cursor returned {len(rows)} rows")
+                if _t0 is not None:
+                    capture_sql('central', 'FUNCTION', f"CURSOR: {function_call}", params,
+                                rows_affected=len(rows), duration_ms=(time.perf_counter() - _t0) * 1000)
                 return pd.DataFrame(rows, columns=columns)
 
         except oracledb.Error as e:
+            if _t0 is not None:
+                capture_sql('central', 'FUNCTION', f"CURSOR: {function_call}", params,
+                            status='ERROR', error=str(e), duration_ms=(time.perf_counter() - _t0) * 1000)
             log_error(e, f"CentralConnector.call_function_cursor({function_call})")
             st.error(f"Central database function cursor execution error: {e}")
             return pd.DataFrame()
