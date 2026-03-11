@@ -355,48 +355,49 @@ def main():
 def render_sql_debug_console():
     """Render the SQL debug console panel at the bottom of any page."""
     st.markdown("---")
-    with st.expander("SQL Debug Console", expanded=True):
-        col1, col2, col3 = st.columns([1, 1, 2])
-        with col1:
-            filter_db = st.selectbox("Database", ["All", "central", "target"],
-                                     key="sql_debug_filter_db")
-        with col2:
-            filter_op = st.selectbox("Operation",
-                                     ["All", "SELECT", "DML", "PLSQL", "PROCEDURE", "FUNCTION"],
-                                     key="sql_debug_filter_op")
-        with col3:
-            btn1, btn2 = st.columns(2)
-            with btn1:
-                if st.button("Refresh", key="sql_debug_refresh"):
-                    st.rerun()
-            with btn2:
-                if st.button("Clear", key="sql_debug_clear"):
-                    clear_sql_log()
-                    st.rerun()
+    st.subheader("SQL Debug Console")
 
-        entries = get_sql_log()
+    col1, col2, col3 = st.columns([1, 1, 2])
+    with col1:
+        filter_db = st.selectbox("Database", ["All", "central", "target"],
+                                 key="sql_debug_filter_db")
+    with col2:
+        filter_op = st.selectbox("Operation",
+                                 ["All", "SELECT", "DML", "PLSQL", "PROCEDURE", "FUNCTION"],
+                                 key="sql_debug_filter_op")
+    with col3:
+        btn1, btn2 = st.columns(2)
+        with btn1:
+            if st.button("Refresh", key="sql_debug_refresh"):
+                st.rerun()
+        with btn2:
+            if st.button("Clear", key="sql_debug_clear"):
+                clear_sql_log()
+                st.rerun()
 
-        if filter_db != "All":
-            entries = [e for e in entries if filter_db in e['database']]
-        if filter_op != "All":
-            entries = [e for e in entries if e['operation'] == filter_op]
+    entries = get_sql_log()
 
-        if entries:
-            st.caption(f"{len(entries)} queries captured")
-            for i, entry in enumerate(entries):
-                status_icon = "🔴" if entry['status'] == 'ERROR' else "🟢"
-                duration = f"{entry['duration_ms']:.0f}ms" if entry['duration_ms'] else "?"
-                rows = f"{entry['rows']} rows" if entry['rows'] is not None else ""
-                header = (f"{status_icon} `{entry['timestamp']}` **{entry['operation']}** "
-                          f"on `{entry['database']}` — {duration} {rows}")
-                with st.expander(header, expanded=False):
-                    st.code(entry['sql'], language='sql')
-                    if entry['params']:
-                        st.json(entry['params'])
-                    if entry['error']:
-                        st.error(entry['error'])
-        else:
-            st.info("No SQL queries captured yet. Interact with the dashboard to see queries here.")
+    if filter_db != "All":
+        entries = [e for e in entries if filter_db in e['database']]
+    if filter_op != "All":
+        entries = [e for e in entries if e['operation'] == filter_op]
+
+    if entries:
+        st.caption(f"{len(entries)} queries captured")
+        for i, entry in enumerate(entries):
+            status_icon = "🔴" if entry['status'] == 'ERROR' else "🟢"
+            duration = f"{entry['duration_ms']:.0f}ms" if entry['duration_ms'] else "?"
+            rows = f"{entry['rows']} rows" if entry['rows'] is not None else ""
+            header = (f"{status_icon} `{entry['timestamp']}` **{entry['operation']}** "
+                      f"on `{entry['database']}` — {duration} {rows}")
+            with st.expander(header, expanded=False):
+                st.code(entry['sql'], language='sql')
+                if entry['params']:
+                    st.json(entry['params'])
+                if entry['error']:
+                    st.error(entry['error'])
+    else:
+        st.info("No SQL queries captured yet. Interact with the dashboard to see queries here.")
 
 
 def show_dashboard():

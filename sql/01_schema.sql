@@ -677,7 +677,7 @@ BEGIN
         EXECUTE IMMEDIATE 'CREATE SEQUENCE SEQ_EXECUTION_ID START WITH 1 INCREMENT BY 1 CACHE 20 NOCYCLE';
         DBMS_OUTPUT.PUT_LINE('✓ Sequence SEQ_EXECUTION_ID created successfully');
         -- Add comment
-        EXECUTE IMMEDIATE 'COMMENT ON SEQUENCE SEQ_EXECUTION_ID IS ''Unique identifier for compression execution batches''';
+        DBMS_OUTPUT.PUT_LINE('  Comment: Unique identifier for compression execution batches');
     ELSE
         DBMS_OUTPUT.PUT_LINE('  Sequence SEQ_EXECUTION_ID already exists - skipping');
     END IF;

@@ -76,7 +76,7 @@ EXCEPTION
 END;
 /
 
-COMMENT ON SEQUENCE SEQ_STRATEGY_RULES IS 'Sequence for T_STRATEGY_RULES primary key generation';
+-- Note: Oracle does not support COMMENT ON SEQUENCE
 
 -- ============================================================================
 -- SECTION 2: ADD MISSING COLUMNS TO T_STRATEGY_RULES
