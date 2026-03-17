@@ -6,6 +6,7 @@ Trigger and monitor compression analysis
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+import threading
 from datetime import datetime
 from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.target_queries import TargetQueries
@@ -19,14 +20,17 @@ def show_analysis_page():
     st.markdown("Analyze tables for compression opportunities")
     st.markdown("---")
 
-    # Tabs for Analysis and Monitor
-    tab1, tab2 = st.tabs(["Run Analysis", "Monitor Progress"])
+    # Tabs for Analysis, Monitor, and Schema Size
+    tab1, tab2, tab3 = st.tabs(["Run Analysis", "Monitor Progress", "Check Schema Size"])
 
     with tab1:
         show_analysis_config()
 
     with tab2:
         show_analysis_monitor()
+
+    with tab3:
+        show_schema_size()
 
 
 def show_analysis_config():
@@ -102,8 +106,10 @@ def show_analysis_config():
                     st.error("Select a target database from the sidebar first.")
                 else:
                     owner = None if selected_schema == "All Schemas" else selected_schema
-                    with st.spinner("Running analysis (this may take a while)..."):
-                        result = TargetQueries.start_analysis(
+
+                    # Launch analysis in background thread so UI stays responsive
+                    def _run_analysis():
+                        TargetQueries.start_analysis(
                             db_id,
                             owner=owner,
                             strategy_id=selected_strategy,
@@ -111,12 +117,12 @@ def show_analysis_config():
                             include_partitions=include_partitions
                         )
 
-                        if result.get('success'):
-                            run_id = result.get('run_id')
-                            st.success(result.get('message', f"Analysis completed! Run ID: {run_id}"))
-                            st.session_state.current_analysis_id = run_id
-                        else:
-                            st.error(result.get('message', 'Analysis failed'))
+                    thread = threading.Thread(target=_run_analysis, daemon=True)
+                    thread.start()
+                    st.success(
+                        "Analysis started in background. "
+                        "Switch to the **Monitor Progress** tab to track status."
+                    )
 
     with col2:
         st.subheader("Analysis Parameters")
@@ -266,6 +272,100 @@ def show_analysis_config():
             st.rerun()
     else:
         st.info("No recommendations available. Run an analysis first.")
+
+
+def show_schema_size():
+    """Show schema size breakdown from target database"""
+
+    st.subheader("Schema Size Overview")
+    st.markdown("Query `DBA_SEGMENTS` on the target database to see storage usage per schema.")
+
+    db_id = st.session_state.get('active_database_id')
+    if not db_id:
+        st.warning("Select a target database from the sidebar first.")
+        return
+
+    if st.button("Check Schema Size", use_container_width=True, type="primary", key="check_schema_size_btn"):
+        from hcc_advisor.utils.target_connector import TargetConnector
+
+        query = """
+            SELECT
+                owner,
+                SUM(bytes)                          AS total_bytes,
+                ROUND(SUM(bytes) / 1024, 2)         AS total_kb,
+                ROUND(SUM(bytes) / 1048576, 2)      AS total_mb,
+                ROUND(SUM(bytes) / 1073741824, 4)   AS total_gb,
+                COUNT(*)                            AS segment_count
+            FROM
+                dba_segments
+            WHERE
+                owner NOT IN (
+                    'SYS', 'SYSTEM', 'OUTLN', 'DBSNMP', 'APPQOSSYS',
+                    'DBSFWUSER', 'GGSYS', 'ANONYMOUS', 'CTXSYS', 'DVSYS',
+                    'DVF', 'GSMADMIN_INTERNAL', 'MDSYS', 'OLAPSYS', 'ORDSYS',
+                    'ORDPLUGINS', 'ORDDATA', 'SI_INFORMTN_SCHEMA', 'XDB',
+                    'WMSYS', 'LBACSYS', 'OJVMSYS', 'AUDSYS', 'APEX_030200',
+                    'APEX_040000', 'FLOWS_FILES', 'APEX_PUBLIC_USER',
+                    'XS$NULL', 'SPATIAL_CSW_ADMIN_USR', 'SPATIAL_WFS_ADMIN_USR',
+                    'MDDATA', 'SYSBACKUP', 'SYSDG', 'SYSKM', 'SYSRAC',
+                    'REMOTE_SCHEDULER_AGENT', 'GSMUSER', 'GSMROOTUSER',
+                    'DIP', 'ORACLE_OCM', 'SYSMAN', 'MGMT_VIEW',
+                    'EXFSYS', 'TSMSYS', 'DMSYS'
+                )
+                AND owner NOT LIKE 'APEX_%'
+                AND owner NOT LIKE 'FLOWS_%'
+            GROUP BY
+                owner
+            ORDER BY
+                total_bytes DESC
+        """
+
+        with st.spinner("Querying DBA_SEGMENTS..."):
+            df = TargetConnector.execute_query(db_id, query)
+
+        if df.empty:
+            st.info("No schema data returned.")
+            return
+
+        df.columns = [c.lower() for c in df.columns]
+
+        # Summary metrics
+        total_gb = df['total_gb'].sum()
+        total_mb = df['total_mb'].sum()
+        total_segments = df['segment_count'].sum()
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total Size", f"{total_gb:.2f} GB" if total_gb >= 1 else f"{total_mb:.1f} MB")
+        with col2:
+            st.metric("Schemas", len(df))
+        with col3:
+            st.metric("Segments", f"{int(total_segments):,}")
+
+        st.markdown("---")
+
+        # Chart
+        fig = go.Figure(data=[
+            go.Bar(
+                x=df['owner'],
+                y=df['total_mb'],
+                marker_color=config.CHART_COLORS['primary'],
+                text=df['total_mb'].apply(lambda x: f"{x:.1f} MB"),
+                textposition='auto'
+            )
+        ])
+        fig.update_layout(
+            xaxis_title="Schema",
+            yaxis_title="Size (MB)",
+            height=400
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Data table
+        display_df = df[['owner', 'total_mb', 'total_gb', 'segment_count']].copy()
+        display_df.columns = ['Schema', 'Size (MB)', 'Size (GB)', 'Segments']
+
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 
 def show_analysis_monitor():

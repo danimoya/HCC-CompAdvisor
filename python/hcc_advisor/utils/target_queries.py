@@ -1215,52 +1215,17 @@ class TargetQueries:
             }
 
         try:
-            # Execute compression via procedure on target
-            if partition_name:
-                # Use compress_partition for partitioned objects
-                plsql_block = """
-                BEGIN
-                    PKG_COMPRESSION_EXECUTOR.compress_partition(
-                        p_owner => :owner,
-                        p_table_name => :table_name,
-                        p_partition_name => :partition_name,
-                        p_compression_type => :compression_type,
-                        p_online => TRUE
-                    );
-                END;
-                """
-                success = TargetConnector.execute_plsql(
-                    database_id,
-                    plsql_block,
-                    params={
-                        'owner': owner,
-                        'table_name': table_name,
-                        'partition_name': partition_name,
-                        'compression_type': compression_type
-                    }
-                )
-            else:
-                # Use compress_table for regular tables
-                plsql_block = """
-                BEGIN
-                    PKG_COMPRESSION_EXECUTOR.compress_table(
-                        p_owner => :owner,
-                        p_table_name => :table_name,
-                        p_compression_type => :compression_type,
-                        p_online => TRUE,
-                        p_dry_run => FALSE
-                    );
-                END;
-                """
-                success = TargetConnector.execute_plsql(
-                    database_id,
-                    plsql_block,
-                    params={
-                        'owner': owner,
-                        'table_name': table_name,
-                        'compression_type': compression_type
-                    }
-                )
+            # Execute compression via direct ALTER TABLE MOVE DDL
+            ddl = TargetQueries.generate_ddl(
+                owner, table_name, compression_type, partition_name
+            )
+            # Strip trailing semicolon — oracledb executes DDL without it
+            ddl_exec = ddl.rstrip().rstrip(';')
+
+            success = TargetConnector.execute_plsql(
+                database_id,
+                f"BEGIN EXECUTE IMMEDIATE q'[{ddl_exec}]'; END;"
+            )
 
             if success:
                 # Get the latest history_id after successful execution
@@ -1325,28 +1290,15 @@ class TargetQueries:
         Returns:
             dict with execution result
         """
-        plsql_block = """
-        BEGIN
-            PKG_COMPRESSION_EXECUTOR.compress_partition(
-                p_owner => :owner,
-                p_table_name => :table_name,
-                p_partition_name => :partition_name,
-                p_compression_type => :compression_type,
-                p_online => TRUE
-            );
-        END;
-        """
-
         try:
+            ddl = TargetQueries.generate_ddl(
+                owner, table_name, compression_type, partition_name
+            )
+            ddl_exec = ddl.rstrip().rstrip(';')
+
             success = TargetConnector.execute_plsql(
                 database_id,
-                plsql_block,
-                params={
-                    'owner': owner,
-                    'table_name': table_name,
-                    'partition_name': partition_name,
-                    'compression_type': compression_type
-                }
+                f"BEGIN EXECUTE IMMEDIATE q'[{ddl_exec}]'; END;"
             )
 
             if success:
