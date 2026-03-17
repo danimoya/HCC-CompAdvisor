@@ -117,6 +117,9 @@ class TargetQueries:
             # 5. Batch-fetch DML stats for hotness scoring
             dml_stats = TargetQueries._get_batch_dml_stats(database_id, owner)
 
+            # 5b. Batch-fetch column-level statistics for smarter recommendations
+            col_stats = TargetQueries._get_batch_table_stats(database_id, owner)
+
             # 6. Analyze each table
             results = []
             tables_analyzed = 0
@@ -136,8 +139,19 @@ class TargetQueries:
 
                     current_size_mb = table_info['size_mb']
 
+                    # Build table_stats dict for enhanced recommendation
+                    tbl_col_stats = col_stats.get(hotness_key, {})
+                    table_stats = {
+                        'avg_row_len': table_info.get('avg_row_len', 0),
+                        'last_analyzed': table_info.get('last_analyzed'),
+                        'num_rows': table_info.get('num_rows', 0),
+                        'avg_null_pct': tbl_col_stats.get('avg_null_pct', 0),
+                        'avg_distinct': tbl_col_stats.get('avg_distinct', 0),
+                        'num_columns': tbl_col_stats.get('num_columns', 0),
+                    }
+
                     recommended = TargetQueries._evaluate_strategy(
-                        strategy_rules, 'TABLE', hotness_score, ratios
+                        strategy_rules, 'TABLE', hotness_score, ratios, table_stats
                     )
 
                     # Use the ratio for the recommended compression type for savings
@@ -154,7 +168,7 @@ class TargetQueries:
                     savings_pct = round((savings_mb / current_size_mb) * 100, 2) if current_size_mb > 0 else 0
 
                     rationale = TargetQueries._generate_rationale(
-                        current_size_mb, hotness_score, ratios, recommended
+                        current_size_mb, hotness_score, ratios, recommended, table_stats
                     )
 
                     current_comp = table_info.get('compress_for') or table_info.get('compression', 'NONE')
@@ -173,7 +187,7 @@ class TargetQueries:
                         'SIZE_BYTES': table_info['size_bytes'],
                         'ROW_COUNT': table_info.get('num_rows'),
                         'BLOCK_COUNT': table_info.get('blocks'),
-                        'AVG_ROW_LENGTH': None,
+                        'AVG_ROW_LENGTH': table_info.get('avg_row_len'),
                         'BASIC_RATIO': basic_ratio,
                         'OLTP_RATIO': oltp_ratio,
                         'ADV_LOW_RATIO': ratios.get('query_low'),
@@ -197,7 +211,7 @@ class TargetQueries:
                         'READ_RATIO': None,
                         'WRITE_RATIO': None,
                         'DML_24H_RATE': None,
-                        'LAST_ANALYZED': None,
+                        'LAST_ANALYZED': table_info.get('last_analyzed'),
                         'DATA_AGE_DAYS': None,
                         'CURRENT_COMPRESSION': current_comp,
                         'ADVISABLE_COMPRESSION': recommended,
@@ -413,6 +427,9 @@ class TargetQueries:
 
         query = f"""
             SELECT t.owner, t.table_name, t.num_rows, t.blocks,
+                   t.avg_row_len,
+                   t.last_analyzed,
+                   t.partitioned,
                    t.compression, t.compress_for,
                    NVL(s.total_bytes, 0) as size_bytes,
                    ROUND(NVL(s.total_bytes, 0) / 1024 / 1024, 2) as size_mb
@@ -450,6 +467,9 @@ class TargetQueries:
                     'table_name': row['TABLE_NAME'],
                     'num_rows': int(row.get('NUM_ROWS') or 0),
                     'blocks': int(row.get('BLOCKS') or 0),
+                    'avg_row_len': int(row.get('AVG_ROW_LEN') or 0),
+                    'last_analyzed': row.get('LAST_ANALYZED'),
+                    'partitioned': row.get('PARTITIONED', 'NO'),
                     'compression': row.get('COMPRESSION', 'NONE'),
                     'compress_for': row.get('COMPRESS_FOR'),
                     'size_bytes': int(row.get('SIZE_BYTES') or 0),
@@ -866,6 +886,48 @@ class TargetQueries:
         except Exception:
             return {}
 
+    @staticmethod
+    def _get_batch_table_stats(database_id: int, owner: Optional[str] = None) -> Dict[str, Dict]:
+        """Batch-fetch column-level statistics to enrich compression recommendations.
+
+        Queries dba_tab_col_statistics to compute per-table metrics:
+        - avg_null_pct:  average NULL ratio across all columns (high = compresses well)
+        - avg_distinct:  average number of distinct values (low = compresses well)
+        - num_columns:   total column count
+
+        Returns dict keyed by 'OWNER.TABLE_NAME'.
+        """
+        owner_filter = "WHERE c.owner = :owner" if owner else ""
+        params = {'owner': owner.upper()} if owner else None
+
+        query = f"""
+            SELECT c.owner, c.table_name,
+                   COUNT(*)                                             AS num_columns,
+                   ROUND(AVG(CASE WHEN c.num_nulls IS NOT NULL AND t.num_rows > 0
+                                  THEN c.num_nulls / t.num_rows ELSE 0 END), 4)
+                                                                        AS avg_null_pct,
+                   ROUND(AVG(NVL(c.num_distinct, 0)), 0)               AS avg_distinct
+            FROM dba_tab_col_statistics c
+            JOIN all_tables t ON t.owner = c.owner AND t.table_name = c.table_name
+            {owner_filter}
+            GROUP BY c.owner, c.table_name
+        """
+
+        try:
+            df = TargetConnector.execute_query(database_id, query, params)
+            result = {}
+            if not df.empty:
+                for _, row in df.iterrows():
+                    key = f"{row['OWNER']}.{row['TABLE_NAME']}"
+                    result[key] = {
+                        'num_columns': int(row.get('NUM_COLUMNS') or 0),
+                        'avg_null_pct': float(row.get('AVG_NULL_PCT') or 0),
+                        'avg_distinct': float(row.get('AVG_DISTINCT') or 0),
+                    }
+            return result
+        except Exception:
+            return {}
+
     # Map from compression type to ratio dict key
     _COMP_TYPE_RATIO_KEY = {
         'BASIC': 'basic', 'OLTP': 'oltp',
@@ -878,32 +940,94 @@ class TargetQueries:
         rules: List[Dict],
         object_type: str,
         hotness_score: float,
-        ratios: Dict[str, Any]
+        ratios: Dict[str, Any],
+        table_stats: Optional[Dict[str, Any]] = None
     ) -> str:
         """Evaluate strategy rules to determine compression recommendation.
+
+        Considers:
+        - Strategy rules (hotness bands mapped to compression types)
+        - Compression ratios from DBMS_COMPRESSION
+        - Table statistics: avg_row_len, last_analyzed, column null density,
+          distinct cardinality (from dba_tab_col_statistics)
+
+        Decision flow:
+        1. If strategy rules match hotness band and ratio is valid, use rule.
+        2. Otherwise, compute an effective hotness that blends DML activity
+           with table statistics (data age, null density, row width).
+        3. Pick the best compression type matching effective hotness and
+           available ratios.
 
         Args:
             rules: Strategy rules from central DB
             object_type: 'TABLE', 'INDEX', etc.
             hotness_score: 0-100 DML hotness score
             ratios: dict of compression ratios (basic, oltp, query_low, etc.)
+            table_stats: optional dict with keys: avg_row_len, last_analyzed,
+                         num_rows, avg_null_pct, avg_distinct, num_columns
 
         Returns:
             Compression type: NONE/BASIC/OLTP/QUERY LOW/QUERY HIGH/ARCHIVE LOW/ARCHIVE HIGH
         """
+        stats = table_stats or {}
+
+        # --- Compute effective hotness adjusting for table statistics ---
+        effective_hotness = hotness_score
+
+        # Stale/unanalyzed data is likely cold → lower effective hotness
+        last_analyzed = stats.get('last_analyzed')
+        if last_analyzed:
+            from datetime import datetime, date
+            try:
+                if isinstance(last_analyzed, (datetime, date)):
+                    age_days = (datetime.now() - (last_analyzed if isinstance(last_analyzed, datetime)
+                                else datetime.combine(last_analyzed, datetime.min.time()))).days
+                else:
+                    age_days = 0
+                # Tables not analyzed in >90 days are likely cold
+                if age_days > 365:
+                    effective_hotness = max(0, effective_hotness - 30)
+                elif age_days > 90:
+                    effective_hotness = max(0, effective_hotness - 15)
+            except Exception:
+                pass
+
+        # High NULL density → data compresses very well, favor deeper compression
+        avg_null_pct = stats.get('avg_null_pct', 0) or 0
+        if avg_null_pct > 0.5:
+            # >50% NULLs on average → push toward deeper compression (lower hotness)
+            effective_hotness = max(0, effective_hotness - 10)
+        elif avg_null_pct > 0.3:
+            effective_hotness = max(0, effective_hotness - 5)
+
+        # Low cardinality → repetitive data → compresses well
+        avg_distinct = stats.get('avg_distinct', 0) or 0
+        num_rows = stats.get('num_rows', 0) or 0
+        if num_rows > 0 and avg_distinct > 0:
+            distinct_ratio = avg_distinct / num_rows
+            if distinct_ratio < 0.01:
+                # Very repetitive data → favor deeper compression
+                effective_hotness = max(0, effective_hotness - 10)
+            elif distinct_ratio < 0.1:
+                effective_hotness = max(0, effective_hotness - 5)
+
+        # Wide rows benefit more from compression
+        avg_row_len = stats.get('avg_row_len', 0) or 0
+        if avg_row_len > 500:
+            effective_hotness = max(0, effective_hotness - 5)
+
+        # --- Try strategy rules with effective hotness ---
         for rule in rules:
             if rule.get('object_type') == object_type:
-                if rule.get('hotness_min', 0) <= hotness_score <= rule.get('hotness_max', 100):
+                if rule.get('hotness_min', 0) <= effective_hotness <= rule.get('hotness_max', 100):
                     comp_type = rule['compression_type']
-                    # Check if the recommended type has a valid ratio
                     ratio_key = TargetQueries._COMP_TYPE_RATIO_KEY.get(comp_type)
                     ratio_val = ratios.get(ratio_key) if ratio_key else None
                     if ratio_val and ratio_val > 1:
                         return comp_type
-                    # HCC type not available on this platform, try next rule
                     continue
 
-        # Default: pick best available compression based on all ratios
+        # --- Fallback: pick best available compression based on ratios + effective hotness ---
         basic = ratios.get('basic') or 1
         oltp = ratios.get('oltp') or 1
         query_low = ratios.get('query_low') or 0
@@ -911,19 +1035,25 @@ class TargetQueries:
         archive_low = ratios.get('archive_low') or 0
         archive_high = ratios.get('archive_high') or 0
 
-        # Prefer HCC if available and significantly better
         best_hcc = max(query_low, query_high, archive_low, archive_high)
         best_std = max(basic, oltp)
 
-        if best_hcc >= 2:
-            # HCC available and effective — pick highest ratio HCC type
+        if best_hcc >= 2 and effective_hotness < 50:
+            # HCC only if data is not too hot (HCC penalizes DML)
             hcc_options = [
                 ('ARCHIVE HIGH', archive_high), ('ARCHIVE LOW', archive_low),
                 ('QUERY HIGH', query_high), ('QUERY LOW', query_low),
             ]
+            # For warm-ish data (25-50), prefer QUERY over ARCHIVE
+            if effective_hotness >= 25:
+                hcc_options = [
+                    ('QUERY HIGH', query_high), ('QUERY LOW', query_low),
+                    ('ARCHIVE LOW', archive_low), ('ARCHIVE HIGH', archive_high),
+                ]
             return max(hcc_options, key=lambda x: x[1])[0]
         elif best_std >= 2:
-            return 'OLTP'
+            # Hot data or no HCC available → OLTP (handles DML well)
+            return 'OLTP' if effective_hotness >= 30 or oltp >= basic else 'BASIC'
         elif best_std >= 1.5:
             return 'BASIC'
         return 'NONE'
@@ -931,13 +1061,29 @@ class TargetQueries:
     @staticmethod
     def _generate_rationale(
         size_mb: float, hotness_score: float, ratios: Dict[str, Any],
-        recommended: str
+        recommended: str, table_stats: Optional[Dict[str, Any]] = None
     ) -> str:
         """Generate human-readable rationale for compression recommendation."""
+        stats = table_stats or {}
         parts = [f'Size: {size_mb:.2f} MB']
         if hotness_score > 0:
             label = 'High DML' if hotness_score > 70 else ('Moderate DML' if hotness_score > 30 else 'Low DML')
             parts.append(f'Hotness: {hotness_score}/100 ({label})')
+
+        # Table statistics context
+        stat_notes = []
+        avg_null_pct = stats.get('avg_null_pct', 0)
+        if avg_null_pct > 0.3:
+            stat_notes.append(f'High NULL density ({avg_null_pct:.0%})')
+        avg_row_len = stats.get('avg_row_len', 0)
+        if avg_row_len > 500:
+            stat_notes.append(f'Wide rows ({avg_row_len}B avg)')
+        num_rows = stats.get('num_rows', 0)
+        avg_distinct = stats.get('avg_distinct', 0)
+        if num_rows > 0 and avg_distinct > 0 and (avg_distinct / num_rows) < 0.01:
+            stat_notes.append('Low cardinality (repetitive data)')
+        if stat_notes:
+            parts.append('Stats: ' + ', '.join(stat_notes))
 
         # Show all available compression ratios
         ratio_strs = []
