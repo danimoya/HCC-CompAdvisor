@@ -629,149 +629,6 @@ class TargetQueries:
             return {}
 
     @staticmethod
-    def _get_compression_ratios(
-        database_id: int, owner: str, table_name: str,
-        platform_type: str = 'STANDARD',
-        partition_name: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """Get compression ratios using DBMS_COMPRESSION.GET_COMPRESSION_RATIO.
-
-        Tests BASIC and OLTP on all platforms. On Exadata, also tests
-        QUERY LOW/HIGH and ARCHIVE LOW/HIGH (HCC compression types).
-
-        Falls back to CTAS sampling only if DBMS_COMPRESSION is unavailable
-        (e.g., Oracle Free development environments).
-
-        Args:
-            database_id: Target database identifier
-            owner: Schema owner
-            table_name: Table name
-            platform_type: 'STANDARD' or 'EXADATA'
-            partition_name: Optional partition/subpartition name (None for whole table)
-
-        Returns:
-            dict with keys: basic, oltp, query_low, query_high, archive_low, archive_high
-            Values are float ratios (>1 = compression effective), None if not tested/available.
-        """
-        # PL/SQL block using DBMS_COMPRESSION.GET_COMPRESSION_RATIO
-        # Tests all 6 compression types; HCC types fail gracefully on non-Exadata
-        plsql = """
-        DECLARE
-            v_tbs VARCHAR2(128);
-            v_bc PLS_INTEGER;
-            v_bu PLS_INTEGER;
-            v_rc PLS_INTEGER;
-            v_ru PLS_INTEGER;
-            v_ratio NUMBER;
-            v_str VARCHAR2(100);
-        BEGIN
-            SELECT default_tablespace INTO v_tbs FROM dba_users WHERE username = :owner;
-
-            -- BASIC (DBMS_COMPRESSION.COMP_BASIC = 4096)
-            BEGIN
-                DBMS_COMPRESSION.GET_COMPRESSION_RATIO(
-                    v_tbs, :owner, :table_name, :partition_name, 4096,
-                    v_bc, v_bu, v_rc, v_ru, v_ratio, v_str);
-                :basic_ratio := ROUND(v_ratio, 2);
-            EXCEPTION WHEN OTHERS THEN :basic_ratio := -1; END;
-
-            -- OLTP (DBMS_COMPRESSION.COMP_FOR_OLTP = 2)
-            BEGIN
-                DBMS_COMPRESSION.GET_COMPRESSION_RATIO(
-                    v_tbs, :owner, :table_name, :partition_name, 2,
-                    v_bc, v_bu, v_rc, v_ru, v_ratio, v_str);
-                :oltp_ratio := ROUND(v_ratio, 2);
-            EXCEPTION WHEN OTHERS THEN :oltp_ratio := -1; END;
-
-            -- QUERY LOW (DBMS_COMPRESSION.COMP_FOR_QUERY_LOW = 4) - HCC/Exadata
-            BEGIN
-                DBMS_COMPRESSION.GET_COMPRESSION_RATIO(
-                    v_tbs, :owner, :table_name, :partition_name, 4,
-                    v_bc, v_bu, v_rc, v_ru, v_ratio, v_str);
-                :query_low_ratio := ROUND(v_ratio, 2);
-            EXCEPTION WHEN OTHERS THEN :query_low_ratio := NULL; END;
-
-            -- QUERY HIGH (DBMS_COMPRESSION.COMP_FOR_QUERY_HIGH = 8) - HCC/Exadata
-            BEGIN
-                DBMS_COMPRESSION.GET_COMPRESSION_RATIO(
-                    v_tbs, :owner, :table_name, :partition_name, 8,
-                    v_bc, v_bu, v_rc, v_ru, v_ratio, v_str);
-                :query_high_ratio := ROUND(v_ratio, 2);
-            EXCEPTION WHEN OTHERS THEN :query_high_ratio := NULL; END;
-
-            -- ARCHIVE LOW (DBMS_COMPRESSION.COMP_FOR_ARCHIVE_LOW = 16) - HCC/Exadata
-            BEGIN
-                DBMS_COMPRESSION.GET_COMPRESSION_RATIO(
-                    v_tbs, :owner, :table_name, :partition_name, 16,
-                    v_bc, v_bu, v_rc, v_ru, v_ratio, v_str);
-                :archive_low_ratio := ROUND(v_ratio, 2);
-            EXCEPTION WHEN OTHERS THEN :archive_low_ratio := NULL; END;
-
-            -- ARCHIVE HIGH (DBMS_COMPRESSION.COMP_FOR_ARCHIVE_HIGH = 32) - HCC/Exadata
-            BEGIN
-                DBMS_COMPRESSION.GET_COMPRESSION_RATIO(
-                    v_tbs, :owner, :table_name, :partition_name, 32,
-                    v_bc, v_bu, v_rc, v_ru, v_ratio, v_str);
-                :archive_high_ratio := ROUND(v_ratio, 2);
-            EXCEPTION WHEN OTHERS THEN :archive_high_ratio := NULL; END;
-        END;
-        """
-
-        out_params = {
-            'basic_ratio': float,
-            'oltp_ratio': float,
-            'query_low_ratio': float,
-            'query_high_ratio': float,
-            'archive_low_ratio': float,
-            'archive_high_ratio': float,
-        }
-
-        try:
-            result = TargetConnector.execute_procedure_with_output(
-                database_id, plsql,
-                in_params={'owner': owner, 'table_name': table_name, 'partition_name': partition_name},
-                out_params=out_params
-            )
-
-            ratios = {
-                'basic': result.get('basic_ratio'),
-                'oltp': result.get('oltp_ratio'),
-                'query_low': result.get('query_low_ratio'),
-                'query_high': result.get('query_high_ratio'),
-                'archive_low': result.get('archive_low_ratio'),
-                'archive_high': result.get('archive_high_ratio'),
-            }
-
-            # Check if DBMS_COMPRESSION failed for standard types (-1 = error)
-            basic_failed = (ratios['basic'] is not None and ratios['basic'] < 0)
-            oltp_failed = (ratios['oltp'] is not None and ratios['oltp'] < 0)
-
-            if basic_failed and oltp_failed:
-                # DBMS_COMPRESSION unavailable (e.g., Oracle Free SAMPLE BLOCK bug)
-                # Fall back to CTAS sampling for BASIC + OLTP only
-                log_warning(
-                    f"DBMS_COMPRESSION unavailable for {owner}.{table_name}, "
-                    f"falling back to CTAS sampling"
-                )
-                fallback = TargetQueries._get_compression_ratios_ctas(
-                    database_id, owner, table_name
-                )
-                ratios['basic'] = fallback.get('basic', 1)
-                ratios['oltp'] = fallback.get('oltp', 1)
-            else:
-                # Clean up failed individual tests (set -1 to 1)
-                for key in ('basic', 'oltp'):
-                    if ratios[key] is not None and ratios[key] < 0:
-                        ratios[key] = 1
-
-            return ratios
-
-        except Exception as e:
-            log_warning(f"Compression ratio test failed for {owner}.{table_name}: {e}")
-            return {'basic': 1, 'oltp': 1, 'query_low': None, 'query_high': None,
-                    'archive_low': None, 'archive_high': None}
-
-    @staticmethod
     def _get_compression_ratios_ctas(
         database_id: int, owner: str, table_name: str, sample_rows: int = 5000
     ) -> Dict[str, float]:
@@ -971,7 +828,7 @@ class TargetQueries:
         """
         stats = table_stats or {}
 
-        # --- Compute effective hotness (same adjustments as _evaluate_strategy) ---
+        # --- Compute effective hotness adjusting for table statistics ---
         effective_hotness = hotness_score
 
         last_analyzed = stats.get('last_analyzed')
@@ -1099,129 +956,6 @@ class TargetQueries:
         'QUERY LOW': 'query_low', 'QUERY HIGH': 'query_high',
         'ARCHIVE LOW': 'archive_low', 'ARCHIVE HIGH': 'archive_high',
     }
-
-    @staticmethod
-    def _evaluate_strategy(
-        rules: List[Dict],
-        object_type: str,
-        hotness_score: float,
-        ratios: Dict[str, Any],
-        table_stats: Optional[Dict[str, Any]] = None
-    ) -> str:
-        """Evaluate strategy rules to determine compression recommendation.
-
-        Considers:
-        - Strategy rules (hotness bands mapped to compression types)
-        - Compression ratios from DBMS_COMPRESSION
-        - Table statistics: avg_row_len, last_analyzed, column null density,
-          distinct cardinality (from dba_tab_col_statistics)
-
-        Decision flow:
-        1. If strategy rules match hotness band and ratio is valid, use rule.
-        2. Otherwise, compute an effective hotness that blends DML activity
-           with table statistics (data age, null density, row width).
-        3. Pick the best compression type matching effective hotness and
-           available ratios.
-
-        Args:
-            rules: Strategy rules from central DB
-            object_type: 'TABLE', 'INDEX', etc.
-            hotness_score: 0-100 DML hotness score
-            ratios: dict of compression ratios (basic, oltp, query_low, etc.)
-            table_stats: optional dict with keys: avg_row_len, last_analyzed,
-                         num_rows, avg_null_pct, avg_distinct, num_columns
-
-        Returns:
-            Compression type: NONE/BASIC/OLTP/QUERY LOW/QUERY HIGH/ARCHIVE LOW/ARCHIVE HIGH
-        """
-        stats = table_stats or {}
-
-        # --- Compute effective hotness adjusting for table statistics ---
-        effective_hotness = hotness_score
-
-        # Stale/unanalyzed data is likely cold → lower effective hotness
-        last_analyzed = stats.get('last_analyzed')
-        if last_analyzed:
-            from datetime import datetime, date
-            try:
-                if isinstance(last_analyzed, (datetime, date)):
-                    age_days = (datetime.now() - (last_analyzed if isinstance(last_analyzed, datetime)
-                                else datetime.combine(last_analyzed, datetime.min.time()))).days
-                else:
-                    age_days = 0
-                # Tables not analyzed in >90 days are likely cold
-                if age_days > 365:
-                    effective_hotness = max(0, effective_hotness - 30)
-                elif age_days > 90:
-                    effective_hotness = max(0, effective_hotness - 15)
-            except Exception:
-                pass
-
-        # High NULL density → data compresses very well, favor deeper compression
-        avg_null_pct = stats.get('avg_null_pct', 0) or 0
-        if avg_null_pct > 0.5:
-            # >50% NULLs on average → push toward deeper compression (lower hotness)
-            effective_hotness = max(0, effective_hotness - 10)
-        elif avg_null_pct > 0.3:
-            effective_hotness = max(0, effective_hotness - 5)
-
-        # Low cardinality → repetitive data → compresses well
-        avg_distinct = stats.get('avg_distinct', 0) or 0
-        num_rows = stats.get('num_rows', 0) or 0
-        if num_rows > 0 and avg_distinct > 0:
-            distinct_ratio = avg_distinct / num_rows
-            if distinct_ratio < 0.01:
-                # Very repetitive data → favor deeper compression
-                effective_hotness = max(0, effective_hotness - 10)
-            elif distinct_ratio < 0.1:
-                effective_hotness = max(0, effective_hotness - 5)
-
-        # Wide rows benefit more from compression
-        avg_row_len = stats.get('avg_row_len', 0) or 0
-        if avg_row_len > 500:
-            effective_hotness = max(0, effective_hotness - 5)
-
-        # --- Try strategy rules with effective hotness ---
-        for rule in rules:
-            if rule.get('object_type') == object_type:
-                if rule.get('hotness_min', 0) <= effective_hotness <= rule.get('hotness_max', 100):
-                    comp_type = rule['compression_type']
-                    ratio_key = TargetQueries._COMP_TYPE_RATIO_KEY.get(comp_type)
-                    ratio_val = ratios.get(ratio_key) if ratio_key else None
-                    if ratio_val and ratio_val > 1:
-                        return comp_type
-                    continue
-
-        # --- Fallback: pick best available compression based on ratios + effective hotness ---
-        basic = ratios.get('basic') or 1
-        oltp = ratios.get('oltp') or 1
-        query_low = ratios.get('query_low') or 0
-        query_high = ratios.get('query_high') or 0
-        archive_low = ratios.get('archive_low') or 0
-        archive_high = ratios.get('archive_high') or 0
-
-        best_hcc = max(query_low, query_high, archive_low, archive_high)
-        best_std = max(basic, oltp)
-
-        if best_hcc >= 2 and effective_hotness < 50:
-            # HCC only if data is not too hot (HCC penalizes DML)
-            hcc_options = [
-                ('ARCHIVE HIGH', archive_high), ('ARCHIVE LOW', archive_low),
-                ('QUERY HIGH', query_high), ('QUERY LOW', query_low),
-            ]
-            # For warm-ish data (25-50), prefer QUERY over ARCHIVE
-            if effective_hotness >= 25:
-                hcc_options = [
-                    ('QUERY HIGH', query_high), ('QUERY LOW', query_low),
-                    ('ARCHIVE LOW', archive_low), ('ARCHIVE HIGH', archive_high),
-                ]
-            return max(hcc_options, key=lambda x: x[1])[0]
-        elif best_std >= 2:
-            # Hot data or no HCC available → OLTP (handles DML well)
-            return 'OLTP' if effective_hotness >= 30 or oltp >= basic else 'BASIC'
-        elif best_std >= 1.5:
-            return 'BASIC'
-        return 'NONE'
 
     @staticmethod
     def _generate_rationale(
@@ -1538,6 +1272,20 @@ class TargetQueries:
         )
         ddl_exec = ddl.rstrip().rstrip(';')
 
+        # Pre-compression validation: check for LOB columns
+        try:
+            lob_q = """
+                SELECT COUNT(*) as lob_count FROM all_tab_columns
+                WHERE owner = :owner AND table_name = :table_name
+                  AND data_type IN ('BLOB', 'CLOB', 'NCLOB', 'LONG')
+            """
+            lob_df = TargetConnector.execute_query(database_id, lob_q,
+                                                   {'owner': owner, 'table_name': table_name})
+            if not lob_df.empty and int(lob_df.iloc[0]['LOB_COUNT'] or 0) > 0:
+                log_warning(f"{owner}.{table_name} has LOB columns — MOVE may need LOB storage clause")
+        except Exception:
+            pass
+
         # Get original size from target before compression
         orig_size = 0
         try:
@@ -1586,6 +1334,34 @@ class TargetQueries:
             elapsed = _time.perf_counter() - t0
 
             if success:
+                # Rebuild unusable indexes after ALTER TABLE MOVE
+                idx_rebuilt = 0
+                idx_time = 0
+                try:
+                    idx_q = """
+                        SELECT owner, index_name FROM all_indexes
+                        WHERE table_owner = :owner AND table_name = :table_name
+                          AND status = 'UNUSABLE'
+                    """
+                    idx_params = {'owner': owner, 'table_name': table_name}
+                    idx_df = TargetConnector.execute_query(database_id, idx_q, idx_params)
+                    if not idx_df.empty:
+                        it0 = _time.perf_counter()
+                        for _, idx_row in idx_df.iterrows():
+                            idx_owner = idx_row['OWNER']
+                            idx_name = idx_row['INDEX_NAME']
+                            try:
+                                TargetConnector.execute_plsql(
+                                    database_id,
+                                    f"BEGIN EXECUTE IMMEDIATE 'ALTER INDEX {idx_owner}.{idx_name} REBUILD ONLINE PARALLEL {parallel_degree}'; END;"
+                                )
+                                idx_rebuilt += 1
+                            except Exception:
+                                log_warning(f"Failed to rebuild index {idx_owner}.{idx_name}")
+                        idx_time = round(_time.perf_counter() - it0, 1)
+                except Exception:
+                    pass
+
                 # Get compressed size
                 comp_size = 0
                 try:
@@ -1596,6 +1372,7 @@ class TargetQueries:
                     pass
 
                 ratio = round(orig_size / comp_size, 2) if comp_size > 0 else None
+                total_elapsed = round(elapsed + idx_time, 1)
 
                 # Update history to SUCCESS
                 CentralConnector.execute_dml("""
@@ -1604,19 +1381,23 @@ class TargetQueries:
                         end_time = SYSTIMESTAMP,
                         duration_seconds = :dur,
                         compressed_size_bytes = :comp_size,
-                        compression_ratio_achieved = :ratio
+                        compression_ratio_achieved = :ratio,
+                        indexes_rebuilt_count = :idx_cnt,
+                        index_rebuild_time_sec = :idx_time
                     WHERE owner = :owner AND object_name = :tbl
                       AND operation_status = 'IN_PROGRESS'
                       AND ROWNUM = 1
                 """, {
-                    'dur': round(elapsed, 1), 'comp_size': comp_size,
-                    'ratio': ratio, 'owner': owner, 'tbl': table_name
+                    'dur': total_elapsed, 'comp_size': comp_size,
+                    'ratio': ratio, 'owner': owner, 'tbl': table_name,
+                    'idx_cnt': idx_rebuilt, 'idx_time': idx_time
                 })
 
                 saved_mb = round((orig_size - comp_size) / 1048576, 2)
+                idx_msg = f", {idx_rebuilt} indexes rebuilt" if idx_rebuilt else ""
                 return {
                     'success': True,
-                    'message': f"Compression completed in {elapsed:.0f}s, saved {saved_mb} MB"
+                    'message': f"Compression completed in {total_elapsed:.0f}s, saved {saved_mb} MB{idx_msg}"
                 }
 
             # DDL returned False — unknown failure
@@ -1649,122 +1430,63 @@ class TargetQueries:
         return {'error': 'Execution failed'}
 
     @staticmethod
-    def execute_partition_compression(
-        database_id: int,
-        owner: str,
-        table_name: str,
-        partition_name: str,
-        compression_type: str
-    ) -> Dict[str, Any]:
-        """
-        Execute compression for a specific partition on the target database.
-
-        Args:
-            database_id: Target database identifier
-            owner: Schema owner
-            table_name: Table name
-            partition_name: Partition name
-            compression_type: Target compression type
-
-        Returns:
-            dict with execution result
-        """
-        try:
-            ddl = TargetQueries.generate_ddl(
-                owner, table_name, compression_type, partition_name
-            )
-            ddl_exec = ddl.rstrip().rstrip(';')
-
-            success = TargetConnector.execute_plsql(
-                database_id,
-                f"BEGIN EXECUTE IMMEDIATE q'[{ddl_exec}]'; END;"
-            )
-
-            if success:
-                # Get the latest history_id after successful execution
-                history_query = """
-                    SELECT MAX(history_id) as history_id
-                    FROM t_compression_history
-                    WHERE owner = :owner
-                      AND object_name = :table_name
-                      AND partition_name = :partition_name
-                """
-                hist_df = TargetConnector.execute_query(
-                    database_id,
-                    history_query,
-                    {'owner': owner, 'table_name': table_name, 'partition_name': partition_name}
-                )
-                history_id = hist_df.iloc[0]['HISTORY_ID'] if not hist_df.empty else None
-
-                return {
-                    'success': True,
-                    'execution_id': history_id,
-                    'message': f"Partition compression completed. History ID: {history_id}"
-                }
-        except Exception as e:
-            log_error(e, "TargetQueries.execute_partition_compression", {
-                'database_id': database_id,
-                'owner': owner,
-                'table_name': table_name,
-                'partition_name': partition_name,
-                'compression_type': compression_type
-            })
-            return {'error': str(e)}
-
-        return {'error': 'Partition compression failed'}
-
-    @staticmethod
     def batch_execute(
         database_id: int,
         items: List[Dict],
         dry_run: bool = True,
-        parallel_degree: int = 4
+        parallel_degree: int = 4,
+        concurrency: int = 1
     ) -> Dict[str, Any]:
         """
         Execute compression for multiple items in batch on the target database.
+        Uses ThreadPoolExecutor for concurrent table compression.
 
         Args:
             database_id: Target database identifier
             items: List of dicts, each with owner, table_name, compression_type,
                    and optional partition_name
             dry_run: If True, only generate DDL without executing
-            parallel_degree: Parallel execution degree per table
+            parallel_degree: Parallel execution degree per table (PARALLEL N in DDL)
+            concurrency: Number of tables to compress simultaneously
 
         Returns:
             dict with batch execution results
         """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _compress_one(item):
+            res = TargetQueries.execute_compression(
+                database_id=database_id,
+                owner=item.get('owner'),
+                table_name=item.get('table_name'),
+                compression_type=item.get('compression_type'),
+                partition_name=item.get('partition_name'),
+                dry_run=dry_run,
+                parallel_degree=parallel_degree
+            )
+            return {
+                'owner': item.get('owner'),
+                'table_name': item.get('table_name'),
+                'partition_name': item.get('partition_name'),
+                'compression_type': item.get('compression_type'),
+                'result': res
+            }
+
         results = []
         success_count = 0
         error_count = 0
 
-        for item in items:
-            owner = item.get('owner')
-            table_name = item.get('table_name')
-            compression_type = item.get('compression_type')
-            partition_name = item.get('partition_name')
+        max_workers = max(1, min(concurrency, len(items)))
 
-            result = TargetQueries.execute_compression(
-                database_id=database_id,
-                owner=owner,
-                table_name=table_name,
-                compression_type=compression_type,
-                partition_name=partition_name,
-                dry_run=dry_run,
-                parallel_degree=parallel_degree
-            )
-
-            results.append({
-                'owner': owner,
-                'table_name': table_name,
-                'partition_name': partition_name,
-                'compression_type': compression_type,
-                'result': result
-            })
-
-            if result.get('success'):
-                success_count += 1
-            else:
-                error_count += 1
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_compress_one, item): item for item in items}
+            for future in as_completed(futures):
+                entry = future.result()
+                results.append(entry)
+                if entry['result'].get('success'):
+                    success_count += 1
+                else:
+                    error_count += 1
 
         return {
             'total': len(items),

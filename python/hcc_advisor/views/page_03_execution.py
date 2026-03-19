@@ -257,7 +257,7 @@ def show_batch_execution():
             cpu_count_batch = TargetQueries.get_cpu_count(db_id)
             max_parallel_batch = max(1, cpu_count_batch // 2)
 
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
 
         with col1:
             batch_parallel = st.slider(
@@ -270,6 +270,16 @@ def show_batch_execution():
             )
 
         with col2:
+            batch_concurrency = st.slider(
+                "Concurrent Tables",
+                min_value=1,
+                max_value=max_parallel_batch,
+                value=1,
+                key="batch_concurrency",
+                help=f"How many tables to compress simultaneously (max CPU_COUNT/2 = {max_parallel_batch})"
+            )
+
+        with col3:
             batch_confirm = st.checkbox(
                 "Confirm Batch Execution",
                 value=False,
@@ -302,7 +312,8 @@ def show_batch_execution():
                         result = TargetQueries.batch_execute(
                             db_id, items,
                             dry_run=False,
-                            parallel_degree=batch_parallel
+                            parallel_degree=batch_parallel,
+                            concurrency=batch_concurrency
                         )
 
                         if result.get('errors', 0) > 0:

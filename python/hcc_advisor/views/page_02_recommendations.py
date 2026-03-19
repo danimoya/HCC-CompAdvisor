@@ -995,6 +995,17 @@ def show_compression_status_tab(db_id):
 
     stab1, stab2, stab3 = st.tabs(["Tables", "Partitions", "Subpartitions"])
 
+    # Load recommendations for comparison
+    recs_df = CentralQueries.get_recommendations(limit=500, min_savings_pct=0, database_id=db_id,
+                                                  schema=schema if schema != "All" else None)
+    rec_map = {}
+    if not recs_df.empty:
+        recs_df.columns = [c.lower() for c in recs_df.columns]
+        for _, r in recs_df.iterrows():
+            key = f"{r.get('table_owner','')}.{r.get('table_name','')}"
+            if r.get('object_type', 'TABLE') == 'TABLE' and key not in rec_map:
+                rec_map[key] = r.get('recommended_strategy', '')
+
     with stab1:
         q = f"""
             SELECT t.owner, t.table_name, t.compression, t.compress_for,
@@ -1011,7 +1022,20 @@ def show_compression_status_tab(db_id):
         df_t = TargetConnector.execute_query(db_id, q, params if params else None)
         if not df_t.empty:
             df_t.columns = [c.lower() for c in df_t.columns]
-            st.dataframe(df_t, use_container_width=True, hide_index=True)
+            # Add recommended column for comparison
+            df_t['recommended'] = df_t.apply(
+                lambda r: rec_map.get(f"{r['owner']}.{r['table_name']}", ''), axis=1
+            )
+            df_t['match'] = df_t.apply(
+                lambda r: 'Yes' if r['recommended'] and r.get('compress_for', '') == r['recommended'] else
+                          ('--' if not r['recommended'] else 'No'),
+                axis=1
+            )
+            st.dataframe(df_t, use_container_width=True, hide_index=True,
+                         column_config={
+                             'match': st.column_config.TextColumn('Match', help='Does current match recommended?'),
+                             'recommended': st.column_config.TextColumn('Recommended'),
+                         })
         else:
             st.info("No tables found.")
 
