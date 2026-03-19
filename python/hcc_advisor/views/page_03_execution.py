@@ -184,8 +184,15 @@ def show_batch_execution():
 
     db_id = st.session_state.get('active_database_id')
 
+    # Schema filter for batch
+    schemas = TargetQueries.get_available_schemas(db_id) if db_id else []
+    schema_filter = st.selectbox("Filter by Schema", ["All Schemas"] + schemas, key="batch_schema")
+
     # Fetch recommendations using central database query
-    df = CentralQueries.get_recommendations(limit=100, min_savings_pct=10.0, database_id=db_id)
+    schema_val = None if schema_filter == "All Schemas" else schema_filter
+    df = CentralQueries.get_recommendations(
+        limit=200, min_savings_pct=5.0, database_id=db_id, schema=schema_val
+    )
 
     if df.empty:
         st.warning("No recommendations available. Run an analysis first.")
@@ -194,8 +201,30 @@ def show_batch_execution():
     # Normalize column names to lowercase
     df.columns = [col.lower() for col in df.columns]
 
-    # Multi-select
-    st.markdown("Select multiple tables for batch execution:")
+    # Show schema summary with totals
+    if schema_val:
+        total_current = df['current_size_mb'].sum() if 'current_size_mb' in df.columns else 0
+        total_est = df['estimated_size_mb'].sum() if 'estimated_size_mb' in df.columns else 0
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("Tables", len(df))
+        with c2:
+            st.metric("Current Total", f"{total_current:.1f} MB")
+        with c3:
+            st.metric("Estimated After", f"{total_est:.1f} MB")
+
+        st.dataframe(
+            df[['table_owner', 'table_name', 'current_size_mb', 'recommended_strategy',
+                'estimated_size_mb', 'savings_pct']].rename(columns={
+                'table_owner': 'Owner', 'table_name': 'Table',
+                'current_size_mb': 'Current (MB)', 'recommended_strategy': 'Advised',
+                'estimated_size_mb': 'Est. Size (MB)', 'savings_pct': 'Savings %'
+            }),
+            use_container_width=True, hide_index=True
+        )
+
+    st.markdown("---")
+    st.markdown("Select tables for batch execution:")
 
     selected_tables = st.multiselect(
         "Tables",

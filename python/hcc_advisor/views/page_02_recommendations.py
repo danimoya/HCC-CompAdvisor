@@ -98,14 +98,20 @@ def show_recommendations_page():
 
     st.markdown("---")
 
-    # Two tabs: Overview & Charts | Detailed Recommendations
-    tab1, tab2 = st.tabs(["Overview & Charts", "Detailed Recommendations"])
+    # Three tabs
+    tab1, tab2, tab3 = st.tabs(["Overview & Charts", "Detailed Recommendations", "Compression Status"])
 
     # =========================================================================
     # TAB 1: Overview & Charts
     # =========================================================================
     with tab1:
         show_overview_tab(df)
+
+    # =========================================================================
+    # TAB 3: Current Compression Status from Target DB
+    # =========================================================================
+    with tab3:
+        show_compression_status_tab(db_id)
 
     # =========================================================================
     # TAB 2: Detailed Recommendations with Batch Actions
@@ -968,6 +974,84 @@ def execute_batch_compression(selected_df: pd.DataFrame, original_df: pd.DataFra
                 for result in results:
                     if result['Status'] == 'DDL Generated':
                         st.code(result['Message'], language='sql')
+
+
+def show_compression_status_tab(db_id):
+    """Show current compression status queried from the target database."""
+    from hcc_advisor.utils.target_connector import TargetConnector
+
+    if not db_id:
+        st.warning("Select a target database from the sidebar.")
+        return
+
+    schemas = TargetQueries.get_available_schemas(db_id)
+    schema = st.selectbox("Schema", ["All"] + schemas, key="comp_status_schema")
+    schema_filter = "" if schema == "All" else "AND t.owner = :schema"
+    params = {'schema': schema} if schema != "All" else {}
+
+    if not st.button("Refresh Compression Status", key="comp_status_refresh"):
+        st.info("Click Refresh to query the target database.")
+        return
+
+    stab1, stab2, stab3 = st.tabs(["Tables", "Partitions", "Subpartitions"])
+
+    with stab1:
+        q = f"""
+            SELECT t.owner, t.table_name, t.compression, t.compress_for,
+                   t.num_rows, ROUND(NVL(s.bytes,0)/1048576, 2) as size_mb
+            FROM all_tables t
+            LEFT JOIN (SELECT owner, segment_name, SUM(bytes) as bytes
+                       FROM dba_segments WHERE segment_type LIKE 'TABLE%'
+                       GROUP BY owner, segment_name
+            ) s ON s.owner = t.owner AND s.segment_name = t.table_name
+            WHERE t.temporary = 'N' {schema_filter}
+              AND NVL(s.bytes, 0) > 0
+            ORDER BY s.bytes DESC NULLS LAST
+        """
+        df_t = TargetConnector.execute_query(db_id, q, params if params else None)
+        if not df_t.empty:
+            df_t.columns = [c.lower() for c in df_t.columns]
+            st.dataframe(df_t, use_container_width=True, hide_index=True)
+        else:
+            st.info("No tables found.")
+
+    with stab2:
+        q = f"""
+            SELECT p.table_owner as owner, p.table_name, p.partition_name,
+                   p.compression, p.compress_for, p.num_rows,
+                   ROUND(NVL(s.bytes,0)/1048576, 2) as size_mb
+            FROM dba_tab_partitions p
+            LEFT JOIN dba_segments s ON s.owner = p.table_owner
+                AND s.segment_name = p.table_name AND s.partition_name = p.partition_name
+                AND s.segment_type = 'TABLE PARTITION'
+            WHERE 1=1 {schema_filter.replace('t.owner', 'p.table_owner')}
+            ORDER BY s.bytes DESC NULLS LAST
+        """
+        df_p = TargetConnector.execute_query(db_id, q, params if params else None)
+        if not df_p.empty:
+            df_p.columns = [c.lower() for c in df_p.columns]
+            st.dataframe(df_p, use_container_width=True, hide_index=True)
+        else:
+            st.info("No partitions found.")
+
+    with stab3:
+        q = f"""
+            SELECT sp.table_owner as owner, sp.table_name, sp.partition_name,
+                   sp.subpartition_name, sp.compression, sp.compress_for,
+                   sp.num_rows, ROUND(NVL(s.bytes,0)/1048576, 2) as size_mb
+            FROM dba_tab_subpartitions sp
+            LEFT JOIN dba_segments s ON s.owner = sp.table_owner
+                AND s.segment_name = sp.table_name AND s.partition_name = sp.subpartition_name
+                AND s.segment_type = 'TABLE SUBPARTITION'
+            WHERE 1=1 {schema_filter.replace('t.owner', 'sp.table_owner')}
+            ORDER BY s.bytes DESC NULLS LAST
+        """
+        df_s = TargetConnector.execute_query(db_id, q, params if params else None)
+        if not df_s.empty:
+            df_s.columns = [c.lower() for c in df_s.columns]
+            st.dataframe(df_s, use_container_width=True, hide_index=True)
+        else:
+            st.info("No subpartitions found.")
 
 
 if __name__ == "__main__":

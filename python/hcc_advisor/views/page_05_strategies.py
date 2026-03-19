@@ -20,11 +20,12 @@ def show_strategies_page():
     st.markdown("---")
 
     # Create tabs for different sections
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "Strategy Overview",
         "Edit Strategies",
         "Strategy Rules",
-        "Compare Strategies"
+        "Compare Strategies",
+        "SQL Patches"
     ])
 
     with tab1:
@@ -38,6 +39,9 @@ def show_strategies_page():
 
     with tab4:
         show_strategy_comparison()
+
+    with tab5:
+        show_sql_patches()
 
 
 def show_strategy_overview():
@@ -703,6 +707,94 @@ def show_strategy_comparison():
                     best_strategy = display_df.loc[best_idx, 'Strategy']
                     best_savings = display_df.loc[best_idx, 'Savings %']
                     st.success(f"**Recommended Strategy:** {best_strategy} ({best_savings:.1f}% savings)")
+
+
+def show_sql_patches():
+    """Show SQL patch management UI."""
+    import os
+    from pathlib import Path
+    from hcc_advisor.utils.central_connector import CentralConnector
+
+    st.subheader("SQL Patch Management")
+    st.markdown("Apply versioned SQL patches to the central database without redeploying.")
+
+    patches_dir = Path(__file__).resolve().parents[2] / 'sql' / 'patches'
+
+    if not patches_dir.exists():
+        st.info(f"No patches directory found at `sql/patches/`.")
+        return
+
+    # Scan for patch directories (YYYYMMDD-description)
+    patch_dirs = sorted(
+        [d for d in patches_dir.iterdir() if d.is_dir()],
+        key=lambda d: d.name, reverse=True
+    )
+
+    if not patch_dirs:
+        st.info("No patches found.")
+        return
+
+    # Get applied patches from DB (if T_PATCH_HISTORY exists)
+    applied = set()
+    try:
+        df = CentralConnector.execute_query(
+            "SELECT patch_name FROM t_patch_history WHERE status = 'SUCCESS'"
+        )
+        if not df.empty:
+            applied = set(df['PATCH_NAME'].tolist())
+    except Exception:
+        pass  # Table may not exist yet
+
+    for pdir in patch_dirs:
+        patch_name = pdir.name
+        is_applied = patch_name in applied
+        status_icon = "🟢" if is_applied else "⚪"
+
+        readme_path = pdir / 'readme.md'
+        sql_path = pdir / 'patch.sql'
+        readme_text = readme_path.read_text() if readme_path.exists() else "No description."
+        sql_text = sql_path.read_text() if sql_path.exists() else None
+
+        with st.expander(f"{status_icon} {patch_name} {'(applied)' if is_applied else ''}"):
+            st.markdown(readme_text)
+            if sql_text:
+                st.code(sql_text, language='sql')
+
+                if not is_applied:
+                    if st.button(f"Apply Patch: {patch_name}", key=f"apply_{patch_name}"):
+                        with st.spinner("Applying patch..."):
+                            try:
+                                # Split on / for PL/SQL blocks
+                                blocks = [b.strip() for b in sql_text.split('\n/\n') if b.strip()]
+                                for block in blocks:
+                                    clean = block.rstrip().rstrip('/')
+                                    if clean:
+                                        CentralConnector.execute_plsql(clean)
+
+                                # Record success
+                                try:
+                                    CentralConnector.execute_dml(
+                                        "INSERT INTO t_patch_history (patch_name) VALUES (:n)",
+                                        {'n': patch_name}
+                                    )
+                                except Exception:
+                                    pass
+                                st.success(f"Patch {patch_name} applied successfully!")
+                                st.rerun()
+                            except Exception as e:
+                                # Record failure
+                                try:
+                                    CentralConnector.execute_dml(
+                                        "INSERT INTO t_patch_history (patch_name, status, error_message) VALUES (:n, 'FAILED', :e)",
+                                        {'n': patch_name, 'e': str(e)[:4000]}
+                                    )
+                                except Exception:
+                                    pass
+                                st.error(f"Patch failed: {e}")
+                else:
+                    st.caption("Already applied.")
+            else:
+                st.warning("No patch.sql found in this directory.")
 
 
 if __name__ == "__main__":

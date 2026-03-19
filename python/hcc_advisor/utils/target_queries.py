@@ -1527,57 +1527,122 @@ class TargetQueries:
                 'message': 'DDL generated successfully (dry run)'
             }
 
-        try:
-            # Execute compression via direct ALTER TABLE MOVE DDL
-            ddl = TargetQueries.generate_ddl(
-                owner, table_name, compression_type, partition_name,
-                parallel_degree=parallel_degree
-            )
-            # Strip trailing semicolon — oracledb executes DDL without it
-            ddl_exec = ddl.rstrip().rstrip(';')
+        import time as _time
+        from datetime import datetime
+        from hcc_advisor.utils.central_queries import CentralQueries
+        from hcc_advisor.utils.central_connector import CentralConnector
 
+        ddl = TargetQueries.generate_ddl(
+            owner, table_name, compression_type, partition_name,
+            parallel_degree=parallel_degree
+        )
+        ddl_exec = ddl.rstrip().rstrip(';')
+
+        # Get original size from target before compression
+        orig_size = 0
+        try:
+            seg_q = """
+                SELECT NVL(SUM(bytes), 0) as size_bytes
+                FROM dba_segments WHERE owner = :owner AND segment_name = :table_name
+            """
+            seg_params = {'owner': owner, 'table_name': table_name}
+            if partition_name:
+                seg_q = """
+                    SELECT NVL(SUM(bytes), 0) as size_bytes
+                    FROM dba_segments WHERE owner = :owner AND segment_name = :table_name
+                    AND partition_name = :partition_name
+                """
+                seg_params['partition_name'] = partition_name
+            seg_df = TargetConnector.execute_query(database_id, seg_q, seg_params)
+            if not seg_df.empty:
+                orig_size = int(seg_df.iloc[0]['SIZE_BYTES'] or 0)
+        except Exception:
+            pass
+
+        # Insert IN_PROGRESS history record
+        start_dt = datetime.now()
+        history_record = {
+            'owner': owner,
+            'object_name': table_name,
+            'object_type': 'PARTITION' if partition_name else 'TABLE',
+            'partition_name': partition_name,
+            'compression_type_applied': compression_type,
+            'compression_clause': ddl_exec,
+            'execution_mode': 'ONLINE',
+            'parallel_degree': parallel_degree,
+            'original_size_bytes': orig_size,
+            'operation_status': 'IN_PROGRESS',
+            'start_time': start_dt,
+            'executed_by': 'HCC_ADVISOR',
+        }
+        CentralQueries.store_compression_history(database_id, history_record)
+
+        try:
+            t0 = _time.perf_counter()
             success = TargetConnector.execute_plsql(
                 database_id,
                 f"BEGIN EXECUTE IMMEDIATE q'[{ddl_exec}]'; END;"
             )
+            elapsed = _time.perf_counter() - t0
 
             if success:
-                # Get the latest history_id after successful execution
-                history_query = """
-                    SELECT MAX(history_id) as history_id
-                    FROM t_compression_history
-                    WHERE owner = :owner
-                      AND object_name = :table_name
-                """
-                hist_params = {'owner': owner, 'table_name': table_name}
-                if partition_name:
-                    history_query = """
-                        SELECT MAX(history_id) as history_id
-                        FROM t_compression_history
-                        WHERE owner = :owner
-                          AND object_name = :table_name
-                          AND partition_name = :partition_name
-                    """
-                    hist_params['partition_name'] = partition_name
+                # Get compressed size
+                comp_size = 0
+                try:
+                    seg_df2 = TargetConnector.execute_query(database_id, seg_q, seg_params)
+                    if not seg_df2.empty:
+                        comp_size = int(seg_df2.iloc[0]['SIZE_BYTES'] or 0)
+                except Exception:
+                    pass
 
-                hist_df = TargetConnector.execute_query(
-                    database_id, history_query, hist_params
-                )
-                history_id = hist_df.iloc[0]['HISTORY_ID'] if not hist_df.empty else None
+                ratio = round(orig_size / comp_size, 2) if comp_size > 0 else None
 
+                # Update history to SUCCESS
+                CentralConnector.execute_dml("""
+                    UPDATE t_compression_history
+                    SET operation_status = 'SUCCESS',
+                        end_time = SYSTIMESTAMP,
+                        duration_seconds = :dur,
+                        compressed_size_bytes = :comp_size,
+                        compression_ratio_achieved = :ratio
+                    WHERE owner = :owner AND object_name = :tbl
+                      AND operation_status = 'IN_PROGRESS'
+                      AND ROWNUM = 1
+                """, {
+                    'dur': round(elapsed, 1), 'comp_size': comp_size,
+                    'ratio': ratio, 'owner': owner, 'tbl': table_name
+                })
+
+                saved_mb = round((orig_size - comp_size) / 1048576, 2)
                 return {
                     'success': True,
-                    'execution_id': history_id,
-                    'message': f"Compression completed. History ID: {history_id}"
+                    'message': f"Compression completed in {elapsed:.0f}s, saved {saved_mb} MB"
                 }
 
+            # DDL returned False — unknown failure
+            CentralConnector.execute_dml("""
+                UPDATE t_compression_history
+                SET operation_status = 'FAILED', end_time = SYSTIMESTAMP,
+                    duration_seconds = :dur, error_message = 'DDL execution returned failure'
+                WHERE owner = :owner AND object_name = :tbl
+                  AND operation_status = 'IN_PROGRESS' AND ROWNUM = 1
+            """, {'dur': round(elapsed, 1), 'owner': owner, 'tbl': table_name})
+
         except Exception as e:
+            # Update history to FAILED
+            try:
+                CentralConnector.execute_dml("""
+                    UPDATE t_compression_history
+                    SET operation_status = 'FAILED', end_time = SYSTIMESTAMP,
+                        error_message = :err
+                    WHERE owner = :owner AND object_name = :tbl
+                      AND operation_status = 'IN_PROGRESS' AND ROWNUM = 1
+                """, {'err': str(e)[:4000], 'owner': owner, 'tbl': table_name})
+            except Exception:
+                pass
             log_error(e, "TargetQueries.execute_compression", {
-                'database_id': database_id,
-                'owner': owner,
-                'table_name': table_name,
-                'compression_type': compression_type,
-                'partition_name': partition_name
+                'database_id': database_id, 'owner': owner,
+                'table_name': table_name, 'compression_type': compression_type
             })
             return {'error': str(e)}
 
