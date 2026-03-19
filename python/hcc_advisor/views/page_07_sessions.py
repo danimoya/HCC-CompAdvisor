@@ -306,9 +306,13 @@ def show_session_card(session):
             st.caption(f"Module: {module}")
             st.caption(f"Action: {action}")
 
-        # SQL ID info
+        # SQL info
         if sql_id:
-            st.caption(f"SQL ID: {sql_id}")
+            sql_text = session.get('sql_text', '')
+            if sql_text:
+                st.code(f"/* {sql_id} */ {sql_text}", language='sql')
+            else:
+                st.caption(f"SQL ID: {sql_id}")
 
         # Wait info
         if seconds_in_wait > 0:

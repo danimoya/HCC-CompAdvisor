@@ -68,25 +68,24 @@ def show_single_execution():
     st.markdown("---")
     st.subheader("Execution Parameters")
 
-    col1, col2, col3 = st.columns(3)
+    # Query CPU_COUNT from target for max parallel degree
+    max_parallel = 16
+    if db_id:
+        cpu_count = TargetQueries.get_cpu_count(db_id)
+        max_parallel = max(1, cpu_count // 2)
+
+    col1, col2 = st.columns(2)
 
     with col1:
-        dry_run = st.checkbox(
-            "Dry Run (Preview Only)",
-            value=True,
-            help="Generate DDL without making actual changes"
-        )
-
-    with col2:
         parallel_degree = st.slider(
             "Parallel Degree",
             min_value=1,
-            max_value=16,
-            value=4,
-            help="Number of parallel processes"
+            max_value=max_parallel,
+            value=min(4, max_parallel),
+            help=f"Number of parallel processes (max CPU_COUNT/2 = {max_parallel})"
         )
 
-    with col3:
+    with col2:
         confirm_execution = st.checkbox(
             "Confirm Execution",
             value=False,
@@ -134,21 +133,24 @@ def show_single_execution():
     table_name = selected_row['table_name']
     partition_name = selected_row.get('partition_name')
 
-    ddl = TargetQueries.generate_ddl(owner, table_name, recommended_strategy, partition_name)
+    ddl = TargetQueries.generate_ddl(
+        owner, table_name, recommended_strategy, partition_name,
+        parallel_degree=parallel_degree
+    )
     st.code(ddl, language="sql")
 
     # Execute button
     st.markdown("---")
 
-    if not dry_run and not confirm_execution:
-        st.warning("Please confirm execution for production changes")
+    if not confirm_execution:
+        st.warning("Check 'Confirm Execution' to enable the button")
 
     col1, col2, col3 = st.columns([1, 1, 1])
 
     with col2:
         execute_button = st.button(
             "Execute Compression",
-            disabled=(not dry_run and not confirm_execution),
+            disabled=not confirm_execution,
             use_container_width=True
         )
 
@@ -156,29 +158,23 @@ def show_single_execution():
         if not db_id:
             st.error("Select a target database from the sidebar first.")
         else:
-            analysis_id = selected_row.get('recommendation_id')
-            if analysis_id:
-                with st.spinner("Executing compression..."):
-                    result = TargetQueries.execute_compression(
-                        db_id,
-                        owner=owner,
-                        table_name=table_name,
-                        compression_type=recommended_strategy,
-                        dry_run=dry_run
-                    )
+            with st.spinner("Executing compression..."):
+                result = TargetQueries.execute_compression(
+                    db_id,
+                    owner=owner,
+                    table_name=table_name,
+                    compression_type=recommended_strategy,
+                    partition_name=partition_name,
+                    dry_run=False,
+                    parallel_degree=parallel_degree
+                )
 
-                    if result.get('error'):
-                        st.error(f"Execution failed: {result['error']}")
-                    elif result.get('dry_run'):
-                        st.success("DDL generated successfully (dry run)")
-                        st.code(result.get('ddl', ''), language='sql')
-                    elif result.get('success'):
-                        st.success(f"Execution started! ID: {result.get('execution_id')}")
-                        st.session_state.last_execution_id = result.get('execution_id')
-                    else:
-                        st.warning("Execution completed with unknown result")
-            else:
-                st.error("No valid recommendation ID found")
+                if result.get('error'):
+                    st.error(f"Execution failed: {result['error']}")
+                elif result.get('success'):
+                    st.success(result.get('message', 'Compression completed'))
+                else:
+                    st.warning("Execution completed with unknown result")
 
 
 def show_batch_execution():
@@ -227,37 +223,56 @@ def show_batch_execution():
         # Execution parameters
         st.markdown("---")
 
+        max_parallel_batch = 16
+        if db_id:
+            cpu_count_batch = TargetQueries.get_cpu_count(db_id)
+            max_parallel_batch = max(1, cpu_count_batch // 2)
+
         col1, col2 = st.columns(2)
 
         with col1:
-            batch_dry_run = st.checkbox(
-                "Dry Run (Preview Only)",
-                value=True,
-                key="batch_dry_run"
-            )
-
-        with col2:
             batch_parallel = st.slider(
                 "Parallel Degree",
                 min_value=1,
-                max_value=16,
-                value=4,
-                key="batch_parallel"
+                max_value=max_parallel_batch,
+                value=min(4, max_parallel_batch),
+                key="batch_parallel",
+                help=f"Per-table parallelism (max CPU_COUNT/2 = {max_parallel_batch})"
+            )
+
+        with col2:
+            batch_confirm = st.checkbox(
+                "Confirm Batch Execution",
+                value=False,
+                key="batch_confirm"
             )
 
         # Execute batch
         col1, col2, col3 = st.columns([1, 1, 1])
 
         with col2:
-            if st.button("Execute Batch", use_container_width=True):
+            if st.button("Execute Batch", use_container_width=True, disabled=not batch_confirm):
                 if not db_id:
                     st.error("Select a target database from the sidebar first.")
                 else:
-                    with st.spinner(f"Executing {len(selected_tables)} compressions..."):
+                    # Build proper items list from selected recommendation IDs
+                    items = []
+                    for rec_id in selected_tables:
+                        match = df[df['recommendation_id'] == rec_id]
+                        if not match.empty:
+                            row = match.iloc[0]
+                            pn = row.get('partition_name')
+                            items.append({
+                                'owner': row['table_owner'],
+                                'table_name': row['table_name'],
+                                'compression_type': row['recommended_strategy'],
+                                'partition_name': pn if pd.notna(pn) else None
+                            })
+
+                    with st.spinner(f"Executing {len(items)} compressions..."):
                         result = TargetQueries.batch_execute(
-                            db_id,
-                            analysis_ids=selected_tables,
-                            dry_run=batch_dry_run,
+                            db_id, items,
+                            dry_run=False,
                             parallel_degree=batch_parallel
                         )
 

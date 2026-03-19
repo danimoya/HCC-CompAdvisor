@@ -175,6 +175,29 @@ def show_connections_page():
     with tab2:
         st.markdown("### Add New Target Database")
 
+        # Quick test connection (outside the form)
+        with st.expander("Test Connection First", expanded=False):
+            tc1, tc2 = st.columns(2)
+            with tc1:
+                _t_host = st.text_input("Host", key="pretest_host", placeholder="hostname or IP")
+                _t_service = st.text_input("Service", key="pretest_service", placeholder="e.g., FREEPDB1")
+                _t_user = st.text_input("Username", key="pretest_user")
+            with tc2:
+                _t_port = st.number_input("Port", value=1521, min_value=1, max_value=65535, key="pretest_port")
+                _t_pass = st.text_input("Password", type="password", key="pretest_pass")
+                if st.button("Test Connection", use_container_width=True, type="primary", key="pretest_btn"):
+                    if all([_t_host, _t_service, _t_user, _t_pass]):
+                        conn_cfg = {'host': _t_host, 'port': _t_port, 'service': _t_service,
+                                    'username': _t_user, 'password': _t_pass}
+                        with st.spinner("Testing..."):
+                            ok, msg, ver = test_target_connection(conn_cfg)
+                        if ok:
+                            st.success(f"{msg} — {ver}")
+                        else:
+                            st.error(f"Failed: {msg}")
+                    else:
+                        st.warning("Fill in all fields")
+
         with st.form("new_target_form"):
             col1, col2 = st.columns(2)
 

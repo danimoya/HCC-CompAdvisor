@@ -73,12 +73,18 @@ def show_analysis_config():
                 help="Select the analysis strategy"
             )
 
+            # Dynamic max from target CPU_COUNT
+            _max_par = 16
+            if db_id:
+                _cpu = TargetQueries.get_cpu_count(db_id)
+                _max_par = max(1, _cpu // 2)
+
             parallel_degree = st.slider(
                 "Parallel Degree",
                 min_value=1,
-                max_value=16,
-                value=4,
-                help="Number of parallel workers for analysis"
+                max_value=_max_par,
+                value=min(4, _max_par),
+                help=f"Number of parallel workers (max CPU_COUNT/2 = {_max_par})"
             )
 
             include_partitions = st.checkbox(

@@ -129,10 +129,6 @@ class TargetQueries:
                 tbl_owner = table_info['owner']
                 tbl_name = table_info['table_name']
                 try:
-                    ratios = TargetQueries._get_compression_ratios(
-                        database_id, tbl_owner, tbl_name, platform_type
-                    )
-
                     hotness_key = f"{tbl_owner}.{tbl_name}"
                     dml_info = dml_stats.get(hotness_key, {})
                     hotness_score = dml_info.get('hotness_score', 0) if isinstance(dml_info, dict) else 0
@@ -150,17 +146,25 @@ class TargetQueries:
                         'num_columns': tbl_col_stats.get('num_columns', 0),
                     }
 
-                    recommended = TargetQueries._evaluate_strategy(
-                        strategy_rules, 'TABLE', hotness_score, ratios, table_stats
+                    # Determine target compression from hotness + stats FIRST
+                    recommended = TargetQueries._determine_target_compression(
+                        strategy_rules, 'TABLE', hotness_score, table_stats, platform_type
                     )
 
-                    # Use the ratio for the recommended compression type for savings
-                    rec_ratio_key = TargetQueries._COMP_TYPE_RATIO_KEY.get(recommended)
-                    rec_ratio = (ratios.get(rec_ratio_key) if rec_ratio_key else None) or 1
+                    # Only test the single advised ratio (1 call instead of 6)
+                    ratios = {k: None for k in ('basic', 'oltp', 'query_low', 'query_high', 'archive_low', 'archive_high')}
+                    rec_ratio = 1.0
+                    if recommended != 'NONE':
+                        rec_ratio = TargetQueries._get_single_compression_ratio(
+                            database_id, tbl_owner, tbl_name, recommended
+                        )
+                        ratio_key = TargetQueries._COMP_TYPE_RATIO_KEY.get(recommended)
+                        if ratio_key:
+                            ratios[ratio_key] = rec_ratio
+                        if rec_ratio <= 1:
+                            recommended = 'NONE'
 
-                    # Also compute best ratio across all types for the BEST_RATIO column
-                    all_ratios = [v for v in ratios.values() if v and v > 0]
-                    best_ratio = max(all_ratios) if all_ratios else 1
+                    best_ratio = rec_ratio if rec_ratio > 1 else 1
 
                     # Savings based on recommended compression type
                     rec_size = round(current_size_mb / rec_ratio, 2) if rec_ratio > 0 else current_size_mb
@@ -175,9 +179,6 @@ class TargetQueries:
                     if current_comp in ('DISABLED', None, ''):
                         current_comp = 'NONE'
 
-                    basic_ratio = ratios.get('basic') or 1
-                    oltp_ratio = ratios.get('oltp') or 1
-
                     result = {
                         'OWNER': tbl_owner,
                         'OBJECT_NAME': tbl_name,
@@ -188,8 +189,8 @@ class TargetQueries:
                         'ROW_COUNT': table_info.get('num_rows'),
                         'BLOCK_COUNT': table_info.get('blocks'),
                         'AVG_ROW_LENGTH': table_info.get('avg_row_len'),
-                        'BASIC_RATIO': basic_ratio,
-                        'OLTP_RATIO': oltp_ratio,
+                        'BASIC_RATIO': ratios.get('basic'),
+                        'OLTP_RATIO': ratios.get('oltp'),
                         'ADV_LOW_RATIO': ratios.get('query_low'),
                         'ADV_HIGH_RATIO': ratios.get('query_high'),
                         'BLKCNT_UNCMP_BASIC': None,
@@ -246,17 +247,24 @@ class TargetQueries:
                                 for part_info in partitions:
                                     part_name = part_info['partition_name']
                                     try:
-                                        part_ratios = TargetQueries._get_compression_ratios(
-                                            database_id, tbl_owner, tbl_name, platform_type,
-                                            partition_name=part_name
-                                        )
                                         part_dml_info = part_dml.get(part_name, {})
                                         part_hotness = part_dml_info.get('hotness_score', 0)
-                                        part_recommended = TargetQueries._evaluate_strategy(
-                                            strategy_rules, 'TABLE', part_hotness, part_ratios
+                                        part_recommended = TargetQueries._determine_target_compression(
+                                            strategy_rules, 'TABLE', part_hotness, table_stats, platform_type
                                         )
-                                        part_ratio_key = TargetQueries._COMP_TYPE_RATIO_KEY.get(part_recommended)
-                                        part_rec_ratio = (part_ratios.get(part_ratio_key) if part_ratio_key else None) or 1
+                                        part_ratios = {k: None for k in ('basic', 'oltp', 'query_low', 'query_high', 'archive_low', 'archive_high')}
+                                        part_rec_ratio = 1.0
+                                        if part_recommended != 'NONE':
+                                            part_rec_ratio = TargetQueries._get_single_compression_ratio(
+                                                database_id, tbl_owner, tbl_name, part_recommended,
+                                                partition_name=part_name
+                                            )
+                                            pk = TargetQueries._COMP_TYPE_RATIO_KEY.get(part_recommended)
+                                            if pk:
+                                                part_ratios[pk] = part_rec_ratio
+                                            if part_rec_ratio <= 1:
+                                                part_recommended = 'NONE'
+
                                         part_size_mb = part_info.get('size_mb', 0)
                                         part_rec_size = round(part_size_mb / part_rec_ratio, 2) if part_rec_ratio > 0 else part_size_mb
                                         part_savings_mb = part_size_mb - part_rec_size
@@ -279,8 +287,8 @@ class TargetQueries:
                                             'ROW_COUNT': part_info.get('num_rows'),
                                             'BLOCK_COUNT': part_info.get('blocks'),
                                             'AVG_ROW_LENGTH': None,
-                                            'BASIC_RATIO': part_ratios.get('basic') or 1,
-                                            'OLTP_RATIO': part_ratios.get('oltp') or 1,
+                                            'BASIC_RATIO': part_ratios.get('basic'),
+                                            'OLTP_RATIO': part_ratios.get('oltp'),
                                             'ADV_LOW_RATIO': part_ratios.get('query_low'),
                                             'ADV_HIGH_RATIO': part_ratios.get('query_high'),
                                             'BLKCNT_UNCMP_BASIC': None, 'BLKCNT_CMP_BASIC': None,
@@ -317,15 +325,22 @@ class TargetQueries:
                                             for subpart_info in subparts:
                                                 sub_name = subpart_info['subpartition_name']
                                                 try:
-                                                    sub_ratios = TargetQueries._get_compression_ratios(
-                                                        database_id, tbl_owner, tbl_name, platform_type,
-                                                        partition_name=sub_name
+                                                    sub_recommended = TargetQueries._determine_target_compression(
+                                                        strategy_rules, 'TABLE', 0, table_stats, platform_type
                                                     )
-                                                    sub_recommended = TargetQueries._evaluate_strategy(
-                                                        strategy_rules, 'TABLE', 0, sub_ratios
-                                                    )
-                                                    sub_ratio_key = TargetQueries._COMP_TYPE_RATIO_KEY.get(sub_recommended)
-                                                    sub_rec_ratio = (sub_ratios.get(sub_ratio_key) if sub_ratio_key else None) or 1
+                                                    sub_ratios = {k: None for k in ('basic', 'oltp', 'query_low', 'query_high', 'archive_low', 'archive_high')}
+                                                    sub_rec_ratio = 1.0
+                                                    if sub_recommended != 'NONE':
+                                                        sub_rec_ratio = TargetQueries._get_single_compression_ratio(
+                                                            database_id, tbl_owner, tbl_name, sub_recommended,
+                                                            partition_name=sub_name
+                                                        )
+                                                        sk = TargetQueries._COMP_TYPE_RATIO_KEY.get(sub_recommended)
+                                                        if sk:
+                                                            sub_ratios[sk] = sub_rec_ratio
+                                                        if sub_rec_ratio <= 1:
+                                                            sub_recommended = 'NONE'
+
                                                     sub_size_mb = subpart_info.get('size_mb', 0)
                                                     sub_rec_size = round(sub_size_mb / sub_rec_ratio, 2) if sub_rec_ratio > 0 else sub_size_mb
                                                     sub_savings_mb = sub_size_mb - sub_rec_size
@@ -344,8 +359,8 @@ class TargetQueries:
                                                         'ROW_COUNT': subpart_info.get('num_rows'),
                                                         'BLOCK_COUNT': subpart_info.get('blocks'),
                                                         'AVG_ROW_LENGTH': None,
-                                                        'BASIC_RATIO': sub_ratios.get('basic') or 1,
-                                                        'OLTP_RATIO': sub_ratios.get('oltp') or 1,
+                                                        'BASIC_RATIO': sub_ratios.get('basic'),
+                                                        'OLTP_RATIO': sub_ratios.get('oltp'),
                                                         'ADV_LOW_RATIO': sub_ratios.get('query_low'),
                                                         'ADV_HIGH_RATIO': sub_ratios.get('query_high'),
                                                         'BLKCNT_UNCMP_BASIC': None, 'BLKCNT_CMP_BASIC': None,
@@ -928,6 +943,156 @@ class TargetQueries:
         except Exception:
             return {}
 
+    # DBMS_COMPRESSION type constants
+    _COMP_TYPE_CONST = {
+        'BASIC': 4096, 'OLTP': 2,
+        'QUERY LOW': 4, 'QUERY HIGH': 8,
+        'ARCHIVE LOW': 16, 'ARCHIVE HIGH': 32,
+    }
+
+    @staticmethod
+    def _determine_target_compression(
+        rules: List[Dict],
+        object_type: str,
+        hotness_score: float,
+        table_stats: Optional[Dict[str, Any]] = None,
+        platform_type: str = 'STANDARD'
+    ) -> str:
+        """Determine the target compression type from hotness + table stats BEFORE
+        testing the actual compression ratio. This avoids testing all 6 types.
+
+        Hotness bands (never BASIC):
+            >85  → NONE (very hot, not a candidate)
+            65-85 → OLTP
+            45-64 → QUERY LOW
+            25-44 → QUERY HIGH
+            10-24 → ARCHIVE LOW
+            <10  → ARCHIVE HIGH
+        """
+        stats = table_stats or {}
+
+        # --- Compute effective hotness (same adjustments as _evaluate_strategy) ---
+        effective_hotness = hotness_score
+
+        last_analyzed = stats.get('last_analyzed')
+        if last_analyzed:
+            from datetime import datetime, date
+            try:
+                if isinstance(last_analyzed, (datetime, date)):
+                    la = last_analyzed if isinstance(last_analyzed, datetime) \
+                        else datetime.combine(last_analyzed, datetime.min.time())
+                    age_days = (datetime.now() - la).days
+                else:
+                    age_days = 0
+                if age_days > 365:
+                    effective_hotness = max(0, effective_hotness - 30)
+                elif age_days > 90:
+                    effective_hotness = max(0, effective_hotness - 15)
+            except Exception:
+                pass
+
+        avg_null_pct = stats.get('avg_null_pct', 0) or 0
+        if avg_null_pct > 0.5:
+            effective_hotness = max(0, effective_hotness - 10)
+        elif avg_null_pct > 0.3:
+            effective_hotness = max(0, effective_hotness - 5)
+
+        avg_distinct = stats.get('avg_distinct', 0) or 0
+        num_rows = stats.get('num_rows', 0) or 0
+        if num_rows > 0 and avg_distinct > 0:
+            if (avg_distinct / num_rows) < 0.01:
+                effective_hotness = max(0, effective_hotness - 10)
+            elif (avg_distinct / num_rows) < 0.1:
+                effective_hotness = max(0, effective_hotness - 5)
+
+        if (stats.get('avg_row_len', 0) or 0) > 500:
+            effective_hotness = max(0, effective_hotness - 5)
+
+        # --- Try strategy rules first (ignore ratio since we don't have one yet) ---
+        for rule in rules:
+            if rule.get('object_type') == object_type:
+                if rule.get('hotness_min', 0) <= effective_hotness <= rule.get('hotness_max', 100):
+                    comp_type = rule['compression_type']
+                    if comp_type == 'BASIC':
+                        comp_type = 'OLTP'  # never BASIC
+                    if comp_type != 'NONE':
+                        # On non-Exadata, HCC types fall back to OLTP
+                        if platform_type != 'EXADATA' and comp_type in ('QUERY LOW', 'QUERY HIGH', 'ARCHIVE LOW', 'ARCHIVE HIGH'):
+                            return 'OLTP'
+                        return comp_type
+
+        # --- Default hotness bands ---
+        if effective_hotness > 85:
+            return 'NONE'
+        elif effective_hotness >= 65:
+            return 'OLTP'
+        elif effective_hotness >= 45:
+            target = 'QUERY LOW'
+        elif effective_hotness >= 25:
+            target = 'QUERY HIGH'
+        elif effective_hotness >= 10:
+            target = 'ARCHIVE LOW'
+        else:
+            target = 'ARCHIVE HIGH'
+
+        # On non-Exadata, HCC falls back to OLTP
+        if platform_type != 'EXADATA' and target in ('QUERY LOW', 'QUERY HIGH', 'ARCHIVE LOW', 'ARCHIVE HIGH'):
+            return 'OLTP'
+        return target
+
+    @staticmethod
+    def _get_single_compression_ratio(
+        database_id: int, owner: str, table_name: str,
+        compression_type: str,
+        partition_name: Optional[str] = None
+    ) -> float:
+        """Test a single compression type via DBMS_COMPRESSION.GET_COMPRESSION_RATIO.
+
+        Returns the compression ratio (>1 = effective), or 1.0 on failure.
+        """
+        comp_const = TargetQueries._COMP_TYPE_CONST.get(compression_type)
+        if not comp_const:
+            return 1.0
+
+        plsql = """
+        DECLARE
+            v_tbs VARCHAR2(128);
+            v_bc PLS_INTEGER; v_bu PLS_INTEGER;
+            v_rc PLS_INTEGER; v_ru PLS_INTEGER;
+            v_ratio NUMBER; v_str VARCHAR2(100);
+        BEGIN
+            SELECT default_tablespace INTO v_tbs FROM dba_users WHERE username = :owner;
+            DBMS_COMPRESSION.GET_COMPRESSION_RATIO(
+                v_tbs, :owner, :table_name, :partition_name, :comp_type,
+                v_bc, v_bu, v_rc, v_ru, v_ratio, v_str);
+            :out_ratio := ROUND(v_ratio, 2);
+        EXCEPTION
+            WHEN OTHERS THEN :out_ratio := -1;
+        END;
+        """
+
+        try:
+            result = TargetConnector.execute_procedure_with_output(
+                database_id, plsql,
+                in_params={
+                    'owner': owner, 'table_name': table_name,
+                    'partition_name': partition_name, 'comp_type': comp_const
+                },
+                out_params={'out_ratio': float}
+            )
+            ratio = result.get('out_ratio', 1.0) or 1.0
+            if ratio < 0:
+                # DBMS_COMPRESSION failed — try CTAS fallback for OLTP
+                if compression_type == 'OLTP':
+                    fallback = TargetQueries._get_compression_ratios_ctas(
+                        database_id, owner, table_name
+                    )
+                    return fallback.get('oltp', 1.0)
+                return 1.0
+            return ratio
+        except Exception:
+            return 1.0
+
     # Map from compression type to ratio dict key
     _COMP_TYPE_RATIO_KEY = {
         'BASIC': 'basic', 'OLTP': 'oltp',
@@ -1328,7 +1493,8 @@ class TargetQueries:
         table_name: str,
         compression_type: str,
         partition_name: Optional[str] = None,
-        dry_run: bool = True
+        dry_run: bool = True,
+        parallel_degree: int = 4
     ) -> Dict[str, Any]:
         """
         Execute compression for a specific table or partition on the target database.
@@ -1340,6 +1506,7 @@ class TargetQueries:
             compression_type: Target compression type
             partition_name: Optional partition name
             dry_run: If True, only generate DDL without executing
+            parallel_degree: Parallel execution degree
 
         Returns:
             dict with execution result
@@ -1349,9 +1516,9 @@ class TargetQueries:
             partition_name = None
 
         if dry_run:
-            # Generate DDL only - no database connection needed
             ddl = TargetQueries.generate_ddl(
-                owner, table_name, compression_type, partition_name
+                owner, table_name, compression_type, partition_name,
+                parallel_degree=parallel_degree
             )
             return {
                 'success': True,
@@ -1363,7 +1530,8 @@ class TargetQueries:
         try:
             # Execute compression via direct ALTER TABLE MOVE DDL
             ddl = TargetQueries.generate_ddl(
-                owner, table_name, compression_type, partition_name
+                owner, table_name, compression_type, partition_name,
+                parallel_degree=parallel_degree
             )
             # Strip trailing semicolon — oracledb executes DDL without it
             ddl_exec = ddl.rstrip().rstrip(';')
@@ -1484,7 +1652,8 @@ class TargetQueries:
     def batch_execute(
         database_id: int,
         items: List[Dict],
-        dry_run: bool = True
+        dry_run: bool = True,
+        parallel_degree: int = 4
     ) -> Dict[str, Any]:
         """
         Execute compression for multiple items in batch on the target database.
@@ -1494,6 +1663,7 @@ class TargetQueries:
             items: List of dicts, each with owner, table_name, compression_type,
                    and optional partition_name
             dry_run: If True, only generate DDL without executing
+            parallel_degree: Parallel execution degree per table
 
         Returns:
             dict with batch execution results
@@ -1514,7 +1684,8 @@ class TargetQueries:
                 table_name=table_name,
                 compression_type=compression_type,
                 partition_name=partition_name,
-                dry_run=dry_run
+                dry_run=dry_run,
+                parallel_degree=parallel_degree
             )
 
             results.append({
@@ -1544,7 +1715,8 @@ class TargetQueries:
         table_name: str,
         compression_type: str,
         partition_name: Optional[str] = None,
-        subpartition_name: Optional[str] = None
+        subpartition_name: Optional[str] = None,
+        parallel_degree: int = 4
     ) -> str:
         """
         Generate DDL statement for compression. Static utility - no database connection needed.
@@ -1555,6 +1727,7 @@ class TargetQueries:
             compression_type: Target compression type
             partition_name: Optional partition name
             subpartition_name: Optional subpartition name
+            parallel_degree: Parallel execution degree
 
         Returns:
             DDL statement string
@@ -1586,18 +1759,36 @@ class TargetQueries:
             ddl = f"""ALTER TABLE {owner}.{table_name}
 MOVE SUBPARTITION {subpartition_name}
 {compression_clause}
-ONLINE PARALLEL 4;"""
+ONLINE PARALLEL {parallel_degree};"""
         elif partition_name:
             ddl = f"""ALTER TABLE {owner}.{table_name}
 MOVE PARTITION {partition_name}
 {compression_clause}
-ONLINE PARALLEL 4;"""
+ONLINE PARALLEL {parallel_degree};"""
         else:
             ddl = f"""ALTER TABLE {owner}.{table_name}
 MOVE {compression_clause}
-ONLINE PARALLEL 4;"""
+ONLINE PARALLEL {parallel_degree};"""
 
         return ddl
+
+    # ============================================================================
+    # TARGET DATABASE METADATA
+    # ============================================================================
+
+    @staticmethod
+    def get_cpu_count(database_id: int) -> int:
+        """Query CPU_COUNT from target database v$parameter."""
+        try:
+            df = TargetConnector.execute_query(
+                database_id,
+                "SELECT value FROM v$parameter WHERE name = 'cpu_count'"
+            )
+            if not df.empty:
+                return int(df.iloc[0]['VALUE'])
+        except Exception:
+            pass
+        return 8  # safe default
 
     # ============================================================================
     # SCHEMA DISCOVERY (queries target data dictionary)
@@ -2089,8 +2280,10 @@ ONLINE PARALLEL 4;"""
                 s.last_call_et as seconds_in_wait,
                 s.state,
                 s.wait_class,
-                s.event
+                s.event,
+                SUBSTR(sq.sql_text, 1, 200) as sql_text
             FROM v$session s
+            LEFT JOIN v$sql sq ON sq.sql_id = s.sql_id AND sq.child_number = 0
             WHERE s.type = 'USER'
               AND s.status = 'ACTIVE'
               AND (
