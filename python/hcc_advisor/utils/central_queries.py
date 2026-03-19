@@ -1891,8 +1891,45 @@ class CentralQueries:
             log_warning("store_analysis_results called with empty DataFrame")
             return True
 
-        insert_query = """
-            INSERT INTO t_compression_analysis (
+        merge_query = """
+            MERGE INTO t_compression_analysis tgt
+            USING (SELECT :database_id AS database_id, :owner AS owner,
+                          :object_name AS object_name,
+                          :partition_name AS partition_name,
+                          :subpartition_name AS subpartition_name
+                   FROM DUAL) src
+            ON (    tgt.database_id = src.database_id
+                AND tgt.owner = src.owner
+                AND tgt.object_name = src.object_name
+                AND NVL(tgt.partition_name, '~') = NVL(src.partition_name, '~')
+                AND NVL(tgt.subpartition_name, '~') = NVL(src.subpartition_name, '~'))
+            WHEN MATCHED THEN UPDATE SET
+                advisor_run_id = :advisor_run_id,
+                object_type = :object_type,
+                size_bytes = :size_bytes, row_count = :row_count,
+                block_count = :block_count, avg_row_length = :avg_row_length,
+                basic_ratio = :basic_ratio, oltp_ratio = :oltp_ratio,
+                adv_low_ratio = :adv_low_ratio, adv_high_ratio = :adv_high_ratio,
+                blkcnt_uncmp_basic = :blkcnt_uncmp_basic, blkcnt_cmp_basic = :blkcnt_cmp_basic,
+                blkcnt_uncmp_oltp = :blkcnt_uncmp_oltp, blkcnt_cmp_oltp = :blkcnt_cmp_oltp,
+                blkcnt_uncmp_adv_low = :blkcnt_uncmp_adv_low, blkcnt_cmp_adv_low = :blkcnt_cmp_adv_low,
+                blkcnt_uncmp_adv_high = :blkcnt_uncmp_adv_high, blkcnt_cmp_adv_high = :blkcnt_cmp_adv_high,
+                insert_count = :insert_count, update_count = :update_count, delete_count = :delete_count,
+                logical_reads = :logical_reads, physical_reads = :physical_reads,
+                access_frequency = :access_frequency, last_access_date = :last_access_date,
+                hotness_score = :hotness_score, read_ratio = :read_ratio,
+                write_ratio = :write_ratio, dml_24h_rate = :dml_24h_rate,
+                last_analyzed = :last_analyzed, data_age_days = :data_age_days,
+                current_compression = :current_compression,
+                advisable_compression = :advisable_compression,
+                recommendation_reason = :recommendation_reason,
+                confidence_score = :confidence_score,
+                projected_savings_bytes = :projected_savings_bytes,
+                projected_savings_pct = :projected_savings_pct,
+                analysis_duration_sec = :analysis_duration_sec,
+                sample_size_rows = :sample_size_rows,
+                analysis_date = SYSDATE, analysis_timestamp = SYSTIMESTAMP
+            WHEN NOT MATCHED THEN INSERT (
                 database_id, advisor_run_id,
                 owner, object_name, object_type, partition_name, subpartition_name,
                 size_bytes, row_count, block_count, avg_row_length,
@@ -1989,15 +2026,15 @@ class CentralQueries:
                         params[k] = None
                 rows.append(params)
 
-            # Use executemany via direct connection for batch performance
+            # Use executemany MERGE for upsert (insert or update existing)
             with CentralConnector.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.executemany(insert_query, rows)
+                cursor.executemany(merge_query, rows)
                 conn.commit()
-                inserted = cursor.rowcount
+                merged = cursor.rowcount
                 cursor.close()
 
-            log_info(f"Stored {inserted} analysis results: database_id={database_id}, run_id={run_id}")
+            log_info(f"Merged {merged} analysis results: database_id={database_id}, run_id={run_id}")
             return True
 
         except Exception as e:
