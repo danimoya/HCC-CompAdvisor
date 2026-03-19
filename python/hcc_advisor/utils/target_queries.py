@@ -1393,6 +1393,23 @@ class TargetQueries:
                     'idx_cnt': idx_rebuilt, 'idx_time': idx_time
                 })
 
+                # Update analysis row to reflect new compression state
+                try:
+                    CentralConnector.execute_dml("""
+                        UPDATE t_compression_analysis
+                        SET current_compression = :comp_type,
+                            size_bytes = :comp_size
+                        WHERE database_id = :db_id AND owner = :owner
+                          AND object_name = :tbl
+                          AND NVL(partition_name, '~') = NVL(:part, '~')
+                    """, {
+                        'comp_type': compression_type, 'comp_size': comp_size,
+                        'db_id': database_id, 'owner': owner,
+                        'tbl': table_name, 'part': partition_name
+                    })
+                except Exception:
+                    pass
+
                 saved_mb = round((orig_size - comp_size) / 1048576, 2)
                 idx_msg = f", {idx_rebuilt} indexes rebuilt" if idx_rebuilt else ""
                 return {

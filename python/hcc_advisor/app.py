@@ -406,46 +406,80 @@ def show_dashboard():
     st.markdown('<div class="main-header">HCC Compression Advisor Dashboard</div>', unsafe_allow_html=True)
     st.markdown("---")
 
-    # Fetch statistics using direct database queries
-    stats = CentralQueries.get_dashboard_summary(database_id=st.session_state.get('active_database_id'))
+    # Fetch statistics
+    db_id = st.session_state.get('active_database_id')
+    stats = CentralQueries.get_dashboard_summary(database_id=db_id)
+    progress = CentralQueries.get_compression_progress(database_id=db_id)
 
-    # Top metrics
-    col1, col2, col3, col4 = st.columns(4)
+    # Row 1 — Estate Summary
+    col1, col2, col3, col4, col5 = st.columns(5)
 
     with col1:
-        st.metric(
-            label="Total Tables Analyzed",
-            value=f"{stats.get('total_tables', 0):,}",
-            delta=None
-        )
-
+        st.metric("Objects Analyzed", f"{stats.get('total_tables', 0):,}")
     with col2:
-        total_size = stats.get('total_size_gb', 0)
-        st.metric(
-            label="Total Size (GB)",
-            value=f"{total_size:,.2f}",
-            delta=None
-        )
-
+        st.metric("Total Size (GB)", f"{stats.get('total_size_gb', 0):,.2f}")
     with col3:
-        potential_savings = stats.get('potential_savings_gb', 0)
-        st.metric(
-            label="Potential Savings (GB)",
-            value=f"{potential_savings:,.2f}",
-            delta=None
-        )
-
+        st.metric("Compressed", f"{progress.get('compressed', 0):,}",
+                   delta=f"{progress.get('saved_mb', 0) / 1024:.2f} GB saved" if progress.get('saved_mb', 0) > 0 else None)
     with col4:
-        savings_pct = stats.get('avg_savings_pct', 0)
-        st.metric(
-            label="Avg Savings",
-            value=f"{savings_pct:.1f}%",
-            delta=None
-        )
+        st.metric("Pending", f"{progress.get('pending', 0):,}",
+                   delta=f"{progress.get('pending_savings_mb', 0) / 1024:.2f} GB potential" if progress.get('pending', 0) > 0 else None)
+    with col5:
+        st.metric("Avg Savings", f"{stats.get('avg_savings_pct', 0):.1f}%")
 
     st.markdown("---")
 
-    # Recent activity and charts
+    # Row 2 — Compression Progress
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Compression Progress")
+        compressed = progress.get('compressed', 0)
+        pending = progress.get('pending', 0)
+        skipped = progress.get('skipped', 0)
+
+        if compressed + pending + skipped > 0:
+            import plotly.graph_objects as go
+            fig = go.Figure(data=[go.Pie(
+                labels=['Compressed', 'Pending', 'Not Recommended'],
+                values=[compressed, pending, skipped],
+                marker_colors=['#28a745', '#ffc107', '#6c757d'],
+                hole=0.5,
+                textinfo='label+value'
+            )])
+            fig.update_layout(height=300, margin=dict(t=20, b=20, l=20, r=20),
+                              showlegend=True, legend=dict(orientation='h', y=-0.1))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No analysis data yet. Run an analysis first.")
+
+    with col2:
+        st.subheader("Savings Overview")
+        total_size = stats.get('total_size_gb', 0)
+        saved = progress.get('saved_mb', 0) / 1024
+        pending_save = progress.get('pending_savings_mb', 0) / 1024
+        remaining = max(0, total_size - saved - pending_save)
+
+        if total_size > 0:
+            import plotly.graph_objects as go
+            fig = go.Figure(data=[
+                go.Bar(name='Already Saved', x=['Storage'], y=[saved],
+                       marker_color='#28a745', text=f"{saved:.2f} GB", textposition='auto'),
+                go.Bar(name='Pending Savings', x=['Storage'], y=[pending_save],
+                       marker_color='#ffc107', text=f"{pending_save:.2f} GB", textposition='auto'),
+                go.Bar(name='Remaining', x=['Storage'], y=[remaining],
+                       marker_color='#6c757d', text=f"{remaining:.2f} GB", textposition='auto'),
+            ])
+            fig.update_layout(barmode='stack', height=300, yaxis_title="GB",
+                              margin=dict(t=20, b=20), showlegend=True,
+                              legend=dict(orientation='h', y=-0.15))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No size data available.")
+
+    st.markdown("---")
+
+    # Row 3 — Existing charts
     col1, col2 = st.columns(2)
 
     with col1:

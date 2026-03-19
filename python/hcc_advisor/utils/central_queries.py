@@ -76,6 +76,67 @@ class CentralQueries:
         }
 
     @staticmethod
+    def get_compression_progress(database_id: Optional[int] = None) -> Dict[str, Any]:
+        """Get compressed/pending/skipped breakdown for the dashboard."""
+        db_filter = "AND a.database_id = :database_id" if database_id else ""
+        hist_db_filter = "AND database_id = :database_id" if database_id else ""
+        query = f"""
+            SELECT
+                COUNT(*) as total,
+                COUNT(CASE WHEN a.advisable_compression IS NULL
+                           OR a.advisable_compression = 'NONE' THEN 1 END) as skipped,
+                COUNT(CASE WHEN a.advisable_compression IS NOT NULL
+                           AND a.advisable_compression != 'NONE'
+                           AND h.operation_status = 'SUCCESS' THEN 1 END) as compressed,
+                COUNT(CASE WHEN a.advisable_compression IS NOT NULL
+                           AND a.advisable_compression != 'NONE'
+                           AND (h.operation_status IS NULL OR h.operation_status != 'SUCCESS')
+                           THEN 1 END) as pending,
+                COALESCE(SUM(CASE WHEN h.operation_status = 'SUCCESS'
+                           THEN (a.size_mb - NVL(h.compressed_size_mb, a.size_mb))
+                           ELSE 0 END), 0) as saved_mb,
+                COALESCE(SUM(CASE WHEN a.advisable_compression IS NOT NULL
+                           AND a.advisable_compression != 'NONE'
+                           AND (h.operation_status IS NULL OR h.operation_status != 'SUCCESS')
+                           THEN a.projected_savings_mb ELSE 0 END), 0) as pending_savings_mb
+            FROM t_compression_analysis a
+            LEFT JOIN (
+                SELECT database_id, owner, object_name,
+                       NVL(partition_name, '~') as pn,
+                       operation_status, compressed_size_mb,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY database_id, owner, object_name, NVL(partition_name, '~')
+                           ORDER BY start_time DESC
+                       ) as rn
+                FROM t_compression_history
+                WHERE 1=1 {hist_db_filter}
+            ) h ON h.database_id = a.database_id
+               AND h.owner = a.owner AND h.object_name = a.object_name
+               AND h.pn = NVL(a.partition_name, '~') AND h.rn = 1
+            WHERE 1=1 {db_filter}
+        """
+        params = {}
+        if database_id:
+            params['database_id'] = database_id
+
+        try:
+            df = CentralConnector.execute_query(query, params if params else None)
+            if not df.empty:
+                row = df.iloc[0]
+                return {
+                    'total': int(row.get('TOTAL', 0)),
+                    'compressed': int(row.get('COMPRESSED', 0)),
+                    'pending': int(row.get('PENDING', 0)),
+                    'skipped': int(row.get('SKIPPED', 0)),
+                    'saved_mb': float(row.get('SAVED_MB', 0)),
+                    'pending_savings_mb': float(row.get('PENDING_SAVINGS_MB', 0)),
+                }
+        except Exception as e:
+            log_error(e, "get_compression_progress")
+        return {'total': 0, 'compressed': 0, 'pending': 0, 'skipped': 0,
+                'saved_mb': 0, 'pending_savings_mb': 0}
+
+    @staticmethod
     def get_savings_by_strategy(database_id: Optional[int] = None) -> pd.DataFrame:
         """
         Get savings breakdown grouped by compression strategy
@@ -352,10 +413,11 @@ class CentralQueries:
         min_savings_pct: float = 10.0,
         min_size_mb: float = 0.0,
         limit: int = 100,
-        database_id: Optional[int] = None
+        database_id: Optional[int] = None,
+        show_executed: bool = True
     ) -> pd.DataFrame:
         """
-        Get compression recommendations from T_COMPRESSION_ANALYSIS
+        Get compression recommendations from T_COMPRESSION_ANALYSIS with execution status.
 
         Args:
             schema: Filter by schema/owner (None for all)
@@ -364,43 +426,63 @@ class CentralQueries:
             min_size_mb: Minimum table size in MB
             limit: Maximum number of results
             database_id: Optional target database ID to filter results
+            show_executed: If False, hide objects already compressed successfully
 
         Returns:
-            DataFrame with recommendations
+            DataFrame with recommendations including execution_status column
         """
-        db_filter = "AND database_id = :database_id" if database_id else ""
+        db_filter = "AND a.database_id = :database_id" if database_id else ""
+        hist_db_filter = "AND database_id = :database_id" if database_id else ""
+        executed_filter = "" if show_executed else "AND (h.operation_status IS NULL OR h.operation_status != 'SUCCESS')"
         query = f"""
             SELECT
-                analysis_id as recommendation_id,
-                database_id,
-                owner as table_owner,
-                object_name as table_name,
-                object_type,
-                partition_name,
-                subpartition_name,
-                size_mb as current_size_mb,
-                row_count as estimated_rows,
-                current_compression,
-                advisable_compression as recommended_strategy,
-                size_mb - projected_savings_mb as estimated_size_mb,
-                projected_savings_pct as savings_pct,
-                best_ratio as compression_ratio,
-                basic_ratio,
-                oltp_ratio,
-                adv_low_ratio as query_low_ratio,
-                adv_high_ratio as query_high_ratio,
-                hotness_score,
-                hotness_category,
-                recommendation_reason
-            FROM t_compression_analysis
-            WHERE advisable_compression IS NOT NULL
-              AND advisable_compression != 'NONE'
-              AND projected_savings_pct >= :min_savings_pct
-              AND size_mb >= :min_size_mb
-              AND (:schema IS NULL OR owner = :schema)
-              AND (:strategy IS NULL OR advisable_compression = :strategy)
+                a.analysis_id as recommendation_id,
+                a.database_id,
+                a.owner as table_owner,
+                a.object_name as table_name,
+                a.object_type,
+                a.partition_name,
+                a.subpartition_name,
+                a.size_mb as current_size_mb,
+                a.row_count as estimated_rows,
+                a.current_compression,
+                a.advisable_compression as recommended_strategy,
+                a.size_mb - a.projected_savings_mb as estimated_size_mb,
+                a.projected_savings_pct as savings_pct,
+                a.best_ratio as compression_ratio,
+                a.basic_ratio,
+                a.oltp_ratio,
+                a.adv_low_ratio as query_low_ratio,
+                a.adv_high_ratio as query_high_ratio,
+                a.hotness_score,
+                a.hotness_category,
+                a.recommendation_reason,
+                CASE WHEN h.operation_status = 'SUCCESS' THEN 'Compressed'
+                     WHEN h.operation_status IS NOT NULL THEN h.operation_status
+                     ELSE 'Pending' END as execution_status
+            FROM t_compression_analysis a
+            LEFT JOIN (
+                SELECT owner, object_name,
+                       NVL(partition_name, '~') as pn,
+                       database_id, operation_status,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY database_id, owner, object_name, NVL(partition_name, '~')
+                           ORDER BY start_time DESC
+                       ) as rn
+                FROM t_compression_history
+                WHERE 1=1 {hist_db_filter}
+            ) h ON h.database_id = a.database_id
+               AND h.owner = a.owner AND h.object_name = a.object_name
+               AND h.pn = NVL(a.partition_name, '~') AND h.rn = 1
+            WHERE a.advisable_compression IS NOT NULL
+              AND a.advisable_compression != 'NONE'
+              AND a.projected_savings_pct >= :min_savings_pct
+              AND a.size_mb >= :min_size_mb
+              AND (:schema IS NULL OR a.owner = :schema)
+              AND (:strategy IS NULL OR a.advisable_compression = :strategy)
               {db_filter}
-            ORDER BY projected_savings_mb DESC
+              {executed_filter}
+            ORDER BY a.projected_savings_mb DESC
             FETCH FIRST :limit ROWS ONLY
         """
 

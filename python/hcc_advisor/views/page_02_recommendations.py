@@ -31,7 +31,7 @@ def show_recommendations_page():
     else:
         schemas = []
 
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
 
     with col1:
         schema_options = ["All Schemas"] + schemas
@@ -49,6 +49,14 @@ def show_recommendations_page():
         )
 
     with col3:
+        status_filter = st.selectbox(
+            "Status",
+            options=["Pending Only", "All", "Compressed Only"],
+            index=0,
+            help="Filter by execution status"
+        )
+
+    with col4:
         min_savings = st.slider(
             "Min Savings %",
             min_value=0,
@@ -57,7 +65,7 @@ def show_recommendations_page():
             step=5
         )
 
-    with col4:
+    with col5:
         min_size = st.number_input(
             "Min Size (MB)",
             min_value=0,
@@ -66,7 +74,7 @@ def show_recommendations_page():
             step=10
         )
 
-    with col5:
+    with col6:
         limit = st.number_input(
             "Max Results",
             min_value=10,
@@ -78,6 +86,7 @@ def show_recommendations_page():
     # Fetch recommendations using direct database query
     strategy_param = None if strategy_filter == "All" else strategy_filter
     schema_param = None if schema_filter == "All Schemas" else schema_filter
+    show_executed = status_filter != "Pending Only"
 
     with st.spinner("Loading recommendations..."):
         df = CentralQueries.get_recommendations(
@@ -86,8 +95,15 @@ def show_recommendations_page():
             min_savings_pct=min_savings,
             min_size_mb=min_size,
             limit=limit,
-            database_id=db_id
+            database_id=db_id,
+            show_executed=show_executed
         )
+
+    # Post-filter for "Compressed Only"
+    if not df.empty and status_filter == "Compressed Only":
+        df.columns = [col.lower() for col in df.columns]
+        df = df[df.get('execution_status', pd.Series(['Pending'])) == 'Compressed']
+        df.columns = [col.upper() for col in df.columns]
 
     if df.empty:
         st.warning("No recommendations found. Try adjusting your filters or run a new analysis.")
