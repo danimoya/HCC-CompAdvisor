@@ -219,12 +219,12 @@ def main():
     default_page_index = 0
     if 'selected_page' in st.session_state and st.session_state.selected_page:
         page_mapping = {
-            "Overview": 0, "Run Analysis": 1, "View Recommendations": 2,
-            "Compress Tables": 3, "Execution History": 4, "Session Browser": 5,
-            "Compression Rules": 6, "DB Connections": 7,
+            "Overview": 0, "Quick Scan": 1, "Run Analysis": 2, "View Recommendations": 3,
+            "Compress Tables": 4, "Execution History": 5, "Session Browser": 6,
+            "Compression Rules": 7, "DB Connections": 8,
             # Legacy mappings for compatibility
-            "Dashboard": 0, "Analysis": 1, "Recommendations": 2,
-            "Execution": 3, "History": 4, "Sessions": 5, "Strategies": 6, "Connections": 7
+            "Dashboard": 0, "Analysis": 2, "Recommendations": 3,
+            "Execution": 4, "History": 5, "Sessions": 6, "Strategies": 7, "Connections": 8
         }
         default_page_index = page_mapping.get(st.session_state.selected_page, 0)
         st.session_state.selected_page = None  # Clear after use
@@ -238,6 +238,7 @@ def main():
             menu_title=None,  # No title for cleaner look
             options=[
                 "Overview",
+                "Quick Scan",
                 "Run Analysis",
                 "View Recommendations",
                 "Compress Tables",
@@ -247,14 +248,15 @@ def main():
                 "DB Connections"
             ],
             icons=[
-                "house-door-fill",     # Overview - home/dashboard
-                "bar-chart-line-fill", # Run Analysis - analytics
-                "stars",               # View Recommendations - suggestions
-                "box-arrow-in-down",   # Compress Tables - compression action
-                "journal-text",        # Execution History - log/history
-                "binoculars-fill",     # Session Browser - monitoring
-                "gear-fill",           # Compression Rules - settings/config
-                "plug-fill"            # DB Connections - connectivity
+                "house-door-fill",        # Overview
+                "lightning-charge-fill",  # Quick Scan
+                "bar-chart-line-fill",    # Run Analysis
+                "stars",                  # View Recommendations
+                "box-arrow-in-down",      # Compress Tables
+                "journal-text",           # Execution History
+                "binoculars-fill",        # Session Browser
+                "gear-fill",              # Compression Rules
+                "plug-fill"               # DB Connections
             ],
             menu_icon="list",
             default_index=default_page_index,
@@ -325,6 +327,9 @@ def main():
     # Route to selected page
     if selected == "Overview":
         show_dashboard()
+    elif selected == "Quick Scan":
+        from hcc_advisor.views.page_08_quick_scan import show_quick_scan_page
+        show_quick_scan_page()
     elif selected == "Run Analysis":
         from hcc_advisor.views.page_01_analysis import show_analysis_page
         show_analysis_page()

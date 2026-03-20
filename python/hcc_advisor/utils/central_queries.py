@@ -1986,7 +1986,7 @@ class CentralQueries:
                 AND NVL(tgt.partition_name, '~') = NVL(src.partition_name, '~')
                 AND NVL(tgt.subpartition_name, '~') = NVL(src.subpartition_name, '~'))
             WHEN MATCHED THEN UPDATE SET
-                advisor_run_id = :advisor_run_id,
+                advisor_run_id = NVL(:advisor_run_id, tgt.advisor_run_id),
                 object_type = :object_type,
                 size_bytes = :size_bytes, row_count = :row_count,
                 block_count = :block_count, avg_row_length = :avg_row_length,

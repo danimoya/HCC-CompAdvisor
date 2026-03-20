@@ -2220,6 +2220,393 @@ ONLINE PARALLEL {parallel_degree};"""
             return pd.DataFrame()
 
 
+    # ============================================================================
+    # QUICK SCAN — Hotness-only analysis (no DBMS_COMPRESSION)
+    # ============================================================================
+
+    @staticmethod
+    def quick_scan(
+        database_id: int,
+        owner: Optional[str] = None,
+        strategy_id: int = 2,
+        include_partitions: bool = True
+    ) -> List[Dict]:
+        """Fast analysis using hotness + table stats only (no DBMS_COMPRESSION).
+        Returns list of result dicts and MERGE-es them into t_compression_analysis."""
+        import math
+        from hcc_advisor.utils.central_queries import CentralQueries
+        from hcc_advisor.utils.central_connector import CentralConnector
+
+        db_info = CentralQueries.get_target_database(database_id)
+        platform_type = (db_info.get('platform_type') or 'STANDARD').upper()
+
+        # Load strategy rules
+        strategy_rules = []
+        try:
+            rules_df = CentralConnector.execute_query("""
+                SELECT object_type, compression_type,
+                       NVL(hotness_min, 0) as hotness_min, NVL(hotness_max, 100) as hotness_max
+                FROM t_strategy_rules WHERE strategy_id = :sid AND enabled_flag = 'Y'
+                ORDER BY priority DESC
+            """, {'sid': strategy_id})
+            if not rules_df.empty:
+                for _, r in rules_df.iterrows():
+                    strategy_rules.append({
+                        'object_type': r['OBJECT_TYPE'], 'compression_type': r['COMPRESSION_TYPE'],
+                        'hotness_min': float(r['HOTNESS_MIN']), 'hotness_max': float(r['HOTNESS_MAX']),
+                    })
+        except Exception:
+            pass
+
+        # Flush monitoring info
+        try:
+            TargetConnector.execute_plsql(database_id,
+                "BEGIN DBMS_STATS.FLUSH_DATABASE_MONITORING_INFO; END;", commit=False)
+        except Exception:
+            pass
+
+        tables = TargetQueries._discover_analysis_tables(database_id, owner)
+        if not tables:
+            return []
+
+        dml_stats = TargetQueries._get_batch_dml_stats(database_id, owner)
+        col_stats = TargetQueries._get_batch_table_stats(database_id, owner)
+
+        results = []
+        for t in tables:
+            tbl_owner, tbl_name = t['owner'], t['table_name']
+            hkey = f"{tbl_owner}.{tbl_name}"
+            dml = dml_stats.get(hkey, {})
+            hotness = dml.get('hotness_score', 0) if isinstance(dml, dict) else 0
+            cs = col_stats.get(hkey, {})
+            ts = {
+                'avg_row_len': t.get('avg_row_len', 0), 'last_analyzed': t.get('last_analyzed'),
+                'num_rows': t.get('num_rows', 0), 'avg_null_pct': cs.get('avg_null_pct', 0),
+                'avg_distinct': cs.get('avg_distinct', 0), 'num_columns': cs.get('num_columns', 0),
+            }
+            advised = TargetQueries._determine_target_compression(
+                strategy_rules, 'TABLE', hotness, ts, platform_type)
+
+            current_comp = t.get('compress_for') or t.get('compression', 'NONE')
+            if current_comp in ('DISABLED', None, ''):
+                current_comp = 'NONE'
+
+            results.append({
+                'OWNER': tbl_owner, 'OBJECT_NAME': tbl_name, 'OBJECT_TYPE': 'TABLE',
+                'PARTITION_NAME': None, 'SUBPARTITION_NAME': None,
+                'SIZE_BYTES': t['size_bytes'], 'ROW_COUNT': t.get('num_rows'),
+                'BLOCK_COUNT': t.get('blocks'), 'AVG_ROW_LENGTH': t.get('avg_row_len'),
+                'BASIC_RATIO': None, 'OLTP_RATIO': None, 'ADV_LOW_RATIO': None, 'ADV_HIGH_RATIO': None,
+                'BLKCNT_UNCMP_BASIC': None, 'BLKCNT_CMP_BASIC': None,
+                'BLKCNT_UNCMP_OLTP': None, 'BLKCNT_CMP_OLTP': None,
+                'BLKCNT_UNCMP_ADV_LOW': None, 'BLKCNT_CMP_ADV_LOW': None,
+                'BLKCNT_UNCMP_ADV_HIGH': None, 'BLKCNT_CMP_ADV_HIGH': None,
+                'INSERT_COUNT': dml.get('inserts', 0) if isinstance(dml, dict) else 0,
+                'UPDATE_COUNT': dml.get('updates', 0) if isinstance(dml, dict) else 0,
+                'DELETE_COUNT': dml.get('deletes', 0) if isinstance(dml, dict) else 0,
+                'LOGICAL_READS': None, 'PHYSICAL_READS': None,
+                'ACCESS_FREQUENCY': None, 'LAST_ACCESS_DATE': None,
+                'HOTNESS_SCORE': hotness, 'READ_RATIO': None, 'WRITE_RATIO': None,
+                'DML_24H_RATE': None, 'LAST_ANALYZED': t.get('last_analyzed'),
+                'DATA_AGE_DAYS': None, 'CURRENT_COMPRESSION': current_comp,
+                'ADVISABLE_COMPRESSION': advised,
+                'RECOMMENDATION_REASON': f'Quick scan: hotness={hotness:.0f}',
+                'CONFIDENCE_SCORE': None,
+                'PROJECTED_SAVINGS_BYTES': 0, 'PROJECTED_SAVINGS_PCT': 0,
+                'ANALYSIS_DURATION_SEC': None, 'SAMPLE_SIZE_ROWS': None,
+            })
+
+            # Partition analysis
+            if include_partitions and t.get('partitioned') == 'YES':
+                parts = TargetQueries._discover_partitions(database_id, tbl_owner, tbl_name)
+                part_dml = TargetQueries._get_batch_partition_dml_stats(database_id, tbl_owner, tbl_name)
+                for p in parts:
+                    ph = part_dml.get(p['partition_name'], {}).get('hotness_score', 0)
+                    pa = TargetQueries._determine_target_compression(
+                        strategy_rules, 'TABLE', ph, ts, platform_type)
+                    pc = p.get('compress_for') or p.get('compression', 'NONE')
+                    if pc in ('DISABLED', None, ''):
+                        pc = 'NONE'
+                    results.append({
+                        'OWNER': tbl_owner, 'OBJECT_NAME': tbl_name, 'OBJECT_TYPE': 'PARTITION',
+                        'PARTITION_NAME': p['partition_name'], 'SUBPARTITION_NAME': None,
+                        'SIZE_BYTES': p.get('size_bytes', 0), 'ROW_COUNT': p.get('num_rows'),
+                        'BLOCK_COUNT': p.get('blocks'), 'AVG_ROW_LENGTH': None,
+                        'BASIC_RATIO': None, 'OLTP_RATIO': None, 'ADV_LOW_RATIO': None, 'ADV_HIGH_RATIO': None,
+                        'BLKCNT_UNCMP_BASIC': None, 'BLKCNT_CMP_BASIC': None,
+                        'BLKCNT_UNCMP_OLTP': None, 'BLKCNT_CMP_OLTP': None,
+                        'BLKCNT_UNCMP_ADV_LOW': None, 'BLKCNT_CMP_ADV_LOW': None,
+                        'BLKCNT_UNCMP_ADV_HIGH': None, 'BLKCNT_CMP_ADV_HIGH': None,
+                        'INSERT_COUNT': 0, 'UPDATE_COUNT': 0, 'DELETE_COUNT': 0,
+                        'LOGICAL_READS': None, 'PHYSICAL_READS': None,
+                        'ACCESS_FREQUENCY': None, 'LAST_ACCESS_DATE': None,
+                        'HOTNESS_SCORE': ph, 'READ_RATIO': None, 'WRITE_RATIO': None,
+                        'DML_24H_RATE': None, 'LAST_ANALYZED': None, 'DATA_AGE_DAYS': None,
+                        'CURRENT_COMPRESSION': pc, 'ADVISABLE_COMPRESSION': pa,
+                        'RECOMMENDATION_REASON': f'Quick scan partition: hotness={ph:.0f}',
+                        'CONFIDENCE_SCORE': None,
+                        'PROJECTED_SAVINGS_BYTES': 0, 'PROJECTED_SAVINGS_PCT': 0,
+                        'ANALYSIS_DURATION_SEC': None, 'SAMPLE_SIZE_ROWS': None,
+                    })
+
+                    if p.get('composite') == 'YES':
+                        subs = TargetQueries._discover_subpartitions(
+                            database_id, tbl_owner, tbl_name, p['partition_name'])
+                        for sp in subs:
+                            sa = TargetQueries._determine_target_compression(
+                                strategy_rules, 'TABLE', 0, ts, platform_type)
+                            sc = sp.get('compress_for') or sp.get('compression', 'NONE')
+                            if sc in ('DISABLED', None, ''):
+                                sc = 'NONE'
+                            results.append({
+                                'OWNER': tbl_owner, 'OBJECT_NAME': tbl_name,
+                                'OBJECT_TYPE': 'SUBPARTITION',
+                                'PARTITION_NAME': p['partition_name'],
+                                'SUBPARTITION_NAME': sp['subpartition_name'],
+                                'SIZE_BYTES': sp.get('size_bytes', 0), 'ROW_COUNT': sp.get('num_rows'),
+                                'BLOCK_COUNT': sp.get('blocks'), 'AVG_ROW_LENGTH': None,
+                                'BASIC_RATIO': None, 'OLTP_RATIO': None,
+                                'ADV_LOW_RATIO': None, 'ADV_HIGH_RATIO': None,
+                                'BLKCNT_UNCMP_BASIC': None, 'BLKCNT_CMP_BASIC': None,
+                                'BLKCNT_UNCMP_OLTP': None, 'BLKCNT_CMP_OLTP': None,
+                                'BLKCNT_UNCMP_ADV_LOW': None, 'BLKCNT_CMP_ADV_LOW': None,
+                                'BLKCNT_UNCMP_ADV_HIGH': None, 'BLKCNT_CMP_ADV_HIGH': None,
+                                'INSERT_COUNT': 0, 'UPDATE_COUNT': 0, 'DELETE_COUNT': 0,
+                                'LOGICAL_READS': None, 'PHYSICAL_READS': None,
+                                'ACCESS_FREQUENCY': None, 'LAST_ACCESS_DATE': None,
+                                'HOTNESS_SCORE': 0, 'READ_RATIO': None, 'WRITE_RATIO': None,
+                                'DML_24H_RATE': None, 'LAST_ANALYZED': None, 'DATA_AGE_DAYS': None,
+                                'CURRENT_COMPRESSION': sc, 'ADVISABLE_COMPRESSION': sa,
+                                'RECOMMENDATION_REASON': 'Quick scan subpartition',
+                                'CONFIDENCE_SCORE': None,
+                                'PROJECTED_SAVINGS_BYTES': 0, 'PROJECTED_SAVINGS_PCT': 0,
+                                'ANALYSIS_DURATION_SEC': None, 'SAMPLE_SIZE_ROWS': None,
+                            })
+
+        # MERGE into central DB (run_id=None for quick scan — no advisor_run record)
+        if results:
+            results_df = pd.DataFrame(results)
+            CentralQueries.store_analysis_results(database_id, None, results_df)
+
+        return results
+
+    # ============================================================================
+    # DBMS_SCHEDULER JOB SUBMISSION
+    # ============================================================================
+
+    @staticmethod
+    def submit_compression_job(
+        database_id: int, owner: str, table_name: str,
+        compression_type: str, partition_name: Optional[str] = None,
+        parallel_degree: int = 4
+    ) -> Dict[str, Any]:
+        """Submit ALTER TABLE MOVE as a DBMS_SCHEDULER job on the target database."""
+        from datetime import datetime
+        from hcc_advisor.utils.central_queries import CentralQueries
+        from hcc_advisor.utils.central_connector import CentralConnector
+
+        ts = datetime.now().strftime('%Y%m%d%H%M%S')
+        obj_short = table_name[:20]
+        job_name = f"HCC_{owner[:10]}_{obj_short}_{ts}"
+
+        # Check queue — prevent overload
+        running_df = TargetQueries.get_running_compression_jobs(database_id)
+        running_count = len(running_df) if not running_df.empty else 0
+
+        # Check double-submission via central history (IN_PROGRESS means job is active)
+        from hcc_advisor.utils.central_connector import CentralConnector
+        dup_df = CentralConnector.execute_query("""
+            SELECT 1 FROM t_compression_history
+            WHERE database_id = :db AND owner = :o AND object_name = :t
+              AND operation_status = 'IN_PROGRESS'
+              AND ROWNUM = 1
+        """, {'db': database_id, 'o': owner, 't': table_name})
+        if not dup_df.empty:
+            return {'success': False, 'error': f'{owner}.{table_name} already has a running job'}
+
+        ddl = TargetQueries.generate_ddl(
+            owner, table_name, compression_type, partition_name,
+            parallel_degree=parallel_degree
+        ).rstrip().rstrip(';')
+
+        # Build PL/SQL action with index rebuild
+        part_filter = f"AND table_name = ''{table_name}''" if not partition_name else \
+                      f"AND table_name = ''{table_name}''"
+        action = f"""
+            DECLARE v_n NUMBER := 0;
+            BEGIN
+                EXECUTE IMMEDIATE '{ddl.replace("'", "''")}';
+                FOR idx IN (SELECT owner, index_name FROM all_indexes
+                            WHERE table_owner = '{owner}' AND table_name = '{table_name}'
+                              AND status = 'UNUSABLE')
+                LOOP
+                    EXECUTE IMMEDIATE 'ALTER INDEX ' || idx.owner || '.' || idx.index_name
+                                      || ' REBUILD ONLINE PARALLEL {parallel_degree}';
+                    v_n := v_n + 1;
+                END LOOP;
+            END;
+        """
+
+        create_job_plsql = f"""
+            BEGIN
+                DBMS_SCHEDULER.CREATE_JOB(
+                    job_name   => '{job_name}',
+                    job_type   => 'PLSQL_BLOCK',
+                    job_action => q'§{action}§',
+                    enabled    => TRUE,
+                    auto_drop  => TRUE,
+                    comments   => 'HCC Advisor: {compression_type} on {owner}.{table_name}'
+                );
+            END;
+        """
+
+        try:
+            success = TargetConnector.execute_plsql(database_id, create_job_plsql)
+            if not success:
+                return {'success': False, 'error': 'Failed to create scheduler job'}
+
+            # Get original size
+            orig_size = 0
+            try:
+                sq = "SELECT NVL(SUM(bytes),0) as sz FROM dba_segments WHERE owner=:o AND segment_name=:t"
+                sp = {'o': owner, 't': table_name}
+                sdf = TargetConnector.execute_query(database_id, sq, sp)
+                if not sdf.empty:
+                    orig_size = int(sdf.iloc[0]['SZ'] or 0)
+            except Exception:
+                pass
+
+            # Record IN_PROGRESS in history
+            CentralQueries.store_compression_history(database_id, {
+                'owner': owner, 'object_name': table_name,
+                'object_type': 'PARTITION' if partition_name else 'TABLE',
+                'partition_name': partition_name,
+                'compression_type_applied': compression_type,
+                'compression_clause': job_name,
+                'execution_mode': 'ONLINE', 'parallel_degree': parallel_degree,
+                'original_size_bytes': orig_size,
+                'operation_status': 'IN_PROGRESS',
+                'start_time': datetime.now(), 'executed_by': 'HCC_ADVISOR',
+            })
+
+            return {'success': True, 'job_name': job_name}
+
+        except Exception as e:
+            log_error(e, "submit_compression_job")
+            return {'success': False, 'error': str(e)}
+
+    @staticmethod
+    def get_running_compression_jobs(database_id: int) -> pd.DataFrame:
+        """Query DBA_SCHEDULER_RUNNING_JOBS for HCC_% jobs."""
+        query = """
+            SELECT j.job_name, j.owner as job_owner, j.comments,
+                   CAST(r.elapsed_time AS VARCHAR2(30)) as elapsed_time,
+                   r.session_id
+            FROM dba_scheduler_jobs j
+            JOIN dba_scheduler_running_jobs r
+                ON r.job_name = j.job_name AND r.owner = j.owner
+            WHERE j.job_name LIKE 'HCC_%'
+            ORDER BY j.job_name DESC
+        """
+        try:
+            return TargetConnector.execute_query(database_id, query)
+        except Exception:
+            return pd.DataFrame()
+
+    @staticmethod
+    def check_completed_jobs(database_id: int) -> List[Dict]:
+        """Check DBA_SCHEDULER_JOB_RUN_DETAILS for recently completed HCC_% jobs.
+        Updates t_compression_history from IN_PROGRESS to SUCCESS/FAILED."""
+        from hcc_advisor.utils.central_connector import CentralConnector
+
+        query = """
+            SELECT job_name, status,
+                   TO_CHAR(actual_start_date, 'YYYY-MM-DD HH24:MI:SS') as start_time,
+                   TO_CHAR(run_duration) as run_duration,
+                   error# as error_num,
+                   SUBSTR(additional_info, 1, 2000) as additional_info
+            FROM dba_scheduler_job_run_details
+            WHERE job_name LIKE 'HCC_%'
+              AND actual_start_date > SYSDATE - 1
+            ORDER BY actual_start_date DESC
+        """
+        try:
+            df = TargetConnector.execute_query(database_id, query)
+        except Exception:
+            return []
+
+        if df.empty:
+            return []
+
+        df.columns = [c.lower() for c in df.columns]
+        updated = []
+
+        for _, row in df.iterrows():
+            job_name = row.get('job_name', '')
+            job_status = row.get('status', '')
+
+            if job_status == 'SUCCEEDED':
+                # Update history to SUCCESS, get new size
+                try:
+                    # Find the matching history row
+                    hist = CentralConnector.execute_query("""
+                        SELECT history_id, owner, object_name, partition_name
+                        FROM t_compression_history
+                        WHERE compression_clause = :jn AND operation_status = 'IN_PROGRESS'
+                          AND ROWNUM = 1
+                    """, {'jn': job_name})
+                    if not hist.empty:
+                        h = hist.iloc[0]
+                        o, t = h['OWNER'], h['OBJECT_NAME']
+                        # Get new size
+                        comp_size = 0
+                        try:
+                            sdf = TargetConnector.execute_query(database_id,
+                                "SELECT NVL(SUM(bytes),0) as sz FROM dba_segments WHERE owner=:o AND segment_name=:t",
+                                {'o': o, 't': t})
+                            if not sdf.empty:
+                                comp_size = int(sdf.iloc[0]['SZ'] or 0)
+                        except Exception:
+                            pass
+
+                        CentralConnector.execute_dml("""
+                            UPDATE t_compression_history
+                            SET operation_status = 'SUCCESS', end_time = SYSTIMESTAMP,
+                                compressed_size_bytes = :cs
+                            WHERE compression_clause = :jn AND operation_status = 'IN_PROGRESS'
+                              AND ROWNUM = 1
+                        """, {'cs': comp_size, 'jn': job_name})
+
+                        # Update analysis row
+                        CentralConnector.execute_dml("""
+                            UPDATE t_compression_analysis
+                            SET size_bytes = :cs
+                            WHERE database_id = :db AND owner = :o AND object_name = :t
+                              AND NVL(partition_name, '~') = NVL(:p, '~')
+                        """, {'cs': comp_size, 'db': database_id, 'o': o, 't': t,
+                              'p': h.get('PARTITION_NAME')})
+
+                        updated.append({'job_name': job_name, 'status': 'SUCCESS'})
+                except Exception:
+                    pass
+
+            elif job_status == 'FAILED':
+                err = row.get('additional_info', '')
+                try:
+                    CentralConnector.execute_dml("""
+                        UPDATE t_compression_history
+                        SET operation_status = 'FAILED', end_time = SYSTIMESTAMP,
+                            error_message = :err
+                        WHERE compression_clause = :jn AND operation_status = 'IN_PROGRESS'
+                          AND ROWNUM = 1
+                    """, {'err': str(err)[:4000], 'jn': job_name})
+                    updated.append({'job_name': job_name, 'status': 'FAILED'})
+                except Exception:
+                    pass
+
+        return updated
+
+
 # Create singleton accessor function
 @st.cache_resource
 def get_target_queries() -> TargetQueries:
