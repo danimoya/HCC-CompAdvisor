@@ -93,7 +93,11 @@ class CentralQueries:
                            AND (h.operation_status IS NULL OR h.operation_status != 'SUCCESS')
                            THEN 1 END) as pending,
                 COALESCE(SUM(CASE WHEN h.operation_status = 'SUCCESS'
-                           THEN (a.size_mb - NVL(h.compressed_size_mb, a.size_mb))
+                           AND a.original_size_bytes IS NOT NULL
+                           AND a.original_size_bytes > a.size_bytes
+                           THEN (a.original_size_bytes - a.size_bytes) / 1048576
+                           WHEN h.operation_status = 'SUCCESS'
+                           THEN NVL(h.original_size_mb - h.compressed_size_mb, 0)
                            ELSE 0 END), 0) as saved_mb,
                 COALESCE(SUM(CASE WHEN a.advisable_compression IS NOT NULL
                            AND a.advisable_compression != 'NONE'
@@ -103,7 +107,7 @@ class CentralQueries:
             LEFT JOIN (
                 SELECT database_id, owner, object_name,
                        NVL(partition_name, '~') as pn,
-                       operation_status, compressed_size_mb,
+                       operation_status, original_size_mb, compressed_size_mb,
                        ROW_NUMBER() OVER (
                            PARTITION BY database_id, owner, object_name, NVL(partition_name, '~')
                            ORDER BY start_time DESC
@@ -443,6 +447,7 @@ class CentralQueries:
                 a.object_type,
                 a.partition_name,
                 a.subpartition_name,
+                NVL(a.original_size_bytes, a.size_bytes) / 1048576 as original_size_mb,
                 a.size_mb as current_size_mb,
                 a.row_count as estimated_rows,
                 a.current_compression,
@@ -1988,6 +1993,7 @@ class CentralQueries:
             WHEN MATCHED THEN UPDATE SET
                 advisor_run_id = NVL(:advisor_run_id, tgt.advisor_run_id),
                 object_type = :object_type,
+                original_size_bytes = NVL(tgt.original_size_bytes, :original_size_bytes),
                 size_bytes = :size_bytes, row_count = :row_count,
                 block_count = :block_count, avg_row_length = :avg_row_length,
                 basic_ratio = :basic_ratio, oltp_ratio = :oltp_ratio,
@@ -2014,7 +2020,7 @@ class CentralQueries:
             WHEN NOT MATCHED THEN INSERT (
                 database_id, advisor_run_id,
                 owner, object_name, object_type, partition_name, subpartition_name,
-                size_bytes, row_count, block_count, avg_row_length,
+                original_size_bytes, size_bytes, row_count, block_count, avg_row_length,
                 basic_ratio, oltp_ratio, adv_low_ratio, adv_high_ratio,
                 blkcnt_uncmp_basic, blkcnt_cmp_basic,
                 blkcnt_uncmp_oltp, blkcnt_cmp_oltp,
@@ -2031,7 +2037,7 @@ class CentralQueries:
             ) VALUES (
                 :database_id, :advisor_run_id,
                 :owner, :object_name, :object_type, :partition_name, :subpartition_name,
-                :size_bytes, :row_count, :block_count, :avg_row_length,
+                :original_size_bytes, :size_bytes, :row_count, :block_count, :avg_row_length,
                 :basic_ratio, :oltp_ratio, :adv_low_ratio, :adv_high_ratio,
                 :blkcnt_uncmp_basic, :blkcnt_cmp_basic,
                 :blkcnt_uncmp_oltp, :blkcnt_cmp_oltp,
@@ -2064,6 +2070,7 @@ class CentralQueries:
                     'object_type': row.get('OBJECT_TYPE', 'TABLE'),
                     'partition_name': row.get('PARTITION_NAME'),
                     'subpartition_name': row.get('SUBPARTITION_NAME'),
+                    'original_size_bytes': row.get('ORIGINAL_SIZE_BYTES'),
                     'size_bytes': row.get('SIZE_BYTES'),
                     'row_count': row.get('ROW_COUNT'),
                     'block_count': row.get('BLOCK_COUNT'),

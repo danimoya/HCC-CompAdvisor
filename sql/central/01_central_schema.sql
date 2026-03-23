@@ -227,7 +227,8 @@ CREATE TABLE T_COMPRESSION_ANALYSIS (
     PARTITION_NAME          VARCHAR2(128),
     SUBPARTITION_NAME       VARCHAR2(128),
     -- Size and Row Metrics
-    SIZE_BYTES              NUMBER,
+    ORIGINAL_SIZE_BYTES     NUMBER,           -- preserved pre-compression size
+    SIZE_BYTES              NUMBER,            -- current size (updated after compression)
     SIZE_MB                 NUMBER GENERATED ALWAYS AS (SIZE_BYTES/1024/1024) VIRTUAL,
     SIZE_GB                 NUMBER GENERATED ALWAYS AS (SIZE_BYTES/1024/1024/1024) VIRTUAL,
     ROW_COUNT               NUMBER,
