@@ -221,7 +221,7 @@ def main():
         page_mapping = {
             "Overview": 0, "Quick Scan": 1, "Run Analysis": 2, "View Recommendations": 3,
             "Compress Tables": 4, "Execution History": 5, "Session Browser": 6,
-            "Compression Rules": 7, "DB Connections": 8,
+            "Compression Rules": 7, "DB Connections": 8, "Admin": 9,
             # Legacy mappings for compatibility
             "Dashboard": 0, "Analysis": 2, "Recommendations": 3,
             "Execution": 4, "History": 5, "Sessions": 6, "Strategies": 7, "Connections": 8
@@ -245,7 +245,8 @@ def main():
                 "Execution History",
                 "Session Browser",
                 "Compression Rules",
-                "DB Connections"
+                "DB Connections",
+                "Admin"
             ],
             icons=[
                 "house-door-fill",        # Overview
@@ -256,7 +257,8 @@ def main():
                 "journal-text",           # Execution History
                 "binoculars-fill",        # Session Browser
                 "gear-fill",              # Compression Rules
-                "plug-fill"               # DB Connections
+                "plug-fill",              # DB Connections
+                "wrench-adjustable"       # Admin
             ],
             menu_icon="list",
             default_index=default_page_index,
@@ -351,6 +353,9 @@ def main():
     elif selected == "DB Connections":
         from hcc_advisor.views.page_06_connections import show_connections_page
         show_connections_page()
+    elif selected == "Admin":
+        from hcc_advisor.views.page_09_admin import show_admin_page
+        show_admin_page()
 
     # SQL Debug Console (visible on all pages when enabled)
     if is_debug_enabled():

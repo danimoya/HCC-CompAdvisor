@@ -20,12 +20,11 @@ def show_strategies_page():
     st.markdown("---")
 
     # Create tabs for different sections
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4 = st.tabs([
         "Strategy Overview",
         "Edit Strategies",
         "Strategy Rules",
-        "Compare Strategies",
-        "SQL Patches"
+        "Compare Strategies"
     ])
 
     with tab1:
@@ -39,9 +38,6 @@ def show_strategies_page():
 
     with tab4:
         show_strategy_comparison()
-
-    with tab5:
-        show_sql_patches()
 
 
 def show_strategy_overview():

@@ -10,6 +10,7 @@ from hcc_advisor.utils.target_queries import TargetQueries
 from hcc_advisor.config import config
 
 COMP_OPTIONS = ['OLTP', 'QUERY LOW', 'QUERY HIGH', 'ARCHIVE LOW', 'ARCHIVE HIGH']
+DOP_OPTIONS = list(range(1, 65))  # will be capped at runtime by CPU_COUNT/2
 
 
 def show_quick_scan_page():
@@ -25,15 +26,15 @@ def show_quick_scan_page():
     # Controls row
     schemas = TargetQueries.get_available_schemas(db_id)
     cpu_count = TargetQueries.get_cpu_count(db_id)
-    max_q = max(1, cpu_count // 2)
-    dop = max(1, cpu_count // 2)
+    max_dop = max(1, cpu_count // 2)
 
     col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
     with col1:
         schema = st.selectbox("Schema", ["All Schemas"] + schemas, key="qs_schema")
     with col2:
-        max_queue = st.slider("Max Queue", 1, max_q, min(2, max_q), key="qs_max_queue",
-                              help=f"Max concurrent jobs (CPU_COUNT/2 = {max_q})")
+        max_queue = st.slider("Max Concurrent Jobs", 1, max(1, cpu_count // 2),
+                              min(2, max(1, cpu_count // 2)), key="qs_max_queue",
+                              help=f"Max jobs running simultaneously (CPU_COUNT/2 = {cpu_count // 2})")
     with col3:
         show_running = st.checkbox("Running Only", key="qs_running_only")
     with col4:
@@ -110,14 +111,14 @@ def show_quick_scan_page():
     tab1, tab2, tab3 = st.tabs(["Tables", "Partitions", "Subpartitions"])
 
     with tab1:
-        _render_scan_tab(df[df['object_type'] == 'TABLE'], 'TABLE', db_id, max_queue, dop, running_set)
+        _render_scan_tab(df[df['object_type'] == 'TABLE'], 'TABLE', db_id, max_queue, max_dop, running_set)
     with tab2:
-        _render_scan_tab(df[df['object_type'] == 'PARTITION'], 'PARTITION', db_id, max_queue, dop, running_set)
+        _render_scan_tab(df[df['object_type'] == 'PARTITION'], 'PARTITION', db_id, max_queue, max_dop, running_set)
     with tab3:
-        _render_scan_tab(df[df['object_type'] == 'SUBPARTITION'], 'SUBPARTITION', db_id, max_queue, dop, running_set)
+        _render_scan_tab(df[df['object_type'] == 'SUBPARTITION'], 'SUBPARTITION', db_id, max_queue, max_dop, running_set)
 
 
-def _render_scan_tab(df, obj_type, db_id, max_queue, dop, running_set):
+def _render_scan_tab(df, obj_type, db_id, max_queue, max_dop, running_set):
     """Render a single scan tab with selectable/editable table."""
     if df.empty:
         st.info(f"No {obj_type.lower()} data. Run a scan first.")
@@ -135,11 +136,8 @@ def _render_scan_tab(df, obj_type, db_id, max_queue, dop, running_set):
     available = [c for c in display_cols if c in df.columns]
     show_df = df[available].copy()
     show_df.insert(0, 'select', False)
-
-    # Mark running rows
-    show_df['select'] = show_df.apply(
-        lambda r: False if r.get('status') == 'Running' else False, axis=1
-    )
+    # Add per-row DOP column with default = max_dop
+    show_df['dop'] = max_dop
 
     col_config = {
         'select': st.column_config.CheckboxColumn("Submit", default=False),
@@ -149,6 +147,10 @@ def _render_scan_tab(df, obj_type, db_id, max_queue, dop, running_set):
         'current_compression': st.column_config.TextColumn("Current"),
         'recommended_strategy': st.column_config.SelectboxColumn(
             "Advised", options=COMP_OPTIONS, required=True
+        ),
+        'dop': st.column_config.SelectboxColumn(
+            "DOP", options=list(range(1, max_dop + 1)), required=True,
+            help=f"Parallel degree per object (max CPU_COUNT/2 = {max_dop})"
         ),
         'hotness_score': st.column_config.NumberColumn("Hotness", format="%.0f"),
         'status': st.column_config.TextColumn("Status"),
@@ -196,9 +198,10 @@ def _render_scan_tab(df, obj_type, db_id, max_queue, dop, running_set):
                     else:
                         part = None
 
+                    row_dop = int(row.get('dop', max_dop) or max_dop)
                     result = TargetQueries.submit_compression_job(
                         db_id, owner, table, comp,
-                        partition_name=part, parallel_degree=dop
+                        partition_name=part, parallel_degree=row_dop
                     )
                     if result.get('success'):
                         submitted += 1

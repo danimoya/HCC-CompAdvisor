@@ -2389,10 +2389,24 @@ ONLINE PARALLEL {parallel_degree};"""
                                 'ANALYSIS_DURATION_SEC': None, 'SAMPLE_SIZE_ROWS': None,
                             })
 
-        # MERGE into central DB (run_id=None for quick scan — no advisor_run record)
+        # Create a lightweight run record for the quick scan
         if results:
+            from datetime import datetime
+            run_data = {
+                'run_name': f'Quick Scan {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}',
+                'run_type': 'TABLES',
+                'schema_filter': owner,
+                'strategy_id': strategy_id,
+                'parallel_degree': 1,
+                'analysis_mode': 'QUICK',
+                'include_partitions': 'Y' if include_partitions else 'N'
+            }
+            ok, run_id = CentralQueries.store_advisor_run(database_id, run_data)
+            if not ok or not run_id:
+                run_id = None
+
             results_df = pd.DataFrame(results)
-            CentralQueries.store_analysis_results(database_id, None, results_df)
+            CentralQueries.store_analysis_results(database_id, run_id, results_df)
 
         return results
 
