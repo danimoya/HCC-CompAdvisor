@@ -64,14 +64,20 @@ def show_quick_scan_page():
 
     # Get running jobs for status overlay
     running_jobs = TargetQueries.get_running_compression_jobs(db_id)
+    # Also get IN_PROGRESS objects from central history for status overlay
     running_set = set()
-    if not running_jobs.empty:
-        running_jobs.columns = [c.lower() for c in running_jobs.columns]
-        for _, rj in running_jobs.iterrows():
-            # Extract owner.table from job comments
-            comment = str(rj.get('comments', ''))
-            if ' on ' in comment:
-                running_set.add(comment.split(' on ')[-1])
+    try:
+        from hcc_advisor.utils.central_connector import CentralConnector
+        in_prog = CentralConnector.execute_query("""
+            SELECT owner, object_name FROM t_compression_history
+            WHERE operation_status = 'IN_PROGRESS'
+              AND database_id = :db
+        """, {'db': db_id})
+        if not in_prog.empty:
+            for _, rj in in_prog.iterrows():
+                running_set.add(f"{rj['OWNER']}.{rj['OBJECT_NAME']}")
+    except Exception:
+        pass
 
     st.markdown("---")
 

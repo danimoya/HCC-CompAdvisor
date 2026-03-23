@@ -475,19 +475,24 @@ class TargetQueries:
             df = TargetConnector.execute_query(database_id, query, params if params else None)
             if df.empty:
                 return []
+            def _safe_int(val):
+                if val is None or (isinstance(val, float) and pd.isna(val)):
+                    return 0
+                return int(val)
+
             tables = []
             for _, row in df.iterrows():
                 tables.append({
                     'owner': row['OWNER'],
                     'table_name': row['TABLE_NAME'],
-                    'num_rows': int(row.get('NUM_ROWS') or 0),
-                    'blocks': int(row.get('BLOCKS') or 0),
-                    'avg_row_len': int(row.get('AVG_ROW_LEN') or 0),
+                    'num_rows': _safe_int(row.get('NUM_ROWS')),
+                    'blocks': _safe_int(row.get('BLOCKS')),
+                    'avg_row_len': _safe_int(row.get('AVG_ROW_LEN')),
                     'last_analyzed': row.get('LAST_ANALYZED'),
                     'partitioned': row.get('PARTITIONED', 'NO'),
                     'compression': row.get('COMPRESSION', 'NONE'),
                     'compress_for': row.get('COMPRESS_FOR'),
-                    'size_bytes': int(row.get('SIZE_BYTES') or 0),
+                    'size_bytes': _safe_int(row.get('SIZE_BYTES')),
                     'size_mb': float(row.get('SIZE_MB') or 0),
                 })
             return tables
@@ -2405,9 +2410,10 @@ ONLINE PARALLEL {parallel_degree};"""
         from hcc_advisor.utils.central_queries import CentralQueries
         from hcc_advisor.utils.central_connector import CentralConnector
 
-        ts = datetime.now().strftime('%Y%m%d%H%M%S')
-        obj_short = table_name[:20]
-        job_name = f"HCC_{owner[:10]}_{obj_short}_{ts}"
+        import random
+        ts = datetime.now().strftime('%m%d%H%M%S') + f"{random.randint(0,999):03d}"
+        obj_short = table_name[:30]
+        job_name = f"HCC_{obj_short}_{ts}"
 
         # Check queue — prevent overload
         running_df = TargetQueries.get_running_compression_jobs(database_id)
@@ -2499,14 +2505,14 @@ ONLINE PARALLEL {parallel_degree};"""
     def get_running_compression_jobs(database_id: int) -> pd.DataFrame:
         """Query DBA_SCHEDULER_RUNNING_JOBS for HCC_% jobs."""
         query = """
-            SELECT j.job_name, j.owner as job_owner, j.comments,
-                   CAST(r.elapsed_time AS VARCHAR2(30)) as elapsed_time,
+            SELECT r.job_name, r.owner as job_owner,
+                   EXTRACT(HOUR FROM r.elapsed_time)*3600 +
+                   EXTRACT(MINUTE FROM r.elapsed_time)*60 +
+                   EXTRACT(SECOND FROM r.elapsed_time) as elapsed_seconds,
                    r.session_id
-            FROM dba_scheduler_jobs j
-            JOIN dba_scheduler_running_jobs r
-                ON r.job_name = j.job_name AND r.owner = j.owner
-            WHERE j.job_name LIKE 'HCC_%'
-            ORDER BY j.job_name DESC
+            FROM dba_scheduler_running_jobs r
+            WHERE r.job_name LIKE 'HCC_%'
+            ORDER BY r.job_name DESC
         """
         try:
             return TargetConnector.execute_query(database_id, query)
