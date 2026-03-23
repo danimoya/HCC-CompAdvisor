@@ -124,6 +124,8 @@ def _render_scan_tab(df, obj_type, db_id, max_queue, max_dop, running_set):
         st.info(f"No {obj_type.lower()} data. Run a scan first.")
         return
 
+    ROWS_PER_PAGE = 100
+
     # Prepare display DataFrame
     display_cols = ['table_owner', 'table_name']
     if obj_type == 'PARTITION':
@@ -131,13 +133,29 @@ def _render_scan_tab(df, obj_type, db_id, max_queue, max_dop, running_set):
     elif obj_type == 'SUBPARTITION':
         display_cols.extend(['partition_name', 'subpartition_name'])
     display_cols.extend(['current_size_mb', 'current_compression', 'recommended_strategy',
-                         'hotness_score', 'status'])
+                         'dop', 'hotness_score', 'status'])
 
-    available = [c for c in display_cols if c in df.columns]
-    show_df = df[available].copy()
+    available_base = [c for c in display_cols if c in df.columns or c == 'dop']
+    show_df = df[[c for c in available_base if c in df.columns]].copy()
     show_df.insert(0, 'select', False)
-    # Add per-row DOP column with default = max_dop
     show_df['dop'] = max_dop
+
+    # Summary (full dataset)
+    total_size = show_df['current_size_mb'].sum() if 'current_size_mb' in show_df.columns else 0
+    st.caption(f"{len(show_df)} objects, {total_size:.1f} MB total")
+
+    # Pagination
+    total_pages = max(1, (len(show_df) + ROWS_PER_PAGE - 1) // ROWS_PER_PAGE)
+    page_key = f"qs_page_{obj_type}"
+    if total_pages > 1:
+        page = st.selectbox(
+            f"Page (of {total_pages})", range(1, total_pages + 1), key=page_key,
+            format_func=lambda p: f"Page {p}  ({(p-1)*ROWS_PER_PAGE+1}-{min(p*ROWS_PER_PAGE, len(show_df))} of {len(show_df)})"
+        )
+    else:
+        page = 1
+    start = (page - 1) * ROWS_PER_PAGE
+    page_df = show_df.iloc[start:start + ROWS_PER_PAGE].reset_index(drop=True)
 
     col_config = {
         'select': st.column_config.CheckboxColumn("Submit", default=False),
@@ -148,29 +166,26 @@ def _render_scan_tab(df, obj_type, db_id, max_queue, max_dop, running_set):
         'recommended_strategy': st.column_config.SelectboxColumn(
             "Advised", options=COMP_OPTIONS, required=True
         ),
-        'dop': st.column_config.SelectboxColumn(
-            "DOP", options=list(range(1, max_dop + 1)), required=True,
-            help=f"Parallel degree per object (max CPU_COUNT/2 = {max_dop})"
+        'dop': st.column_config.NumberColumn(
+            "DOP", min_value=1, max_value=max_dop, step=1,
+            help=f"Parallel degree per object (1-{max_dop})"
         ),
         'hotness_score': st.column_config.NumberColumn("Hotness", format="%.0f"),
         'status': st.column_config.TextColumn("Status"),
     }
-    if 'partition_name' in available:
+    if 'partition_name' in page_df.columns:
         col_config['partition_name'] = st.column_config.TextColumn("Partition")
-    if 'subpartition_name' in available:
+    if 'subpartition_name' in page_df.columns:
         col_config['subpartition_name'] = st.column_config.TextColumn("Subpartition")
 
     edited = st.data_editor(
-        show_df, column_config=col_config, use_container_width=True,
+        page_df, column_config=col_config, use_container_width=True,
         hide_index=True, disabled=['table_owner', 'table_name', 'current_size_mb',
                                     'current_compression', 'hotness_score', 'status',
                                     'partition_name', 'subpartition_name'],
-        key=f"qs_editor_{obj_type}"
+        key=f"qs_editor_{obj_type}_{page}",
+        height=min(35 * len(page_df) + 50, 800),
     )
-
-    # Summary
-    total_size = show_df['current_size_mb'].sum() if 'current_size_mb' in show_df.columns else 0
-    st.caption(f"{len(show_df)} objects, {total_size:.1f} MB total")
 
     # Submit selected
     selected = edited[edited['select'] == True]
