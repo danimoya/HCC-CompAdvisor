@@ -216,7 +216,8 @@ def show_operation_card(op):
 
         with col2:
             if remaining and pd.notna(remaining):
-                st.metric("Remaining", format_duration(remaining))
+                rem_min = remaining / 60
+                st.metric("Remaining", f"{rem_min:.1f} min" if rem_min < 60 else format_duration(remaining))
             else:
                 st.metric("Remaining", "Calculating...")
 
@@ -233,7 +234,7 @@ def show_operation_card(op):
 
 
 def show_compression_sessions():
-    """Display active sessions running compression operations"""
+    """Display active sessions running compression operations on the TARGET database"""
 
     db_id = st.session_state.get('active_database_id')
     if not db_id:
@@ -241,38 +242,57 @@ def show_compression_sessions():
         return
 
     st.subheader("Active Compression Sessions")
-    st.caption("Sessions currently executing compression-related SQL")
+    st.caption("Sessions on the **target** database running ALTER TABLE MOVE / COMPRESS / INDEX REBUILD")
 
-    with st.spinner("Loading compression sessions..."):
+    with st.spinner("Querying target v$session + v$sql + v$session_longops..."):
         sessions_df = TargetQueries.get_compression_sessions(db_id)
 
     if sessions_df.empty:
-        st.success("No active compression sessions found")
+        st.success("No active compression sessions on the target database")
         return
 
     sessions_df.columns = [c.lower() for c in sessions_df.columns]
 
-    # Summary
     st.metric("Active Compression Sessions", len(sessions_df))
-
     st.markdown("---")
 
-    # Display sessions
-    for _, session in sessions_df.iterrows():
-        show_session_card(session)
+    for _, s in sessions_df.iterrows():
+        sid = s.get('sid', '')
+        serial = s.get('serial_num', '')
+        user = s.get('username', 'N/A')
+        elapsed = s.get('elapsed_seconds', 0) or 0
+        sql_text = s.get('sql_text', '') or ''
+        pct = s.get('pct_complete')
+        remaining = s.get('remaining_minutes')
+        wait_class = s.get('wait_class', '')
+        event = s.get('event', '')
+        opname = s.get('opname', '')
 
-    # Table view
-    with st.expander("View as Table", expanded=False):
-        display_cols = ['sid', 'serial_num', 'username', 'status', 'program',
-                       'module', 'action', 'seconds_in_wait', 'wait_class',
-                       'event', 'sql_id']
-        available = [c for c in display_cols if c in sessions_df.columns]
+        with st.container():
+            col1, col2, col3 = st.columns([3, 1, 1])
+            with col1:
+                st.markdown(f"**SID {sid},{serial}** — user **{user}**")
+                if sql_text:
+                    st.code(sql_text[:200], language='sql')
+            with col2:
+                st.metric("Elapsed", format_duration(elapsed))
+                if wait_class:
+                    st.caption(f"Wait: {wait_class}")
+            with col3:
+                if remaining is not None and pd.notna(remaining):
+                    st.metric("Remaining", f"{remaining:.1f} min")
+                elif pct is not None and pd.notna(pct):
+                    st.metric("Progress", f"{pct:.1f}%")
+                else:
+                    st.caption("No longops data")
 
-        st.dataframe(
-            sessions_df[available],
-            use_container_width=True,
-            hide_index=True
-        )
+            if pct is not None and pd.notna(pct):
+                st.progress(min(float(pct) / 100, 1.0),
+                            text=f"{pct:.1f}% — {opname}" if opname else f"{pct:.1f}%")
+
+            if event:
+                st.caption(f"Event: {event}")
+            st.markdown("---")
 
 
 def show_session_card(session):

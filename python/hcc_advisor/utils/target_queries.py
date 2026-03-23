@@ -2063,13 +2063,8 @@ ONLINE PARALLEL {parallel_degree};"""
     @staticmethod
     def get_compression_sessions(database_id: int) -> pd.DataFrame:
         """
-        Get active sessions performing compression operations on the target database.
-
-        Args:
-            database_id: Target database identifier
-
-        Returns:
-            DataFrame with session data
+        Get active sessions performing compression or MOVE operations on the target.
+        Joins v$session with v$sql for SQL text and v$session_longops for progress.
         """
         query = """
             SELECT
@@ -2079,31 +2074,37 @@ ONLINE PARALLEL {parallel_degree};"""
                 s.status,
                 s.schemaname,
                 s.osuser,
-                s.machine,
                 s.program,
                 s.module,
                 s.action,
                 s.sql_id,
-                s.prev_sql_id,
-                s.logon_time,
-                s.last_call_et as seconds_in_wait,
-                s.state,
+                s.last_call_et as elapsed_seconds,
                 s.wait_class,
                 s.event,
-                SUBSTR(sq.sql_text, 1, 200) as sql_text
+                SUBSTR(sq.sql_text, 1, 300) as sql_text,
+                lo.opname,
+                lo.target as longops_target,
+                ROUND(lo.sofar / NULLIF(lo.totalwork, 0) * 100, 1) as pct_complete,
+                CASE WHEN lo.sofar > 0 AND lo.totalwork > 0 THEN
+                    ROUND((lo.elapsed_seconds / (lo.sofar / lo.totalwork)
+                           * (1 - lo.sofar / lo.totalwork)) / 60, 1)
+                ELSE NULL END as remaining_minutes
             FROM v$session s
             LEFT JOIN v$sql sq ON sq.sql_id = s.sql_id AND sq.child_number = 0
+            LEFT JOIN v$session_longops lo ON lo.sid = s.sid AND lo.serial# = s.serial#
+                AND lo.sofar < lo.totalwork
             WHERE s.type = 'USER'
               AND s.status = 'ACTIVE'
               AND (
-                  UPPER(s.module) LIKE '%HCC%'
-                  OR UPPER(s.module) LIKE '%COMPRESS%'
-                  OR UPPER(s.action) LIKE '%COMPRESS%'
-                  OR UPPER(s.action) LIKE '%MOVE%'
-                  OR UPPER(s.program) LIKE '%SQLPLUS%'
-                  OR UPPER(s.program) LIKE '%PYTHON%'
+                  UPPER(NVL(sq.sql_text, '')) LIKE '%ALTER%TABLE%MOVE%'
+                  OR UPPER(NVL(sq.sql_text, '')) LIKE '%COMPRESS%'
+                  OR UPPER(NVL(sq.sql_text, '')) LIKE '%REBUILD%INDEX%'
+                  OR UPPER(NVL(s.action, '')) LIKE '%COMPRESS%'
+                  OR UPPER(NVL(s.action, '')) LIKE '%MOVE%'
+                  OR UPPER(NVL(s.module, '')) LIKE '%DBMS_SCHEDULER%'
+                  AND UPPER(NVL(sq.sql_text, '')) LIKE '%HCC%'
               )
-            ORDER BY s.logon_time DESC
+            ORDER BY s.last_call_et DESC
         """
 
         try:
