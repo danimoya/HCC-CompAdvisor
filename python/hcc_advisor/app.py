@@ -220,11 +220,12 @@ def main():
     if 'selected_page' in st.session_state and st.session_state.selected_page:
         page_mapping = {
             "Overview": 0, "Quick Scan": 1, "Run Analysis": 2, "View Recommendations": 3,
-            "Compress Tables": 4, "Execution History": 5, "Session Browser": 6,
-            "Compression Rules": 7, "DB Connections": 8, "Admin": 9,
-            # Legacy mappings for compatibility
+            "Compress Tables": 4, "Tablespaces": 5, "Index Manager": 6,
+            "Execution History": 7, "Session Browser": 8,
+            "Compression Rules": 9, "DB Connections": 10, "Admin": 11,
+            # Legacy mappings
             "Dashboard": 0, "Analysis": 2, "Recommendations": 3,
-            "Execution": 4, "History": 5, "Sessions": 6, "Strategies": 7, "Connections": 8
+            "Execution": 4, "History": 7, "Sessions": 8, "Strategies": 9, "Connections": 10
         }
         default_page_index = page_mapping.get(st.session_state.selected_page, 0)
         st.session_state.selected_page = None  # Clear after use
@@ -242,6 +243,8 @@ def main():
                 "Run Analysis",
                 "View Recommendations",
                 "Compress Tables",
+                "Tablespaces",
+                "Index Manager",
                 "Execution History",
                 "Session Browser",
                 "Compression Rules",
@@ -254,6 +257,8 @@ def main():
                 "bar-chart-line-fill",    # Run Analysis
                 "stars",                  # View Recommendations
                 "box-arrow-in-down",      # Compress Tables
+                "hdd-stack-fill",         # Tablespaces
+                "list-check",             # Index Manager
                 "journal-text",           # Execution History
                 "binoculars-fill",        # Session Browser
                 "gear-fill",              # Compression Rules
@@ -341,6 +346,12 @@ def main():
     elif selected == "Compress Tables":
         from hcc_advisor.views.page_03_execution import show_execution_page
         show_execution_page()
+    elif selected == "Tablespaces":
+        from hcc_advisor.views.page_10_tablespaces import show_tablespaces_page
+        show_tablespaces_page()
+    elif selected == "Index Manager":
+        from hcc_advisor.views.page_11_indexes import show_indexes_page
+        show_indexes_page()
     elif selected == "Execution History":
         from hcc_advisor.views.page_04_history import show_history_page
         show_history_page()

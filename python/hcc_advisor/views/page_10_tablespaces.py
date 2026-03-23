@@ -1,0 +1,268 @@
+"""
+Tablespace Manager - HCC Compression Advisor
+Analyze tablespace usage and shrink allocated space after compression
+"""
+
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+from hcc_advisor.utils.target_queries import TargetQueries
+from hcc_advisor.utils.target_connector import TargetConnector
+
+
+def show_tablespaces_page():
+    st.title("Tablespace Manager")
+    st.markdown("Reclaim wasted space from tablespaces after compression")
+    st.markdown("---")
+
+    db_id = st.session_state.get('active_database_id')
+    if not db_id:
+        st.warning("Select a target database from the sidebar.")
+        return
+
+    col1, col2 = st.columns([3, 1])
+    with col2:
+        if st.button("Refresh", key="ts_refresh", use_container_width=True):
+            st.rerun()
+
+    with st.spinner("Querying tablespace usage on target..."):
+        df = _get_tablespace_usage(db_id)
+
+    if df.empty:
+        st.info("No tablespace data returned.")
+        return
+
+    # Summary metrics
+    total_alloc = df['allocated_mb'].sum()
+    total_used = df['used_mb'].sum()
+    total_free = df['free_mb'].sum()
+    total_shrinkable = df['shrinkable_mb'].sum()
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Allocated", f"{total_alloc / 1024:.2f} GB")
+    with col2:
+        st.metric("Used", f"{total_used / 1024:.2f} GB")
+    with col3:
+        st.metric("Free (within files)", f"{total_free / 1024:.2f} GB")
+    with col4:
+        st.metric("Shrinkable", f"{total_shrinkable / 1024:.2f} GB",
+                   delta=f"{total_shrinkable / 1024:.2f} GB reclaimable" if total_shrinkable > 100 else None)
+
+    st.markdown("---")
+
+    # Stacked bar chart — used vs free vs shrinkable
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        name='Used', x=df['tablespace_name'], y=df['used_mb'],
+        marker_color='#1f77b4', text=df['used_mb'].apply(lambda x: f"{x:.0f}"),
+        textposition='auto'
+    ))
+    fig.add_trace(go.Bar(
+        name='Free (in-file)', x=df['tablespace_name'], y=df['free_mb'],
+        marker_color='#aec7e8'
+    ))
+    fig.add_trace(go.Bar(
+        name='Shrinkable', x=df['tablespace_name'], y=df['shrinkable_mb'],
+        marker_color='#28a745',
+        text=df['shrinkable_mb'].apply(lambda x: f"{x:.0f}" if x > 10 else ""),
+        textposition='auto'
+    ))
+    fig.update_layout(
+        barmode='stack', height=400, yaxis_title="MB",
+        legend=dict(orientation='h', y=-0.15),
+        margin=dict(t=20, b=20)
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+
+    # Detail table with shrink actions
+    st.subheader("Tablespace Details")
+
+    show_df = df[['tablespace_name', 'allocated_mb', 'used_mb', 'free_mb',
+                   'used_pct', 'shrinkable_mb', 'can_shrink']].copy()
+    show_df.insert(0, 'select', False)
+
+    col_config = {
+        'select': st.column_config.CheckboxColumn("Shrink", default=False),
+        'tablespace_name': st.column_config.TextColumn("Tablespace"),
+        'allocated_mb': st.column_config.NumberColumn("Allocated (MB)", format="%.1f"),
+        'used_mb': st.column_config.NumberColumn("Used (MB)", format="%.1f"),
+        'free_mb': st.column_config.NumberColumn("Free (MB)", format="%.1f"),
+        'used_pct': st.column_config.ProgressColumn("Used %", min_value=0, max_value=100, format="%.1f%%"),
+        'shrinkable_mb': st.column_config.NumberColumn("Shrinkable (MB)", format="%.1f"),
+        'can_shrink': st.column_config.TextColumn("Shrinkable?"),
+    }
+
+    edited = st.data_editor(
+        show_df, column_config=col_config, use_container_width=True,
+        hide_index=True, disabled=[c for c in show_df.columns if c != 'select'],
+        key="ts_editor", height=min(35 * len(show_df) + 50, 600)
+    )
+
+    # Shrink action
+    selected = edited[edited['select'] == True]
+    if len(selected) > 0:
+        shrinkable = selected[selected['can_shrink'] == 'YES']
+        if len(shrinkable) == 0:
+            st.warning("Selected tablespaces cannot be shrunk (no reclaimable space or bigfile restrictions).")
+        else:
+            total_reclaim = shrinkable['shrinkable_mb'].sum()
+            st.info(f"Ready to shrink {len(shrinkable)} tablespace(s), reclaiming ~{total_reclaim:.0f} MB")
+
+            col1, col2, col3 = st.columns([1, 1, 1])
+            with col1:
+                confirm = st.checkbox("Confirm Shrink", key="ts_confirm")
+            with col2:
+                if st.button("Execute Shrink", disabled=not confirm, type="primary",
+                             key="ts_execute", use_container_width=True):
+                    for _, ts_row in shrinkable.iterrows():
+                        ts_name = ts_row['tablespace_name']
+                        with st.spinner(f"Shrinking {ts_name}..."):
+                            result = _shrink_tablespace(db_id, ts_name)
+                            if result.get('success'):
+                                st.success(f"{ts_name}: {result['message']}")
+                            else:
+                                st.error(f"{ts_name}: {result.get('error', 'Failed')}")
+                    st.rerun()
+
+    # Datafile details
+    st.markdown("---")
+    with st.expander("Datafile Details"):
+        df_files = _get_datafile_details(db_id)
+        if not df_files.empty:
+            st.dataframe(df_files, use_container_width=True, hide_index=True)
+
+
+def _get_tablespace_usage(db_id: int) -> pd.DataFrame:
+    query = """
+        SELECT
+            t.tablespace_name,
+            ROUND(t.allocated_mb, 1) as allocated_mb,
+            ROUND(t.allocated_mb - NVL(f.free_mb, 0), 1) as used_mb,
+            ROUND(NVL(f.free_mb, 0), 1) as free_mb,
+            ROUND((t.allocated_mb - NVL(f.free_mb, 0)) / NULLIF(t.allocated_mb, 0) * 100, 1) as used_pct,
+            ROUND(GREATEST(t.allocated_mb - NVL(hwm.hwm_mb, t.allocated_mb) - 1, 0), 1) as shrinkable_mb,
+            CASE WHEN t.allocated_mb - NVL(hwm.hwm_mb, t.allocated_mb) > 1 THEN 'YES' ELSE 'NO' END as can_shrink
+        FROM (
+            SELECT tablespace_name, SUM(bytes) / 1048576 as allocated_mb
+            FROM dba_data_files GROUP BY tablespace_name
+        ) t
+        LEFT JOIN (
+            SELECT tablespace_name, SUM(bytes) / 1048576 as free_mb
+            FROM dba_free_space GROUP BY tablespace_name
+        ) f ON f.tablespace_name = t.tablespace_name
+        LEFT JOIN (
+            SELECT tablespace_name,
+                   SUM(NVL(hwm_bytes, bytes)) / 1048576 as hwm_mb
+            FROM (
+                SELECT f.tablespace_name, f.bytes,
+                       (SELECT MAX(e.block_id + e.blocks) * ts.block_size
+                        FROM dba_extents e, dba_tablespaces ts
+                        WHERE e.tablespace_name = f.tablespace_name
+                          AND ts.tablespace_name = f.tablespace_name
+                          AND e.file_id = f.file_id) as hwm_bytes
+                FROM dba_data_files f
+            )
+            GROUP BY tablespace_name
+        ) hwm ON hwm.tablespace_name = t.tablespace_name
+        ORDER BY t.allocated_mb DESC
+    """
+    try:
+        df = TargetConnector.execute_query(db_id, query)
+        if not df.empty:
+            df.columns = [c.lower() for c in df.columns]
+        return df
+    except Exception:
+        # Simpler fallback without HWM
+        fallback = """
+            SELECT t.tablespace_name,
+                   ROUND(t.allocated_mb, 1) as allocated_mb,
+                   ROUND(t.allocated_mb - NVL(f.free_mb, 0), 1) as used_mb,
+                   ROUND(NVL(f.free_mb, 0), 1) as free_mb,
+                   ROUND((t.allocated_mb - NVL(f.free_mb, 0)) / NULLIF(t.allocated_mb, 0) * 100, 1) as used_pct,
+                   ROUND(NVL(f.free_mb, 0), 1) as shrinkable_mb,
+                   CASE WHEN NVL(f.free_mb, 0) > 10 THEN 'YES' ELSE 'NO' END as can_shrink
+            FROM (SELECT tablespace_name, SUM(bytes)/1048576 as allocated_mb
+                  FROM dba_data_files GROUP BY tablespace_name) t
+            LEFT JOIN (SELECT tablespace_name, SUM(bytes)/1048576 as free_mb
+                       FROM dba_free_space GROUP BY tablespace_name) f
+                ON f.tablespace_name = t.tablespace_name
+            ORDER BY t.allocated_mb DESC
+        """
+        try:
+            df = TargetConnector.execute_query(db_id, fallback)
+            if not df.empty:
+                df.columns = [c.lower() for c in df.columns]
+            return df
+        except Exception:
+            return pd.DataFrame()
+
+
+def _get_datafile_details(db_id: int) -> pd.DataFrame:
+    query = """
+        SELECT f.tablespace_name,
+               f.file_name,
+               ROUND(f.bytes / 1048576, 1) as size_mb,
+               f.autoextensible as auto_ext,
+               ROUND(NVL(fr.free_mb, 0), 1) as free_mb
+        FROM dba_data_files f
+        LEFT JOIN (
+            SELECT file_id, SUM(bytes) / 1048576 as free_mb
+            FROM dba_free_space GROUP BY file_id
+        ) fr ON fr.file_id = f.file_id
+        ORDER BY f.tablespace_name, f.file_name
+    """
+    try:
+        df = TargetConnector.execute_query(db_id, query)
+        if not df.empty:
+            df.columns = [c.lower() for c in df.columns]
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def _shrink_tablespace(db_id: int, tablespace_name: str) -> dict:
+    """Resize datafiles in a tablespace to reclaim unused space."""
+    try:
+        # Get datafiles with their shrink targets
+        query = """
+            SELECT f.file_id, f.file_name, f.bytes as current_bytes,
+                   NVL((SELECT MAX(e.block_id + e.blocks) * ts.block_size
+                        FROM dba_extents e, dba_tablespaces ts
+                        WHERE e.file_id = f.file_id
+                          AND e.tablespace_name = f.tablespace_name
+                          AND ts.tablespace_name = f.tablespace_name), 1048576) as hwm_bytes
+            FROM dba_data_files f
+            WHERE f.tablespace_name = :ts
+        """
+        df = TargetConnector.execute_query(db_id, query, {'ts': tablespace_name})
+        if df.empty:
+            return {'success': False, 'error': 'No datafiles found'}
+
+        shrunk = 0
+        total_saved = 0
+        for _, row in df.iterrows():
+            current = int(row['CURRENT_BYTES'])
+            hwm = int(row['HWM_BYTES'])
+            target = hwm + 10 * 1048576  # HWM + 10MB buffer
+            if target < current - 1048576:
+                file_name = row['FILE_NAME']
+                target_mb = target // 1048576
+                try:
+                    TargetConnector.execute_plsql(
+                        db_id,
+                        f"BEGIN EXECUTE IMMEDIATE 'ALTER DATABASE DATAFILE ''{file_name}'' RESIZE {target_mb}M'; END;"
+                    )
+                    total_saved += (current - target) // 1048576
+                    shrunk += 1
+                except Exception as e:
+                    return {'success': False, 'error': f'Resize failed for {file_name}: {e}'}
+
+        if shrunk > 0:
+            return {'success': True, 'message': f'{shrunk} file(s) resized, {total_saved} MB reclaimed'}
+        return {'success': True, 'message': 'No files needed resizing'}
+
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
