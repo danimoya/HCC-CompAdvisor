@@ -109,23 +109,29 @@ def show_tablespaces_page():
             st.warning("Selected tablespaces cannot be shrunk (no reclaimable space or bigfile restrictions).")
         else:
             total_reclaim = shrinkable['shrinkable_mb'].sum()
-            st.info(f"Ready to shrink {len(shrinkable)} tablespace(s), reclaiming ~{total_reclaim:.0f} MB")
+            ts_names = shrinkable['tablespace_name'].tolist()
+            st.info(f"Ready to shrink {len(shrinkable)} tablespace(s): **{', '.join(ts_names)}** — ~{total_reclaim:.0f} MB reclaimable")
 
-            col1, col2, col3 = st.columns([1, 1, 1])
-            with col1:
-                confirm = st.checkbox("Confirm Shrink", key="ts_confirm")
-            with col2:
-                if st.button("Execute Shrink", disabled=not confirm, type="primary",
-                             key="ts_execute", use_container_width=True):
-                    for _, ts_row in shrinkable.iterrows():
-                        ts_name = ts_row['tablespace_name']
-                        with st.spinner(f"Shrinking {ts_name}..."):
-                            result = _shrink_tablespace(db_id, ts_name)
-                            if result.get('success'):
-                                st.success(f"{ts_name}: {result['message']}")
-                            else:
-                                st.error(f"{ts_name}: {result.get('error', 'Failed')}")
-                    st.rerun()
+            # Store selection in session_state so it survives the confirm checkbox rerun
+            st.session_state['ts_shrink_targets'] = ts_names
+
+    targets = st.session_state.get('ts_shrink_targets', [])
+    if targets:
+        col1, col2, col3 = st.columns([1, 1, 1])
+        with col1:
+            confirm = st.checkbox("Confirm Shrink", key="ts_confirm")
+        with col2:
+            if st.button("Execute Shrink", disabled=not confirm, type="primary",
+                         key="ts_execute", use_container_width=True):
+                for ts_name in targets:
+                    with st.spinner(f"Shrinking {ts_name}..."):
+                        result = _shrink_tablespace(db_id, ts_name)
+                        if result.get('success'):
+                            st.success(f"{ts_name}: {result['message']}")
+                        else:
+                            st.error(f"{ts_name}: {result.get('error', 'Failed')}")
+                st.session_state.pop('ts_shrink_targets', None)
+                st.rerun()
 
     # Datafile details
     st.markdown("---")
