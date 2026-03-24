@@ -160,7 +160,9 @@ def show_indexes_page():
                     idx_name = row['index_name']
                     row_dop = int(row.get('dop', max_dop) or max_dop)
 
-                    result = _submit_rebuild_job(db_id, idx_owner, idx_name, row_dop)
+                    idx_partitioned = row.get('partitioned', 'NO')
+                    result = _submit_rebuild_job(db_id, idx_owner, idx_name, row_dop,
+                                                 partitioned=idx_partitioned)
                     if result.get('success'):
                         submitted += 1
                         # Track in session_state for immediate UI feedback
@@ -230,16 +232,39 @@ def _get_indexes(db_id: int, schema: str = None, include_valid: bool = False) ->
         return pd.DataFrame()
 
 
-def _submit_rebuild_job(db_id: int, index_owner: str, index_name: str, dop: int = 4) -> dict:
+def _submit_rebuild_job(db_id: int, index_owner: str, index_name: str,
+                        dop: int = 4, partitioned: str = 'NO') -> dict:
     ts = datetime.now().strftime('%m%d%H%M%S') + f"{random.randint(0,999):03d}"
     job_name = f"IDXR_{index_name[:25]}_{ts}"
 
-    action = f"""
-        BEGIN
-            EXECUTE IMMEDIATE 'ALTER INDEX {index_owner}.{index_name} REBUILD ONLINE PARALLEL {dop}';
-            EXECUTE IMMEDIATE 'ALTER INDEX {index_owner}.{index_name} NOPARALLEL';
-        END;
-    """
+    if partitioned == 'YES':
+        # Partitioned index: must rebuild each partition individually (ORA-14086)
+        action = f"""
+            BEGIN
+                FOR p IN (SELECT partition_name FROM all_ind_partitions
+                          WHERE index_owner = '{index_owner}' AND index_name = '{index_name}'
+                            AND status = 'UNUSABLE')
+                LOOP
+                    EXECUTE IMMEDIATE 'ALTER INDEX {index_owner}.{index_name} REBUILD PARTITION '
+                                      || p.partition_name || ' ONLINE PARALLEL {dop}';
+                END LOOP;
+                FOR sp IN (SELECT partition_name, subpartition_name FROM all_ind_subpartitions
+                           WHERE index_owner = '{index_owner}' AND index_name = '{index_name}'
+                             AND status = 'UNUSABLE')
+                LOOP
+                    EXECUTE IMMEDIATE 'ALTER INDEX {index_owner}.{index_name} REBUILD SUBPARTITION '
+                                      || sp.subpartition_name || ' ONLINE PARALLEL {dop}';
+                END LOOP;
+                EXECUTE IMMEDIATE 'ALTER INDEX {index_owner}.{index_name} NOPARALLEL';
+            END;
+        """
+    else:
+        action = f"""
+            BEGIN
+                EXECUTE IMMEDIATE 'ALTER INDEX {index_owner}.{index_name} REBUILD ONLINE PARALLEL {dop}';
+                EXECUTE IMMEDIATE 'ALTER INDEX {index_owner}.{index_name} NOPARALLEL';
+            END;
+        """
 
     create_job = f"""
         BEGIN

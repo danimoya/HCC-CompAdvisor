@@ -458,6 +458,8 @@ class TargetQueries:
                 GROUP BY owner, segment_name
             ) s ON s.owner = t.owner AND s.segment_name = t.table_name
             WHERE t.temporary = 'N'
+              AND t.iot_type IS NULL
+              AND t.cluster_name IS NULL
               AND t.owner NOT IN (
                   'SYS','SYSTEM','AUDSYS','OUTLN','DBSNMP','GSMADMIN_INTERNAL',
                   'XDB','WMSYS','CTXSYS','MDSYS','ORDSYS','ORDDATA','OLAPSYS',
@@ -470,6 +472,11 @@ class TargetQueries:
               AND t.owner NOT LIKE 'ORACLE%'
               AND t.owner NOT LIKE 'FLOWS_%'
               AND NVL(s.total_bytes, 0) > 1048576
+              AND NOT EXISTS (
+                  SELECT 1 FROM all_tab_columns c
+                  WHERE c.owner = t.owner AND c.table_name = t.table_name
+                    AND c.data_type IN ('LONG', 'LONG RAW')
+              )
               {owner_filter}
             ORDER BY s.total_bytes DESC NULLS LAST
         """
