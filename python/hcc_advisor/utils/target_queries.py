@@ -2237,6 +2237,192 @@ ONLINE PARALLEL {parallel_degree};"""
 
 
     # ============================================================================
+    # COMPRESSION ROLLBACK
+    # ============================================================================
+
+    @staticmethod
+    def rollback_compression(
+        database_id: int, owner: str, table_name: str,
+        partition_name: Optional[str] = None, parallel_degree: int = 4
+    ) -> Dict[str, Any]:
+        """Rollback compression by moving table to NOCOMPRESS."""
+        from hcc_advisor.utils.central_connector import CentralConnector
+
+        ddl = f"ALTER TABLE {owner}.{table_name}"
+        if partition_name:
+            ddl += f" MOVE PARTITION {partition_name} NOCOMPRESS ONLINE PARALLEL {parallel_degree}"
+        else:
+            ddl += f" MOVE NOCOMPRESS ONLINE PARALLEL {parallel_degree}"
+
+        try:
+            ok = TargetConnector.execute_plsql(
+                database_id, f"BEGIN EXECUTE IMMEDIATE q'[{ddl}]'; END;"
+            )
+            if ok:
+                # Rebuild unusable indexes
+                idx_q = """
+                    SELECT owner, index_name FROM all_indexes
+                    WHERE table_owner = :o AND table_name = :t AND status = 'UNUSABLE'
+                """
+                idx_df = TargetConnector.execute_query(database_id, idx_q,
+                                                       {'o': owner, 't': table_name})
+                idx_count = 0
+                if not idx_df.empty:
+                    for _, r in idx_df.iterrows():
+                        try:
+                            TargetConnector.execute_plsql(database_id,
+                                f"BEGIN EXECUTE IMMEDIATE 'ALTER INDEX {r['OWNER']}.{r['INDEX_NAME']} REBUILD ONLINE PARALLEL {parallel_degree}'; END;")
+                            idx_count += 1
+                        except Exception:
+                            pass
+
+                # Update history
+                try:
+                    CentralConnector.execute_dml("""
+                        UPDATE t_compression_history
+                        SET rollback_status = 'ROLLED_BACK'
+                        WHERE database_id = :db AND owner = :o AND object_name = :t
+                          AND operation_status = 'SUCCESS'
+                          AND NVL(partition_name, '~') = NVL(:p, '~')
+                          AND rollback_status IS NULL
+                          AND ROWNUM = 1
+                    """, {'db': database_id, 'o': owner, 't': table_name, 'p': partition_name})
+
+                    CentralConnector.execute_dml("""
+                        UPDATE t_compression_analysis
+                        SET current_compression = 'NONE'
+                        WHERE database_id = :db AND owner = :o AND object_name = :t
+                          AND NVL(partition_name, '~') = NVL(:p, '~')
+                    """, {'db': database_id, 'o': owner, 't': table_name, 'p': partition_name})
+                except Exception:
+                    pass
+
+                msg = f"Rolled back to NOCOMPRESS"
+                if idx_count:
+                    msg += f", {idx_count} indexes rebuilt"
+                return {'success': True, 'message': msg}
+            return {'success': False, 'error': 'DDL execution failed'}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    # ============================================================================
+    # AWR/ASH INTEGRATION FOR HOTNESS (requires Diagnostics Pack license)
+    # ============================================================================
+
+    @staticmethod
+    def get_awr_segment_stats(database_id: int, owner: Optional[str] = None) -> Dict[str, float]:
+        """Query DBA_HIST_SEG_STAT for physical reads per segment.
+        Returns dict keyed by 'OWNER.TABLE_NAME' with read_score 0-100.
+        WARNING: Requires Oracle Diagnostics Pack license."""
+        owner_filter = "AND s.obj#owner = :owner" if owner else ""
+        params = {'owner': owner} if owner else {}
+
+        query = f"""
+            SELECT o.owner, o.object_name,
+                   SUM(s.physical_reads_delta) as total_reads
+            FROM dba_hist_seg_stat s
+            JOIN dba_objects o ON o.object_id = s.obj#
+            WHERE o.object_type = 'TABLE'
+              AND s.snap_id > (SELECT MAX(snap_id) - 48 FROM dba_hist_snapshot)
+              {owner_filter}
+            GROUP BY o.owner, o.object_name
+            HAVING SUM(s.physical_reads_delta) > 0
+        """
+        try:
+            df = TargetConnector.execute_query(database_id, query, params if params else None)
+            if df.empty:
+                return {}
+            import math
+            max_reads = df['TOTAL_READS'].max()
+            result = {}
+            for _, r in df.iterrows():
+                reads = float(r['TOTAL_READS'])
+                score = (math.log10(reads + 1) / math.log10(max_reads + 1)) * 100 if max_reads > 0 else 0
+                result[f"{r['OWNER']}.{r['OBJECT_NAME']}"] = round(score, 1)
+            return result
+        except Exception:
+            return {}
+
+    # ============================================================================
+    # SCHEDULED RECURRING ANALYSIS
+    # ============================================================================
+
+    @staticmethod
+    def create_recurring_scan_job(
+        database_id: int, frequency: str = 'WEEKLY',
+        owner: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Create a DBMS_SCHEDULER repeating job for periodic quick scan.
+        frequency: DAILY, WEEKLY, MONTHLY"""
+        import random
+        from datetime import datetime
+
+        repeat_map = {
+            'DAILY': 'FREQ=DAILY;BYHOUR=2;BYMINUTE=0',
+            'WEEKLY': 'FREQ=WEEKLY;BYDAY=SUN;BYHOUR=2;BYMINUTE=0',
+            'MONTHLY': 'FREQ=MONTHLY;BYMONTHDAY=1;BYHOUR=2;BYMINUTE=0',
+        }
+        repeat_interval = repeat_map.get(frequency, repeat_map['WEEKLY'])
+        job_name = f"HCC_RECURRING_SCAN_{random.randint(100,999)}"
+
+        # The recurring job flushes monitoring + gathers fresh stats
+        action = """
+            BEGIN
+                DBMS_STATS.FLUSH_DATABASE_MONITORING_INFO;
+                DBMS_STATS.GATHER_DATABASE_STATS(options => 'GATHER STALE');
+            END;
+        """
+
+        plsql = f"""
+            BEGIN
+                DBMS_SCHEDULER.CREATE_JOB(
+                    job_name        => '{job_name}',
+                    job_type        => 'PLSQL_BLOCK',
+                    job_action      => q'[{action}]',
+                    repeat_interval => '{repeat_interval}',
+                    enabled         => TRUE,
+                    auto_drop       => FALSE,
+                    comments        => 'HCC Advisor: recurring stats refresh ({frequency})'
+                );
+            END;
+        """
+        try:
+            ok = TargetConnector.execute_plsql(database_id, plsql)
+            if ok:
+                return {'success': True, 'job_name': job_name, 'frequency': frequency}
+            return {'success': False, 'error': 'Job creation failed'}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    @staticmethod
+    def get_recurring_scan_jobs(database_id: int) -> pd.DataFrame:
+        """List HCC recurring scan jobs on the target."""
+        query = """
+            SELECT job_name, enabled, state, comments,
+                   repeat_interval,
+                   TO_CHAR(last_start_date, 'YYYY-MM-DD HH24:MI') as last_run,
+                   TO_CHAR(next_run_date, 'YYYY-MM-DD HH24:MI') as next_run
+            FROM dba_scheduler_jobs
+            WHERE job_name LIKE 'HCC_RECURRING%'
+            ORDER BY job_name
+        """
+        try:
+            return TargetConnector.execute_query(database_id, query)
+        except Exception:
+            return pd.DataFrame()
+
+    @staticmethod
+    def drop_recurring_scan_job(database_id: int, job_name: str) -> bool:
+        """Drop a recurring scan job."""
+        try:
+            return TargetConnector.execute_plsql(
+                database_id,
+                f"BEGIN DBMS_SCHEDULER.DROP_JOB('{job_name}', force => TRUE); END;"
+            )
+        except Exception:
+            return False
+
+    # ============================================================================
     # QUICK SCAN — Hotness-only analysis (no DBMS_COMPRESSION)
     # ============================================================================
 

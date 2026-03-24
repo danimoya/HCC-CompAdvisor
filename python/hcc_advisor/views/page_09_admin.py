@@ -15,12 +15,18 @@ def show_admin_page():
     st.markdown("System maintenance and SQL patch management")
     st.markdown("---")
 
-    tab1, tab2 = st.tabs(["SQL Patches", "System Info"])
+    tab1, tab2, tab3, tab4 = st.tabs(["SQL Patches", "Webhooks", "AWR License", "System Info"])
 
     with tab1:
         show_sql_patches()
 
     with tab2:
+        show_webhooks()
+
+    with tab3:
+        show_awr_disclaimer()
+
+    with tab4:
         show_system_info()
 
 
@@ -242,6 +248,138 @@ def show_sql_patches():
                                 st.error(f"Patch failed: {e}")
             else:
                 st.warning("No `patch.sql` found.")
+
+
+def show_webhooks():
+    """Global webhook configuration for notifications."""
+    st.subheader("Notification Webhooks")
+    st.markdown("Configure a global webhook URL (Slack/Teams/custom) to receive notifications "
+                "when compression batches complete or jobs fail.")
+
+    # Load from session state or central DB
+    current_url = st.session_state.get('webhook_url', '')
+    try:
+        df = CentralConnector.execute_query(
+            "SELECT value FROM t_schema_metadata WHERE key = 'webhook_url'"
+        )
+        if not df.empty:
+            current_url = df.iloc[0]['VALUE'] or ''
+            st.session_state['webhook_url'] = current_url
+    except Exception:
+        pass
+
+    url = st.text_input("Webhook URL", value=current_url,
+                         placeholder="https://hooks.slack.com/services/... or Teams webhook URL",
+                         key="webhook_url_input")
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.button("Save", key="webhook_save", use_container_width=True):
+            try:
+                CentralConnector.execute_dml("""
+                    MERGE INTO t_schema_metadata tgt
+                    USING (SELECT 'webhook_url' as key FROM DUAL) src ON (tgt.key = src.key)
+                    WHEN MATCHED THEN UPDATE SET value = :url
+                    WHEN NOT MATCHED THEN INSERT (key, value) VALUES ('webhook_url', :url)
+                """, {'url': url})
+                st.session_state['webhook_url'] = url
+                st.success("Webhook URL saved!")
+            except Exception as e:
+                st.error(f"Failed to save: {e}")
+    with col2:
+        if st.button("Test", key="webhook_test", use_container_width=True):
+            if url:
+                _test_webhook(url)
+            else:
+                st.warning("Enter a URL first")
+    with col3:
+        if st.button("Clear", key="webhook_clear", use_container_width=True):
+            try:
+                CentralConnector.execute_dml(
+                    "DELETE FROM t_schema_metadata WHERE key = 'webhook_url'"
+                )
+                st.session_state.pop('webhook_url', None)
+                st.success("Webhook cleared")
+                st.rerun()
+            except Exception:
+                pass
+
+    st.markdown("---")
+    st.caption("**Events that trigger notifications:**")
+    st.markdown("- Compression batch completed (all jobs in a submission finished)\n"
+                "- Individual job failed with error\n"
+                "- Growth alert: compressed table grew >20% since compression")
+
+
+def _test_webhook(url: str):
+    """Send a test message to the webhook URL."""
+    import urllib.request
+    import json
+    payload = json.dumps({
+        "text": "HCC Compression Advisor — Test notification. Webhook is working!"
+    }).encode('utf-8')
+    try:
+        req = urllib.request.Request(url, data=payload,
+                                     headers={'Content-Type': 'application/json'})
+        resp = urllib.request.urlopen(req, timeout=10)
+        if resp.status < 300:
+            st.success("Test notification sent!")
+        else:
+            st.error(f"Webhook returned status {resp.status}")
+    except Exception as e:
+        st.error(f"Webhook test failed: {e}")
+
+
+def show_awr_disclaimer():
+    """AWR/ASH license acknowledgement for enhanced hotness scoring."""
+    st.subheader("AWR / Diagnostics Pack License")
+    st.warning(
+        "**Important:** The AWR-enhanced hotness scoring feature queries `DBA_HIST_SEG_STAT` "
+        "which is part of the **Oracle Diagnostics Pack**. Using this feature requires a valid "
+        "Diagnostics Pack license on the target database. Using it without the license is a "
+        "violation of Oracle licensing terms.\n\n"
+        "**Ensure your database is properly licensed before enabling this feature.**"
+    )
+
+    acknowledged = st.session_state.get('awr_acknowledged', False)
+    try:
+        df = CentralConnector.execute_query(
+            "SELECT value FROM t_schema_metadata WHERE key = 'awr_acknowledged'"
+        )
+        if not df.empty and df.iloc[0]['VALUE'] == 'Y':
+            acknowledged = True
+            st.session_state['awr_acknowledged'] = True
+    except Exception:
+        pass
+
+    if acknowledged:
+        st.success("AWR feature acknowledged and enabled. Enhanced hotness scoring is active.")
+        if st.button("Revoke Acknowledgement", key="awr_revoke"):
+            try:
+                CentralConnector.execute_dml(
+                    "DELETE FROM t_schema_metadata WHERE key = 'awr_acknowledged'"
+                )
+                st.session_state['awr_acknowledged'] = False
+                st.rerun()
+            except Exception:
+                pass
+    else:
+        st.info("AWR-enhanced hotness scoring is **disabled**.")
+        if st.checkbox("I confirm that the target database has a valid Oracle Diagnostics Pack license",
+                       key="awr_confirm"):
+            if st.button("Enable AWR Features", key="awr_enable", type="primary"):
+                try:
+                    CentralConnector.execute_dml("""
+                        MERGE INTO t_schema_metadata tgt
+                        USING (SELECT 'awr_acknowledged' as key FROM DUAL) src ON (tgt.key = src.key)
+                        WHEN MATCHED THEN UPDATE SET value = 'Y'
+                        WHEN NOT MATCHED THEN INSERT (key, value) VALUES ('awr_acknowledged', 'Y')
+                    """)
+                    st.session_state['awr_acknowledged'] = True
+                    st.success("AWR features enabled!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed: {e}")
 
 
 def show_system_info():

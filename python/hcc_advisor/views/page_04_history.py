@@ -268,6 +268,32 @@ def show_history_page():
         hide_index=True
     )
 
+    # Rollback section for successful compressions
+    success_rows = df[df['status'] == 'SUCCESS'] if 'status' in df.columns else pd.DataFrame()
+    if not success_rows.empty:
+        with st.expander("Rollback Compression"):
+            from hcc_advisor.utils.target_queries import TargetQueries
+            rollback_target = st.selectbox(
+                "Select table to rollback",
+                options=success_rows.index.tolist(),
+                format_func=lambda i: f"{success_rows.loc[i, 'table_owner']}.{success_rows.loc[i, 'table_name']} ({success_rows.loc[i, 'strategy']})",
+                key="rollback_select"
+            )
+            if rollback_target is not None:
+                row = success_rows.loc[rollback_target]
+                st.warning(f"This will move **{row['table_owner']}.{row['table_name']}** to NOCOMPRESS and rebuild indexes.")
+                if st.button("Rollback to NOCOMPRESS", key="rollback_btn", type="primary"):
+                    db_id = st.session_state.get('active_database_id')
+                    if db_id:
+                        with st.spinner("Rolling back..."):
+                            result = TargetQueries.rollback_compression(
+                                db_id, row['table_owner'], row['table_name'])
+                            if result.get('success'):
+                                st.success(result['message'])
+                                st.rerun()
+                            else:
+                                st.error(result.get('error', 'Rollback failed'))
+
     # Failed job details from target scheduler
     failed_rows = df[df['status'] == 'FAILED'] if 'status' in df.columns else pd.DataFrame()
     if not failed_rows.empty:

@@ -99,12 +99,50 @@ def show_scheduler_page():
     else:
         st.info("No compression jobs recorded in the last 24 hours.")
 
+    # Recurring Analysis section
+    if db_id:
+        st.markdown("---")
+        with st.expander("Recurring Stats Refresh Jobs"):
+            _render_recurring_jobs(db_id)
+
     # Auto-refresh logic (at the end so page renders first)
     if st.session_state.scheduler_auto_refresh:
         st.caption(f"Auto-refreshing every {interval} minute(s)... (click Stop to disable)")
         _do_refresh(db_id)
         time.sleep(interval * 60)
         st.rerun()
+
+
+def _render_recurring_jobs(db_id):
+    """Show and manage recurring analysis jobs on the target."""
+    existing = TargetQueries.get_recurring_scan_jobs(db_id)
+    if not existing.empty:
+        existing.columns = [c.lower() for c in existing.columns]
+        st.dataframe(existing, use_container_width=True, hide_index=True)
+
+        job_to_drop = st.selectbox("Drop job", existing['job_name'].tolist(), key="sched_drop_job")
+        if st.button("Drop Selected Job", key="sched_drop_btn"):
+            ok = TargetQueries.drop_recurring_scan_job(db_id, job_to_drop)
+            if ok:
+                st.success(f"Dropped {job_to_drop}")
+                st.rerun()
+    else:
+        st.caption("No recurring jobs configured.")
+
+    st.markdown("---")
+    col1, col2 = st.columns(2)
+    with col1:
+        freq = st.selectbox("Frequency", ["DAILY", "WEEKLY", "MONTHLY"],
+                             index=1, key="sched_freq")
+    with col2:
+        if st.button("Create Recurring Job", key="sched_create_recurring",
+                     type="primary", use_container_width=True):
+            result = TargetQueries.create_recurring_scan_job(db_id, freq)
+            if result.get('success'):
+                st.success(f"Created {result['job_name']} ({freq})")
+                st.rerun()
+            else:
+                st.error(result.get('error', 'Failed'))
 
 
 def _do_refresh(db_id):

@@ -144,6 +144,111 @@ class CentralQueries:
             log_error(e, "get_scheduler_job_details")
             return pd.DataFrame()
 
+    @staticmethod
+    def get_savings_timeline(database_id: Optional[int] = None) -> pd.DataFrame:
+        """Get cumulative savings over time for the effectiveness chart."""
+        db_filter = "AND database_id = :database_id" if database_id else ""
+        query = f"""
+            SELECT TRUNC(start_time) as day,
+                   SUM(CASE WHEN operation_status = 'SUCCESS'
+                       THEN NVL(original_size_bytes - compressed_size_bytes, 0) / 1048576
+                       ELSE 0 END) as saved_mb,
+                   COUNT(CASE WHEN operation_status = 'SUCCESS' THEN 1 END) as objects_compressed
+            FROM t_compression_history
+            WHERE operation_status = 'SUCCESS'
+              AND original_size_bytes > 0
+              {db_filter}
+            GROUP BY TRUNC(start_time)
+            ORDER BY TRUNC(start_time)
+        """
+        params = {'database_id': database_id} if database_id else {}
+        try:
+            return CentralConnector.execute_query(query, params if params else None)
+        except Exception:
+            return pd.DataFrame()
+
+    @staticmethod
+    def get_forecast_data(database_id: Optional[int] = None) -> Dict[str, Any]:
+        """Get data for the space savings forecast report."""
+        db_filter = "AND database_id = :database_id" if database_id else ""
+        query = f"""
+            SELECT
+                COUNT(*) as pending_count,
+                ROUND(SUM(NVL(a.original_size_bytes, a.size_bytes)) / 1048576, 1) as pending_current_mb,
+                ROUND(SUM(NVL(a.original_size_bytes, a.size_bytes) - NVL(a.projected_savings_bytes, 0)) / 1048576, 1) as pending_projected_mb,
+                ROUND(SUM(NVL(a.projected_savings_bytes, 0)) / 1048576, 1) as pending_savings_mb
+            FROM t_compression_analysis a
+            LEFT JOIN (
+                SELECT h2.database_id as h_db_id, h2.owner as h_owner,
+                       h2.object_name as h_obj, NVL(h2.partition_name, '~') as h_pn,
+                       h2.operation_status,
+                       ROW_NUMBER() OVER (PARTITION BY h2.database_id, h2.owner, h2.object_name,
+                                          NVL(h2.partition_name, '~') ORDER BY h2.start_time DESC) as rn
+                FROM t_compression_history h2
+            ) h ON h.h_db_id = a.database_id AND h.h_owner = a.owner
+               AND h.h_obj = a.object_name AND h.h_pn = NVL(a.partition_name, '~') AND h.rn = 1
+            WHERE a.advisable_compression IS NOT NULL
+              AND a.advisable_compression != 'NONE'
+              AND (h.operation_status IS NULL OR h.operation_status != 'SUCCESS')
+              {db_filter}
+        """
+        params = {'database_id': database_id} if database_id else {}
+        try:
+            df = CentralConnector.execute_query(query, params if params else None)
+            if not df.empty:
+                r = df.iloc[0]
+                # Get avg compression duration from history
+                dur_q = f"""
+                    SELECT ROUND(AVG(duration_seconds), 0) as avg_sec
+                    FROM t_compression_history
+                    WHERE operation_status = 'SUCCESS' AND duration_seconds > 0 {db_filter}
+                """
+                dur_df = CentralConnector.execute_query(dur_q, params if params else None)
+                avg_sec = int(dur_df.iloc[0]['AVG_SEC'] or 300) if not dur_df.empty else 300
+
+                return {
+                    'pending_count': int(r.get('PENDING_COUNT') or 0),
+                    'pending_current_mb': float(r.get('PENDING_CURRENT_MB') or 0),
+                    'pending_projected_mb': float(r.get('PENDING_PROJECTED_MB') or 0),
+                    'pending_savings_mb': float(r.get('PENDING_SAVINGS_MB') or 0),
+                    'avg_duration_sec': avg_sec,
+                }
+        except Exception:
+            pass
+        return {'pending_count': 0, 'pending_current_mb': 0, 'pending_projected_mb': 0,
+                'pending_savings_mb': 0, 'avg_duration_sec': 300}
+
+    @staticmethod
+    def get_growth_alerts(database_id: Optional[int] = None, threshold_pct: float = 20.0) -> pd.DataFrame:
+        """Detect compressed tables that have grown beyond threshold since compression."""
+        db_filter = "AND a.database_id = :database_id" if database_id else ""
+        query = f"""
+            SELECT a.owner, a.object_name, a.object_type,
+                   ROUND(h.compressed_size_bytes / 1048576, 1) as compressed_mb,
+                   ROUND(a.size_bytes / 1048576, 1) as current_mb,
+                   ROUND((a.size_bytes - h.compressed_size_bytes) / NULLIF(h.compressed_size_bytes, 0) * 100, 1) as growth_pct
+            FROM t_compression_analysis a
+            JOIN (
+                SELECT database_id, owner, object_name, NVL(partition_name, '~') as pn,
+                       compressed_size_bytes,
+                       ROW_NUMBER() OVER (PARTITION BY database_id, owner, object_name,
+                                          NVL(partition_name, '~') ORDER BY start_time DESC) as rn
+                FROM t_compression_history
+                WHERE operation_status = 'SUCCESS' AND compressed_size_bytes > 0
+            ) h ON h.database_id = a.database_id AND h.owner = a.owner
+               AND h.object_name = a.object_name AND h.pn = NVL(a.partition_name, '~') AND h.rn = 1
+            WHERE a.size_bytes > h.compressed_size_bytes * (1 + :threshold / 100)
+              {db_filter}
+            ORDER BY (a.size_bytes - h.compressed_size_bytes) DESC
+        """
+        params = {'threshold': threshold_pct}
+        if database_id:
+            params['database_id'] = database_id
+        try:
+            return CentralConnector.execute_query(query, params)
+        except Exception:
+            return pd.DataFrame()
+
     def get_compression_progress(database_id: Optional[int] = None) -> Dict[str, Any]:
         """Get compressed/pending/skipped breakdown for the dashboard."""
         db_filter = "AND a.database_id = :database_id" if database_id else ""

@@ -326,9 +326,10 @@ def main():
         else:
             st.error("Central DB Disconnected")
 
-        # SQL Debug toggle
+        # Toggles
         st.markdown("---")
         st.checkbox("SQL Debug Console", key='sql_debug_enabled', value=False)
+        st.caption("Theme: Settings → Theme in Streamlit menu (top-right)")
 
         # Logout button
         render_logout_button()
@@ -505,7 +506,47 @@ def show_dashboard():
 
     st.markdown("---")
 
-    # Row 3 — Existing charts
+    # Row 3 — Effectiveness timeline + Forecast
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Savings Over Time")
+        timeline_df = CentralQueries.get_savings_timeline(database_id=db_id)
+        if not timeline_df.empty:
+            import plotly.graph_objects as go
+            timeline_df.columns = [c.lower() for c in timeline_df.columns]
+            # Cumulative sum
+            timeline_df['cumulative_mb'] = timeline_df['saved_mb'].cumsum()
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=timeline_df['day'], y=timeline_df['cumulative_mb'],
+                mode='lines+markers', fill='tozeroy',
+                marker_color='#28a745', name='Cumulative Saved (MB)'
+            ))
+            fig.update_layout(height=280, yaxis_title="MB Saved",
+                              margin=dict(t=10, b=10), showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No compression history yet.")
+
+    with col2:
+        st.subheader("Forecast")
+        forecast = CentralQueries.get_forecast_data(database_id=db_id)
+        if forecast['pending_count'] > 0:
+            est_hours = (forecast['pending_count'] * forecast['avg_duration_sec']) / 3600
+            c1, c2 = st.columns(2)
+            with c1:
+                st.metric("Pending Objects", forecast['pending_count'])
+                st.metric("Current Size", f"{forecast['pending_current_mb'] / 1024:.2f} GB")
+            with c2:
+                st.metric("Projected After", f"{forecast['pending_projected_mb'] / 1024:.2f} GB")
+                st.metric("Est. Time", f"{est_hours:.1f} hrs" if est_hours < 24 else f"{est_hours / 24:.1f} days")
+        else:
+            st.success("All candidates compressed!")
+
+    st.markdown("---")
+
+    # Row 4 — Strategy chart + Growth alerts
     col1, col2 = st.columns(2)
 
     with col1:
@@ -579,6 +620,15 @@ def show_dashboard():
                 """, unsafe_allow_html=True)
         else:
             st.info("No recent executions")
+
+    # Row 5 — Growth Alerts
+    growth_df = CentralQueries.get_growth_alerts(database_id=db_id)
+    if not growth_df.empty:
+        growth_df.columns = [c.lower() for c in growth_df.columns]
+        st.markdown("---")
+        st.subheader(f"Growth Alerts ({len(growth_df)} tables)")
+        st.caption("Compressed tables that have grown >20% since compression")
+        st.dataframe(growth_df, use_container_width=True, hide_index=True)
 
     # Quick actions
     st.markdown("---")
