@@ -154,18 +154,16 @@ def _get_tablespace_usage(db_id: int) -> pd.DataFrame:
             FROM dba_free_space GROUP BY tablespace_name
         ) f ON f.tablespace_name = t.tablespace_name
         LEFT JOIN (
-            SELECT tablespace_name,
-                   SUM(NVL(hwm_bytes, bytes)) / 1048576 as hwm_mb
+            SELECT e.tablespace_name,
+                   SUM((e.max_block + 1) * ts.block_size) / 1048576 as hwm_mb
             FROM (
-                SELECT f.tablespace_name, f.bytes,
-                       (SELECT MAX(e.block_id + e.blocks) * ts.block_size
-                        FROM dba_extents e, dba_tablespaces ts
-                        WHERE e.tablespace_name = f.tablespace_name
-                          AND ts.tablespace_name = f.tablespace_name
-                          AND e.file_id = f.file_id) as hwm_bytes
-                FROM dba_data_files f
-            )
-            GROUP BY tablespace_name
+                SELECT tablespace_name, file_id,
+                       MAX(block_id + blocks) as max_block
+                FROM dba_extents
+                GROUP BY tablespace_name, file_id
+            ) e
+            JOIN dba_tablespaces ts ON ts.tablespace_name = e.tablespace_name
+            GROUP BY e.tablespace_name, ts.block_size
         ) hwm ON hwm.tablespace_name = t.tablespace_name
         ORDER BY t.allocated_mb DESC
     """
