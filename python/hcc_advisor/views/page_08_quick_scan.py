@@ -299,32 +299,47 @@ def _render_schemas_tab(db_id, max_queue, max_dop):
 
 
 def _bulk_submit(candidates, db_id, max_queue, default_dop):
-    """Submit candidates respecting max_queue. Overflow goes to session_state queue."""
-    running_df = TargetQueries.get_running_compression_jobs(db_id)
-    running_count = len(running_df) if not running_df.empty else 0
-    slots = max(0, max_queue - running_count)
+    """Submit candidates with per-database slot limits. Overflow goes to session_state queue."""
+    from collections import defaultdict
+
+    # Group candidates by database_id
+    by_db = defaultdict(list)
+    for item in candidates:
+        did = item.get('database_id', db_id)
+        by_db[did].append(item)
+
+    # Calculate available slots per database
+    db_slots = {}
+    for did in by_db:
+        try:
+            cpu = TargetQueries.get_cpu_count(did)
+            max_q = max(1, cpu // 2)
+            running_df = TargetQueries.get_running_compression_jobs(did)
+            running_count = len(running_df) if not running_df.empty else 0
+            db_slots[did] = max(0, max_q - running_count)
+        except Exception:
+            db_slots[did] = max(0, max_queue)
 
     submitted = 0
     failed = 0
     overflow = []
 
-    for i, item in enumerate(candidates):
-        if i < slots:
-            result = TargetQueries.submit_compression_job(
-                item['database_id'], item['owner'], item['table_name'],
-                item['compression_type'],
-                partition_name=item.get('partition_name'),
-                parallel_degree=item.get('dop', default_dop)
-            )
-            if result.get('success'):
-                submitted += 1
-            else:
-                if 'already has a running job' in result.get('error', ''):
-                    pass  # skip duplicates
-                else:
+    for did, items in by_db.items():
+        for item in items:
+            if db_slots.get(did, 0) > 0:
+                result = TargetQueries.submit_compression_job(
+                    did, item['owner'], item['table_name'],
+                    item['compression_type'],
+                    partition_name=item.get('partition_name'),
+                    parallel_degree=item.get('dop', default_dop)
+                )
+                if result.get('success'):
+                    submitted += 1
+                    db_slots[did] -= 1
+                elif 'already has a running job' not in result.get('error', ''):
                     failed += 1
-        else:
-            overflow.append(item)
+            else:
+                overflow.append(item)
 
     # Store overflow in session_state for Scheduler to drain
     if 'scheduler_pending_queue' not in st.session_state:

@@ -111,7 +111,6 @@ def _do_refresh(db_id):
     """Poll completed jobs and drain pending queue."""
     if db_id:
         TargetQueries.check_completed_jobs(db_id)
-        _drain_pending_queue(db_id)
     else:
         # Cross-database: poll all registered databases
         try:
@@ -127,44 +126,55 @@ def _do_refresh(db_id):
                             pass
         except Exception:
             pass
-        _drain_pending_queue(None)
+    # Drain pending queue (handles per-database grouping internally)
+    _drain_pending_queue(db_id)
 
 
 def _drain_pending_queue(db_id):
-    """Submit pending items from local queue as slots free up."""
+    """Submit pending items grouped by database_id, each with independent slot limits."""
     queue = st.session_state.get('scheduler_pending_queue', [])
     if not queue:
         return
 
-    # Determine max_queue from first item's database
-    first_db = queue[0].get('database_id', db_id)
-    if first_db:
-        cpu = TargetQueries.get_cpu_count(first_db)
-        max_queue = max(1, cpu // 2)
+    # Group pending items by database_id
+    from collections import defaultdict
+    by_db = defaultdict(list)
+    for item in queue:
+        did = item.get('database_id', db_id)
+        if did:
+            by_db[int(did)].append(item)
 
-        running_df = TargetQueries.get_running_compression_jobs(first_db)
-        running_count = len(running_df) if not running_df.empty else 0
-        slots = max_queue - running_count
-    else:
-        return
-
+    # Per-database slot calculation and drain
     submitted = 0
     remaining = []
-    for item in queue:
-        if slots <= 0:
-            remaining.append(item)
-            continue
-        result = TargetQueries.submit_compression_job(
-            item['database_id'], item['owner'], item['table_name'],
-            item['compression_type'],
-            partition_name=item.get('partition_name'),
-            parallel_degree=item.get('dop', 4)
-        )
-        if result.get('success'):
-            submitted += 1
-            slots -= 1
-        elif 'already has a running job' not in result.get('error', ''):
-            remaining.append(item)
+    db_slots = {}
+
+    for did, items in by_db.items():
+        if did not in db_slots:
+            try:
+                cpu = TargetQueries.get_cpu_count(did)
+                max_q = max(1, cpu // 2)
+                running_df = TargetQueries.get_running_compression_jobs(did)
+                running_count = len(running_df) if not running_df.empty else 0
+                db_slots[did] = max(0, max_q - running_count)
+            except Exception:
+                db_slots[did] = 0
+
+        for item in items:
+            if db_slots[did] <= 0:
+                remaining.append(item)
+                continue
+            result = TargetQueries.submit_compression_job(
+                did, item['owner'], item['table_name'],
+                item['compression_type'],
+                partition_name=item.get('partition_name'),
+                parallel_degree=item.get('dop', 4)
+            )
+            if result.get('success'):
+                submitted += 1
+                db_slots[did] -= 1
+            elif 'already has a running job' not in result.get('error', ''):
+                remaining.append(item)
 
     st.session_state.scheduler_pending_queue = remaining
     if submitted > 0:
