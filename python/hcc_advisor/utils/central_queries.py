@@ -76,6 +76,74 @@ class CentralQueries:
         }
 
     @staticmethod
+    @staticmethod
+    def get_scheduler_job_summary(database_id: Optional[int] = None) -> Dict[str, int]:
+        """Get job status counts for the Scheduler monitor."""
+        db_filter = "AND database_id = :database_id" if database_id else ""
+        query = f"""
+            SELECT
+                SUM(CASE WHEN operation_status = 'IN_PROGRESS' THEN 1 ELSE 0 END) as running,
+                SUM(CASE WHEN operation_status = 'SUCCESS' THEN 1 ELSE 0 END) as succeeded,
+                SUM(CASE WHEN operation_status = 'FAILED' THEN 1 ELSE 0 END) as failed,
+                COUNT(*) as total
+            FROM t_compression_history
+            WHERE start_time > SYSDATE - 1 {db_filter}
+        """
+        params = {'database_id': database_id} if database_id else {}
+        try:
+            df = CentralConnector.execute_query(query, params if params else None)
+            if not df.empty:
+                row = df.iloc[0]
+                return {
+                    'running': int(row.get('RUNNING') or 0),
+                    'succeeded': int(row.get('SUCCEEDED') or 0),
+                    'failed': int(row.get('FAILED') or 0),
+                    'total': int(row.get('TOTAL') or 0),
+                }
+        except Exception as e:
+            log_error(e, "get_scheduler_job_summary")
+        return {'running': 0, 'succeeded': 0, 'failed': 0, 'total': 0}
+
+    @staticmethod
+    def get_scheduler_job_details(database_id: Optional[int] = None) -> pd.DataFrame:
+        """Get detailed job list for Scheduler monitor."""
+        db_filter = "AND h.database_id = :database_id" if database_id else ""
+        db_col = "" if database_id else "d.display_name as database_name,"
+        db_join = "" if database_id else \
+            "LEFT JOIN t_target_databases d ON d.database_id = h.database_id"
+        query = f"""
+            SELECT
+                {db_col}
+                h.owner, h.object_name as table_name,
+                h.object_type, h.partition_name,
+                h.compression_type_applied as strategy,
+                h.compression_clause as job_name,
+                h.operation_status as status,
+                h.parallel_degree as dop,
+                TO_CHAR(h.start_time, 'YYYY-MM-DD HH24:MI:SS') as started,
+                ROUND((CAST(NVL(h.end_time, SYSTIMESTAMP) AS DATE)
+                     - CAST(h.start_time AS DATE)) * 24 * 60, 1) as duration_min,
+                ROUND(h.original_size_bytes / 1048576, 1) as original_mb,
+                ROUND(h.compressed_size_bytes / 1048576, 1) as compressed_mb,
+                ROUND((h.original_size_bytes - NVL(h.compressed_size_bytes, h.original_size_bytes))
+                      / 1048576, 1) as saved_mb,
+                h.error_message
+            FROM t_compression_history h
+            {db_join}
+            WHERE h.start_time > SYSDATE - 1 {db_filter}
+            ORDER BY
+                CASE h.operation_status
+                    WHEN 'IN_PROGRESS' THEN 1 WHEN 'FAILED' THEN 2
+                    WHEN 'SUCCESS' THEN 3 ELSE 4 END,
+                h.start_time DESC
+        """
+        params = {'database_id': database_id} if database_id else {}
+        try:
+            return CentralConnector.execute_query(query, params if params else None)
+        except Exception as e:
+            log_error(e, "get_scheduler_job_details")
+            return pd.DataFrame()
+
     def get_compression_progress(database_id: Optional[int] = None) -> Dict[str, Any]:
         """Get compressed/pending/skipped breakdown for the dashboard."""
         db_filter = "AND a.database_id = :database_id" if database_id else ""

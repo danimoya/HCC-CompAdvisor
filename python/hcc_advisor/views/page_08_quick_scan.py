@@ -107,8 +107,8 @@ def show_quick_scan_page():
             st.info("No running compression jobs.")
             return
 
-    # Split into tabs by object_type
-    tab1, tab2, tab3 = st.tabs(["Tables", "Partitions", "Subpartitions"])
+    # Split into tabs by object_type + Schemas bulk tab
+    tab1, tab2, tab3, tab4 = st.tabs(["Tables", "Partitions", "Subpartitions", "Schemas"])
 
     with tab1:
         _render_scan_tab(df[df['object_type'] == 'TABLE'], 'TABLE', db_id, max_queue, max_dop, running_set)
@@ -116,6 +116,8 @@ def show_quick_scan_page():
         _render_scan_tab(df[df['object_type'] == 'PARTITION'], 'PARTITION', db_id, max_queue, max_dop, running_set)
     with tab3:
         _render_scan_tab(df[df['object_type'] == 'SUBPARTITION'], 'SUBPARTITION', db_id, max_queue, max_dop, running_set)
+    with tab4:
+        _render_schemas_tab(db_id, max_queue, max_dop)
 
 
 def _render_scan_tab(df, obj_type, db_id, max_queue, max_dop, running_set):
@@ -227,6 +229,109 @@ def _render_scan_tab(df, obj_type, db_id, max_queue, max_dop, running_set):
                 if submitted > 0:
                     st.success(f"{submitted} job(s) submitted to DBMS_SCHEDULER")
                     st.rerun()
+
+
+def _render_schemas_tab(db_id, max_queue, max_dop):
+    """Render the Schemas tab for bulk schema-level compression submission."""
+    st.subheader("Bulk Schema Compression")
+    st.markdown("Select one or more schemas to queue ALL pending compression candidates at once.")
+
+    schemas = TargetQueries.get_available_schemas(db_id)
+    if not schemas:
+        st.info("No schemas found. Run a scan first.")
+        return
+
+    selected_schemas = st.multiselect(
+        "Select Schemas", schemas, key="qs_bulk_schemas"
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        bulk_dop = st.slider("DOP for all jobs", 1, max_dop, min(4, max_dop), key="qs_bulk_dop")
+
+    if not selected_schemas:
+        st.caption("Select one or more schemas above.")
+        return
+
+    # Count pending candidates across selected schemas
+    all_candidates = []
+    for s in selected_schemas:
+        recs = CentralQueries.get_recommendations(
+            schema=s, database_id=db_id, show_executed=False,
+            min_savings_pct=0, limit=5000
+        )
+        if not recs.empty:
+            recs.columns = [c.lower() for c in recs.columns]
+            for _, r in recs.iterrows():
+                pn = r.get('partition_name')
+                all_candidates.append({
+                    'database_id': db_id,
+                    'owner': r['table_owner'],
+                    'table_name': r['table_name'],
+                    'compression_type': r['recommended_strategy'],
+                    'partition_name': pn if pd.notna(pn) else None,
+                    'dop': bulk_dop,
+                })
+
+    st.info(f"**{len(all_candidates)}** pending candidates across **{len(selected_schemas)}** schema(s)")
+
+    if len(all_candidates) == 0:
+        st.caption("No pending candidates. All objects may already be compressed.")
+        return
+
+    col1, col2 = st.columns(2)
+    with col1:
+        confirm = st.checkbox("Confirm Bulk Submission", key="qs_bulk_confirm")
+    with col2:
+        if st.button(f"Submit All {len(all_candidates)} Candidates",
+                     disabled=not confirm, type="primary",
+                     key="qs_bulk_submit", use_container_width=True):
+            result = _bulk_submit(all_candidates, db_id, max_queue, bulk_dop)
+            st.success(
+                f"Submitted: {result['submitted']}, "
+                f"Queued for later: {result['queued']}, "
+                f"Failed: {result['failed']}"
+            )
+            if result['queued'] > 0:
+                st.info("Queued items will be submitted automatically by the Scheduler page.")
+            st.session_state.selected_page = "Scheduler"
+            st.rerun()
+
+
+def _bulk_submit(candidates, db_id, max_queue, default_dop):
+    """Submit candidates respecting max_queue. Overflow goes to session_state queue."""
+    running_df = TargetQueries.get_running_compression_jobs(db_id)
+    running_count = len(running_df) if not running_df.empty else 0
+    slots = max(0, max_queue - running_count)
+
+    submitted = 0
+    failed = 0
+    overflow = []
+
+    for i, item in enumerate(candidates):
+        if i < slots:
+            result = TargetQueries.submit_compression_job(
+                item['database_id'], item['owner'], item['table_name'],
+                item['compression_type'],
+                partition_name=item.get('partition_name'),
+                parallel_degree=item.get('dop', default_dop)
+            )
+            if result.get('success'):
+                submitted += 1
+            else:
+                if 'already has a running job' in result.get('error', ''):
+                    pass  # skip duplicates
+                else:
+                    failed += 1
+        else:
+            overflow.append(item)
+
+    # Store overflow in session_state for Scheduler to drain
+    if 'scheduler_pending_queue' not in st.session_state:
+        st.session_state.scheduler_pending_queue = []
+    st.session_state.scheduler_pending_queue.extend(overflow)
+
+    return {'submitted': submitted, 'queued': len(overflow), 'failed': failed}
 
 
 if __name__ == "__main__":

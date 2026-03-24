@@ -221,11 +221,11 @@ def main():
         page_mapping = {
             "Overview": 0, "Quick Action": 1, "Run Analysis": 2, "View Recommendations": 3,
             "Compress Tables": 4, "Tablespaces": 5, "Index Manager": 6,
-            "Execution History": 7, "Session Browser": 8,
-            "Compression Rules": 9, "DB Connections": 10, "Admin": 11,
+            "Execution History": 7, "Session Browser": 8, "Scheduler": 9,
+            "Compression Rules": 10, "DB Connections": 11, "Admin": 12,
             # Legacy mappings
             "Dashboard": 0, "Analysis": 2, "Recommendations": 3,
-            "Execution": 4, "History": 7, "Sessions": 8, "Strategies": 9, "Connections": 10
+            "Execution": 4, "History": 7, "Sessions": 8, "Strategies": 10, "Connections": 11
         }
         default_page_index = page_mapping.get(st.session_state.selected_page, 0)
         st.session_state.selected_page = None  # Clear after use
@@ -247,13 +247,14 @@ def main():
                 "Index Manager",
                 "Execution History",
                 "Session Browser",
+                "Scheduler",
                 "Compression Rules",
                 "DB Connections",
                 "Admin"
             ],
             icons=[
                 "house-door-fill",        # Overview
-                "lightning-charge-fill",  # Quick Scan
+                "lightning-charge-fill",  # Quick Action
                 "bar-chart-line-fill",    # Run Analysis
                 "stars",                  # View Recommendations
                 "box-arrow-in-down",      # Compress Tables
@@ -261,6 +262,7 @@ def main():
                 "list-check",             # Index Manager
                 "journal-text",           # Execution History
                 "binoculars-fill",        # Session Browser
+                "calendar-check",         # Scheduler
                 "gear-fill",              # Compression Rules
                 "plug-fill",              # DB Connections
                 "wrench-adjustable"       # Admin
@@ -358,6 +360,9 @@ def main():
     elif selected == "Session Browser":
         from hcc_advisor.views.page_07_sessions import show_sessions_page
         show_sessions_page()
+    elif selected == "Scheduler":
+        from hcc_advisor.views.page_12_scheduler import show_scheduler_page
+        show_scheduler_page()
     elif selected == "Compression Rules":
         from hcc_advisor.views.page_05_strategies import show_strategies_page
         show_strategies_page()
