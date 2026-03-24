@@ -244,7 +244,7 @@ def show_history_page():
         'strategy': 'Strategy',
         'status': 'Status',
         'savings_pct': 'Savings %',
-        'dry_run': 'Dry Run',
+        'error_message': 'Error',
         'executed_at': 'Executed At'
     }
 
@@ -268,9 +268,54 @@ def show_history_page():
         hide_index=True
     )
 
+    # Failed job details from target scheduler
+    failed_rows = df[df['status'] == 'FAILED'] if 'status' in df.columns else pd.DataFrame()
+    if not failed_rows.empty:
+        st.markdown("---")
+        st.subheader("Failed Job Details")
+
+        db_id = st.session_state.get('active_database_id')
+        if db_id:
+            # Show error messages from central history
+            for _, row in failed_rows.iterrows():
+                err = row.get('error_message', '')
+                tbl = row.get('table_name', '?')
+                owner = row.get('table_owner', '?')
+                if err and str(err) not in ('None', 'nan', ''):
+                    st.error(f"**{owner}.{tbl}**: {err}")
+                else:
+                    st.warning(f"**{owner}.{tbl}**: No error message in central history")
+
+            # Also try to fetch from target dba_scheduler_job_run_details
+            with st.expander("Target Scheduler Job Failures (HCC_% / IDXR_%)"):
+                from hcc_advisor.utils.target_connector import TargetConnector
+                try:
+                    job_df = TargetConnector.execute_query(db_id, """
+                        SELECT job_name, status,
+                               TO_CHAR(actual_start_date, 'YYYY-MM-DD HH24:MI:SS') as started,
+                               TO_CHAR(run_duration) as duration,
+                               error# as error_code,
+                               SUBSTR(additional_info, 1, 2000) as error_detail
+                        FROM dba_scheduler_job_run_details
+                        WHERE (job_name LIKE 'HCC_%' OR job_name LIKE 'IDXR_%')
+                          AND status = 'FAILED'
+                          AND actual_start_date > SYSDATE - 7
+                        ORDER BY actual_start_date DESC
+                        FETCH FIRST 20 ROWS ONLY
+                    """)
+                    if not job_df.empty:
+                        job_df.columns = [c.lower() for c in job_df.columns]
+                        for _, j in job_df.iterrows():
+                            st.error(f"**{j['job_name']}** ({j.get('started', '')}): "
+                                     f"Error #{j.get('error_code', '')}\n\n{j.get('error_detail', '')}")
+                    else:
+                        st.caption("No failed scheduler jobs in the last 7 days on target.")
+                except Exception as e:
+                    st.caption(f"Could not query target scheduler: {e}")
+
     # Export options
     st.markdown("---")
-    st.subheader("📥 Export History")
+    st.subheader("Export History")
 
     col1, col2 = st.columns(2)
 

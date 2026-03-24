@@ -26,20 +26,37 @@ def show_indexes_page():
     cpu_count = TargetQueries.get_cpu_count(db_id)
     max_dop = max(1, cpu_count // 2)
 
-    col1, col2, col3 = st.columns([2, 1, 1])
+    col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
     with col1:
         schemas = TargetQueries.get_available_schemas(db_id)
         schema = st.selectbox("Schema", ["All Schemas"] + schemas, key="idx_schema")
     with col2:
         show_valid = st.checkbox("Show valid indexes too", key="idx_show_valid")
     with col3:
+        show_rebuilding = st.checkbox("Rebuilding only", key="idx_show_rebuilding")
+    with col4:
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("Refresh", key="idx_refresh", use_container_width=True):
-            # Check completed rebuild jobs
             _check_rebuild_jobs(db_id)
+            st.session_state.pop('idx_submitted', None)
             st.rerun()
 
     schema_param = None if schema == "All Schemas" else schema
+
+    # Get running IDXR_% jobs to mark rebuilding indexes
+    rebuilding_set = set()
+    running_jobs = _get_running_rebuild_jobs(db_id)
+    if not running_jobs.empty:
+        for _, rj in running_jobs.iterrows():
+            # Extract index name from job_name: IDXR_<index_name>_<timestamp>
+            jname = str(rj.get('job_name', ''))
+            if jname.startswith('IDXR_'):
+                parts = jname[5:].rsplit('_', 1)
+                if parts:
+                    rebuilding_set.add(parts[0])
+    # Also check session_state for just-submitted jobs
+    for idx_key in st.session_state.get('idx_submitted', []):
+        rebuilding_set.add(idx_key)
 
     with st.spinner("Querying indexes on target..."):
         df = _get_indexes(db_id, schema_param, include_valid=show_valid)
@@ -50,6 +67,18 @@ def show_indexes_page():
         else:
             st.success("No unusable or invalid indexes found.")
         return
+
+    # Add rebuild_status column
+    df['rebuild_status'] = df['index_name'].apply(
+        lambda n: 'Rebuilding' if n in rebuilding_set else ''
+    )
+
+    # Filter to rebuilding only
+    if show_rebuilding:
+        df = df[df['rebuild_status'] == 'Rebuilding']
+        if df.empty:
+            st.info("No indexes currently rebuilding.")
+            return
 
     # Summary
     total = len(df)
@@ -97,6 +126,7 @@ def show_indexes_page():
         'table_name': st.column_config.TextColumn("Table"),
         'index_type': st.column_config.TextColumn("Type"),
         'status': st.column_config.TextColumn("Status"),
+        'rebuild_status': st.column_config.TextColumn("Rebuild"),
         'size_mb': st.column_config.NumberColumn("Size (MB)", format="%.1f"),
         'partitioned': st.column_config.TextColumn("Partitioned"),
         'dop': st.column_config.NumberColumn("DOP", min_value=1, max_value=max_dop, step=1,
@@ -107,7 +137,7 @@ def show_indexes_page():
         show_df, column_config=col_config, use_container_width=True,
         hide_index=True,
         disabled=['index_owner', 'index_name', 'table_owner', 'table_name',
-                  'index_type', 'status', 'size_mb', 'partitioned'],
+                  'index_type', 'status', 'rebuild_status', 'size_mb', 'partitioned'],
         key=f"idx_editor_{page}",
         height=min(35 * len(show_df) + 50, 800)
     )
@@ -133,7 +163,11 @@ def show_indexes_page():
                     result = _submit_rebuild_job(db_id, idx_owner, idx_name, row_dop)
                     if result.get('success'):
                         submitted += 1
-                        st.toast(f"Submitted: {idx_owner}.{idx_name}")
+                        # Track in session_state for immediate UI feedback
+                        if 'idx_submitted' not in st.session_state:
+                            st.session_state['idx_submitted'] = []
+                        st.session_state['idx_submitted'].append(idx_name)
+                        st.toast(f"Submitted: {idx_owner}.{idx_name} -> {result.get('job_name')}")
                     else:
                         st.error(f"Failed {idx_owner}.{idx_name}: {result.get('error')}")
 
@@ -141,12 +175,15 @@ def show_indexes_page():
                     st.success(f"{submitted} rebuild job(s) submitted to DBMS_SCHEDULER")
                     st.rerun()
 
-    # Running rebuild jobs
+    # Running rebuild jobs — always visible
     st.markdown("---")
-    with st.expander("Running Rebuild Jobs", expanded=False):
-        running = _get_running_rebuild_jobs(db_id)
-        if not running.empty:
-            st.dataframe(running, use_container_width=True, hide_index=True)
+    st.subheader("Rebuild Jobs")
+    if not running_jobs.empty:
+        st.dataframe(running_jobs, use_container_width=True, hide_index=True)
+    else:
+        submitted_list = st.session_state.get('idx_submitted', [])
+        if submitted_list:
+            st.info(f"Recently submitted: {', '.join(submitted_list)} — click Refresh to check status")
         else:
             st.caption("No rebuild jobs currently running.")
 
