@@ -219,7 +219,7 @@ def main():
     default_page_index = 0
     if 'selected_page' in st.session_state and st.session_state.selected_page:
         page_mapping = {
-            "Overview": 0, "Quick Scan": 1, "Run Analysis": 2, "View Recommendations": 3,
+            "Overview": 0, "Quick Action": 1, "Run Analysis": 2, "View Recommendations": 3,
             "Compress Tables": 4, "Tablespaces": 5, "Index Manager": 6,
             "Execution History": 7, "Session Browser": 8,
             "Compression Rules": 9, "DB Connections": 10, "Admin": 11,
@@ -239,7 +239,7 @@ def main():
             menu_title=None,  # No title for cleaner look
             options=[
                 "Overview",
-                "Quick Scan",
+                "Quick Action",
                 "Run Analysis",
                 "View Recommendations",
                 "Compress Tables",
@@ -334,7 +334,7 @@ def main():
     # Route to selected page
     if selected == "Overview":
         show_dashboard()
-    elif selected == "Quick Scan":
+    elif selected == "Quick Action":
         from hcc_advisor.views.page_08_quick_scan import show_quick_scan_page
         show_quick_scan_page()
     elif selected == "Run Analysis":

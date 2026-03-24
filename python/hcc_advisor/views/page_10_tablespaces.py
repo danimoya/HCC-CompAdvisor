@@ -228,60 +228,72 @@ def _get_datafile_details(db_id: int) -> pd.DataFrame:
 
 
 def _shrink_tablespace(db_id: int, tablespace_name: str) -> dict:
-    """Shrink all datafiles in a tablespace using ALTER TABLESPACE SHRINK SPACE.
-    Falls back to per-datafile ALTER DATABASE DATAFILE SHRINK for older Oracle versions."""
+    """Shrink datafiles in a permanent tablespace by resizing each file
+    down to its high-water mark + a small buffer.
 
-    # Get size before shrink
-    before_df = TargetConnector.execute_query(db_id,
-        "SELECT SUM(bytes)/1048576 as total_mb FROM dba_data_files WHERE tablespace_name = :ts",
-        {'ts': tablespace_name})
-    before_mb = float(before_df.iloc[0]['TOTAL_MB']) if not before_df.empty else 0
+    For permanent tablespaces ALTER TABLESPACE SHRINK SPACE is not supported
+    (ORA-12916). The correct approach is per-datafile ALTER DATABASE DATAFILE RESIZE.
+    """
 
+    # Get datafiles with their HWM
+    query = """
+        SELECT f.file_id, f.file_name,
+               f.bytes as current_bytes,
+               NVL(hwm.hwm_bytes, 0) as hwm_bytes
+        FROM dba_data_files f
+        LEFT JOIN (
+            SELECT e.file_id,
+                   (MAX(e.block_id + e.blocks)) * ts.block_size as hwm_bytes
+            FROM dba_extents e
+            JOIN dba_tablespaces ts ON ts.tablespace_name = e.tablespace_name
+            WHERE e.tablespace_name = :ts
+            GROUP BY e.file_id, ts.block_size
+        ) hwm ON hwm.file_id = f.file_id
+        WHERE f.tablespace_name = :ts
+    """
     try:
-        # Try ALTER TABLESPACE SHRINK SPACE (Oracle 21c+, simplest)
-        ok = TargetConnector.execute_plsql(
-            db_id,
-            f"BEGIN EXECUTE IMMEDIATE 'ALTER TABLESPACE {tablespace_name} SHRINK SPACE'; END;"
-        )
-        if ok:
-            after_df = TargetConnector.execute_query(db_id,
-                "SELECT SUM(bytes)/1048576 as total_mb FROM dba_data_files WHERE tablespace_name = :ts",
-                {'ts': tablespace_name})
-            after_mb = float(after_df.iloc[0]['TOTAL_MB']) if not after_df.empty else before_mb
-            saved = before_mb - after_mb
-            return {'success': True, 'message': f'Tablespace shrunk, {saved:.0f} MB reclaimed'}
-    except Exception:
-        pass
-
-    # Fallback: per-datafile ALTER DATABASE DATAFILE ... SHRINK (Oracle 12c+)
-    try:
-        files_df = TargetConnector.execute_query(db_id,
-            "SELECT file_name FROM dba_data_files WHERE tablespace_name = :ts",
-            {'ts': tablespace_name})
-        if files_df.empty:
-            return {'success': False, 'error': 'No datafiles found'}
-
-        shrunk = 0
-        for _, row in files_df.iterrows():
-            fname = row['FILE_NAME']
-            try:
-                TargetConnector.execute_plsql(
-                    db_id,
-                    f"BEGIN EXECUTE IMMEDIATE 'ALTER DATABASE DATAFILE ''{fname}'' SHRINK'; END;"
-                )
-                shrunk += 1
-            except Exception:
-                pass  # Some files may not be shrinkable
-
-        after_df = TargetConnector.execute_query(db_id,
-            "SELECT SUM(bytes)/1048576 as total_mb FROM dba_data_files WHERE tablespace_name = :ts",
-            {'ts': tablespace_name})
-        after_mb = float(after_df.iloc[0]['TOTAL_MB']) if not after_df.empty else before_mb
-        saved = before_mb - after_mb
-
-        if shrunk > 0:
-            return {'success': True, 'message': f'{shrunk} file(s) shrunk, {saved:.0f} MB reclaimed'}
-        return {'success': True, 'message': 'No files could be shrunk'}
-
+        df = TargetConnector.execute_query(db_id, query, {'ts': tablespace_name})
     except Exception as e:
-        return {'success': False, 'error': str(e)}
+        return {'success': False, 'error': f'Failed to query datafiles: {e}'}
+
+    if df.empty:
+        return {'success': False, 'error': 'No datafiles found'}
+
+    shrunk = 0
+    total_saved = 0
+    errors = []
+
+    for _, row in df.iterrows():
+        current = int(row['CURRENT_BYTES'])
+        hwm = int(row['HWM_BYTES'])
+        # Target = HWM + 10MB buffer, rounded up to next MB
+        target = hwm + 10 * 1048576
+        if target >= current - 1048576:
+            continue  # Not enough to reclaim
+
+        file_name = row['FILE_NAME']
+        target_mb = (target // 1048576) + 1
+
+        try:
+            TargetConnector.execute_plsql(
+                db_id,
+                f"BEGIN EXECUTE IMMEDIATE q'[ALTER DATABASE DATAFILE ''{file_name}'' RESIZE {target_mb}M]'; END;"
+            )
+            saved = (current - target_mb * 1048576) // 1048576
+            total_saved += max(saved, 0)
+            shrunk += 1
+        except Exception as e:
+            err_str = str(e)
+            if 'ORA-03297' in err_str:
+                errors.append(f'{file_name}: cannot resize below HWM')
+            else:
+                errors.append(f'{file_name}: {err_str[:100]}')
+
+    if shrunk > 0:
+        msg = f'{shrunk} file(s) resized, ~{total_saved} MB reclaimed'
+        if errors:
+            msg += f' ({len(errors)} file(s) skipped)'
+        return {'success': True, 'message': msg}
+    elif errors:
+        return {'success': False, 'error': '; '.join(errors[:3])}
+    return {'success': True, 'message': 'No files needed resizing'}

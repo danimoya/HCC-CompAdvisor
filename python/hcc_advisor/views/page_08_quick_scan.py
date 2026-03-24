@@ -1,5 +1,5 @@
 """
-Quick Scan Page - HCC Compression Advisor
+Quick Action Page - HCC Compression Advisor
 Lightweight hotness-based analysis with DBMS_SCHEDULER job queue
 """
 
@@ -14,7 +14,7 @@ DOP_OPTIONS = list(range(1, 65))  # will be capped at runtime by CPU_COUNT/2
 
 
 def show_quick_scan_page():
-    st.title("Quick Scan")
+    st.title("Quick Action")
     st.markdown("Fast hotness-based analysis and DBMS_SCHEDULER compression jobs")
     st.markdown("---")
 
