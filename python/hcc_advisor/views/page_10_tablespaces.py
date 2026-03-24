@@ -233,12 +233,15 @@ def _shrink_tablespace(db_id: int, tablespace_name: str) -> dict:
         # Get datafiles with their shrink targets
         query = """
             SELECT f.file_id, f.file_name, f.bytes as current_bytes,
-                   NVL((SELECT MAX(e.block_id + e.blocks) * ts.block_size
-                        FROM dba_extents e, dba_tablespaces ts
-                        WHERE e.file_id = f.file_id
-                          AND e.tablespace_name = f.tablespace_name
-                          AND ts.tablespace_name = f.tablespace_name), 1048576) as hwm_bytes
+                   NVL(hwm.hwm_bytes, 1048576) as hwm_bytes
             FROM dba_data_files f
+            LEFT JOIN (
+                SELECT e.file_id, (MAX(e.block_id + e.blocks)) * ts.block_size as hwm_bytes
+                FROM dba_extents e
+                JOIN dba_tablespaces ts ON ts.tablespace_name = e.tablespace_name
+                WHERE e.tablespace_name = :ts
+                GROUP BY e.file_id, ts.block_size
+            ) hwm ON hwm.file_id = f.file_id
             WHERE f.tablespace_name = :ts
         """
         df = TargetConnector.execute_query(db_id, query, {'ts': tablespace_name})
