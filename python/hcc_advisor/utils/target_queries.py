@@ -247,6 +247,74 @@ class TargetQueries:
 
                                 for part_info in partitions:
                                     part_name = part_info['partition_name']
+                                    is_composite = part_info.get('composite') == 'YES'
+
+                                    # Composite partitions cannot be MOVE'd (ORA-14257)
+                                    # Only their subpartitions can — skip the partition-level result
+                                    if is_composite:
+                                        try:
+                                            subparts = TargetQueries._discover_subpartitions(
+                                                database_id, tbl_owner, tbl_name, part_name)
+                                            for subpart_info in subparts:
+                                                sub_name = subpart_info['subpartition_name']
+                                                try:
+                                                    sub_recommended = TargetQueries._determine_target_compression(
+                                                        strategy_rules, 'TABLE', 0, table_stats, platform_type)
+                                                    sub_ratios = {k: None for k in ('basic', 'oltp', 'query_low', 'query_high', 'archive_low', 'archive_high')}
+                                                    sub_rec_ratio = 1.0
+                                                    if sub_recommended != 'NONE':
+                                                        sub_rec_ratio = TargetQueries._get_single_compression_ratio(
+                                                            database_id, tbl_owner, tbl_name, sub_recommended,
+                                                            partition_name=sub_name)
+                                                        sk = TargetQueries._COMP_TYPE_RATIO_KEY.get(sub_recommended)
+                                                        if sk:
+                                                            sub_ratios[sk] = sub_rec_ratio
+                                                        if sub_rec_ratio <= 1:
+                                                            sub_recommended = 'NONE'
+                                                    sub_size_mb = subpart_info.get('size_mb', 0)
+                                                    sub_rec_size = round(sub_size_mb / sub_rec_ratio, 2) if sub_rec_ratio > 0 else sub_size_mb
+                                                    sub_savings_mb = sub_size_mb - sub_rec_size
+                                                    sub_savings_pct = round((sub_savings_mb / sub_size_mb) * 100, 2) if sub_size_mb > 0 else 0
+                                                    sub_current_comp = subpart_info.get('compress_for') or subpart_info.get('compression', 'NONE')
+                                                    if sub_current_comp in ('DISABLED', None, ''):
+                                                        sub_current_comp = 'NONE'
+                                                    results.append({
+                                                        'OWNER': tbl_owner, 'OBJECT_NAME': tbl_name,
+                                                        'OBJECT_TYPE': 'SUBPARTITION',
+                                                        'PARTITION_NAME': part_name, 'SUBPARTITION_NAME': sub_name,
+                                                        'ORIGINAL_SIZE_BYTES': subpart_info.get('size_bytes', 0),
+                                                        'SIZE_BYTES': subpart_info.get('size_bytes', 0),
+                                                        'ROW_COUNT': subpart_info.get('num_rows'),
+                                                        'BLOCK_COUNT': subpart_info.get('blocks'),
+                                                        'AVG_ROW_LENGTH': None,
+                                                        'BASIC_RATIO': sub_ratios.get('basic'),
+                                                        'OLTP_RATIO': sub_ratios.get('oltp'),
+                                                        'ADV_LOW_RATIO': sub_ratios.get('query_low'),
+                                                        'ADV_HIGH_RATIO': sub_ratios.get('query_high'),
+                                                        'BLKCNT_UNCMP_BASIC': None, 'BLKCNT_CMP_BASIC': None,
+                                                        'BLKCNT_UNCMP_OLTP': None, 'BLKCNT_CMP_OLTP': None,
+                                                        'BLKCNT_UNCMP_ADV_LOW': None, 'BLKCNT_CMP_ADV_LOW': None,
+                                                        'BLKCNT_UNCMP_ADV_HIGH': None, 'BLKCNT_CMP_ADV_HIGH': None,
+                                                        'INSERT_COUNT': 0, 'UPDATE_COUNT': 0, 'DELETE_COUNT': 0,
+                                                        'LOGICAL_READS': None, 'PHYSICAL_READS': None,
+                                                        'ACCESS_FREQUENCY': None, 'LAST_ACCESS_DATE': None,
+                                                        'HOTNESS_SCORE': 0, 'READ_RATIO': None, 'WRITE_RATIO': None,
+                                                        'DML_24H_RATE': None, 'LAST_ANALYZED': None, 'DATA_AGE_DAYS': None,
+                                                        'CURRENT_COMPRESSION': sub_current_comp,
+                                                        'ADVISABLE_COMPRESSION': sub_recommended,
+                                                        'RECOMMENDATION_REASON': f'Subpartition of composite {part_name}',
+                                                        'CONFIDENCE_SCORE': None,
+                                                        'PROJECTED_SAVINGS_BYTES': int(sub_savings_mb * 1048576),
+                                                        'PROJECTED_SAVINGS_PCT': sub_savings_pct,
+                                                        'ANALYSIS_DURATION_SEC': None, 'SAMPLE_SIZE_ROWS': None,
+                                                    })
+                                                    objects_analyzed += 1
+                                                except Exception:
+                                                    objects_failed += 1
+                                        except Exception:
+                                            pass
+                                        continue  # Skip to next partition
+
                                     try:
                                         part_dml_info = part_dml.get(part_name, {})
                                         part_hotness = part_dml_info.get('hotness_score', 0)
@@ -318,81 +386,6 @@ class TargetQueries:
                                         results.append(part_result)
                                         tables_analyzed += 1
                                         log_debug(f"Analyzed partition {tbl_owner}.{tbl_name}.{part_name}: rec={part_recommended}")
-
-                                        # Subpartition analysis for composite partitions
-                                        if part_info.get('composite') == 'YES':
-                                            subparts = TargetQueries._discover_subpartitions(
-                                                database_id, tbl_owner, tbl_name, part_name
-                                            )
-                                            for subpart_info in subparts:
-                                                sub_name = subpart_info['subpartition_name']
-                                                try:
-                                                    sub_recommended = TargetQueries._determine_target_compression(
-                                                        strategy_rules, 'TABLE', 0, table_stats, platform_type
-                                                    )
-                                                    sub_ratios = {k: None for k in ('basic', 'oltp', 'query_low', 'query_high', 'archive_low', 'archive_high')}
-                                                    sub_rec_ratio = 1.0
-                                                    if sub_recommended != 'NONE':
-                                                        sub_rec_ratio = TargetQueries._get_single_compression_ratio(
-                                                            database_id, tbl_owner, tbl_name, sub_recommended,
-                                                            partition_name=sub_name
-                                                        )
-                                                        sk = TargetQueries._COMP_TYPE_RATIO_KEY.get(sub_recommended)
-                                                        if sk:
-                                                            sub_ratios[sk] = sub_rec_ratio
-                                                        if sub_rec_ratio <= 1:
-                                                            sub_recommended = 'NONE'
-
-                                                    sub_size_mb = subpart_info.get('size_mb', 0)
-                                                    sub_rec_size = round(sub_size_mb / sub_rec_ratio, 2) if sub_rec_ratio > 0 else sub_size_mb
-                                                    sub_savings_mb = sub_size_mb - sub_rec_size
-                                                    sub_savings_pct = round((sub_savings_mb / sub_size_mb) * 100, 2) if sub_size_mb > 0 else 0
-                                                    sub_current_comp = subpart_info.get('compress_for') or subpart_info.get('compression', 'NONE')
-                                                    if sub_current_comp in ('DISABLED', None, ''):
-                                                        sub_current_comp = 'NONE'
-
-                                                    sub_result = {
-                                                        'OWNER': tbl_owner,
-                                                        'OBJECT_NAME': tbl_name,
-                                                        'OBJECT_TYPE': 'SUBPARTITION',
-                                                        'PARTITION_NAME': part_name,
-                                                        'SUBPARTITION_NAME': sub_name,
-                                                        'ORIGINAL_SIZE_BYTES': subpart_info.get('size_bytes', 0),
-                                                        'SIZE_BYTES': subpart_info.get('size_bytes', 0),
-                                                        'ROW_COUNT': subpart_info.get('num_rows'),
-                                                        'BLOCK_COUNT': subpart_info.get('blocks'),
-                                                        'AVG_ROW_LENGTH': None,
-                                                        'BASIC_RATIO': sub_ratios.get('basic'),
-                                                        'OLTP_RATIO': sub_ratios.get('oltp'),
-                                                        'ADV_LOW_RATIO': sub_ratios.get('query_low'),
-                                                        'ADV_HIGH_RATIO': sub_ratios.get('query_high'),
-                                                        'BLKCNT_UNCMP_BASIC': None, 'BLKCNT_CMP_BASIC': None,
-                                                        'BLKCNT_UNCMP_OLTP': None, 'BLKCNT_CMP_OLTP': None,
-                                                        'BLKCNT_UNCMP_ADV_LOW': None, 'BLKCNT_CMP_ADV_LOW': None,
-                                                        'BLKCNT_UNCMP_ADV_HIGH': None, 'BLKCNT_CMP_ADV_HIGH': None,
-                                                        'INSERT_COUNT': 0, 'UPDATE_COUNT': 0, 'DELETE_COUNT': 0,
-                                                        'LOGICAL_READS': None, 'PHYSICAL_READS': None,
-                                                        'ACCESS_FREQUENCY': None, 'LAST_ACCESS_DATE': None,
-                                                        'HOTNESS_SCORE': 0,
-                                                        'READ_RATIO': None, 'WRITE_RATIO': None,
-                                                        'DML_24H_RATE': None,
-                                                        'LAST_ANALYZED': None, 'DATA_AGE_DAYS': None,
-                                                        'CURRENT_COMPRESSION': sub_current_comp,
-                                                        'ADVISABLE_COMPRESSION': sub_recommended,
-                                                        'RECOMMENDATION_REASON': TargetQueries._generate_rationale(
-                                                            sub_size_mb, 0, sub_ratios, sub_recommended
-                                                        ),
-                                                        'CONFIDENCE_SCORE': None,
-                                                        'PROJECTED_SAVINGS_BYTES': int(sub_savings_mb * 1024 * 1024),
-                                                        'PROJECTED_SAVINGS_PCT': sub_savings_pct,
-                                                        'ANALYSIS_DURATION_SEC': None,
-                                                        'SAMPLE_SIZE_ROWS': None,
-                                                    }
-                                                    results.append(sub_result)
-                                                    tables_analyzed += 1
-                                                except Exception as sub_e:
-                                                    tables_failed += 1
-                                                    log_warning(f"Failed to analyze subpartition {tbl_owner}.{tbl_name}.{part_name}.{sub_name}: {sub_e}")
 
                                     except Exception as part_e:
                                         tables_failed += 1
@@ -2524,36 +2517,11 @@ ONLINE PARALLEL {parallel_degree};"""
                 parts = TargetQueries._discover_partitions(database_id, tbl_owner, tbl_name)
                 part_dml = TargetQueries._get_batch_partition_dml_stats(database_id, tbl_owner, tbl_name)
                 for p in parts:
-                    ph = part_dml.get(p['partition_name'], {}).get('hotness_score', 0)
-                    pa = TargetQueries._determine_target_compression(
-                        strategy_rules, 'TABLE', ph, ts, platform_type)
-                    pc = p.get('compress_for') or p.get('compression', 'NONE')
-                    if pc in ('DISABLED', None, ''):
-                        pc = 'NONE'
-                    results.append({
-                        'OWNER': tbl_owner, 'OBJECT_NAME': tbl_name, 'OBJECT_TYPE': 'PARTITION',
-                        'PARTITION_NAME': p['partition_name'], 'SUBPARTITION_NAME': None,
-                        'ORIGINAL_SIZE_BYTES': p.get('size_bytes', 0),
-                        'SIZE_BYTES': p.get('size_bytes', 0), 'ROW_COUNT': p.get('num_rows'),
-                        'BLOCK_COUNT': p.get('blocks'), 'AVG_ROW_LENGTH': None,
-                        'BASIC_RATIO': None, 'OLTP_RATIO': None, 'ADV_LOW_RATIO': None, 'ADV_HIGH_RATIO': None,
-                        'BLKCNT_UNCMP_BASIC': None, 'BLKCNT_CMP_BASIC': None,
-                        'BLKCNT_UNCMP_OLTP': None, 'BLKCNT_CMP_OLTP': None,
-                        'BLKCNT_UNCMP_ADV_LOW': None, 'BLKCNT_CMP_ADV_LOW': None,
-                        'BLKCNT_UNCMP_ADV_HIGH': None, 'BLKCNT_CMP_ADV_HIGH': None,
-                        'INSERT_COUNT': 0, 'UPDATE_COUNT': 0, 'DELETE_COUNT': 0,
-                        'LOGICAL_READS': None, 'PHYSICAL_READS': None,
-                        'ACCESS_FREQUENCY': None, 'LAST_ACCESS_DATE': None,
-                        'HOTNESS_SCORE': ph, 'READ_RATIO': None, 'WRITE_RATIO': None,
-                        'DML_24H_RATE': None, 'LAST_ANALYZED': None, 'DATA_AGE_DAYS': None,
-                        'CURRENT_COMPRESSION': pc, 'ADVISABLE_COMPRESSION': pa,
-                        'RECOMMENDATION_REASON': f'Quick scan partition: hotness={ph:.0f}',
-                        'CONFIDENCE_SCORE': None,
-                        'PROJECTED_SAVINGS_BYTES': 0, 'PROJECTED_SAVINGS_PCT': 0,
-                        'ANALYSIS_DURATION_SEC': None, 'SAMPLE_SIZE_ROWS': None,
-                    })
+                    is_composite = p.get('composite') == 'YES'
 
-                    if p.get('composite') == 'YES':
+                    if is_composite:
+                        # Composite partitions can't be MOVE'd (ORA-14257)
+                        # List only their subpartitions
                         subs = TargetQueries._discover_subpartitions(
                             database_id, tbl_owner, tbl_name, p['partition_name'])
                         for sp in subs:
@@ -2582,11 +2550,42 @@ ONLINE PARALLEL {parallel_degree};"""
                                 'HOTNESS_SCORE': 0, 'READ_RATIO': None, 'WRITE_RATIO': None,
                                 'DML_24H_RATE': None, 'LAST_ANALYZED': None, 'DATA_AGE_DAYS': None,
                                 'CURRENT_COMPRESSION': sc, 'ADVISABLE_COMPRESSION': sa,
-                                'RECOMMENDATION_REASON': 'Quick scan subpartition',
+                                'RECOMMENDATION_REASON': f'Quick scan subpartition of {p["partition_name"]}',
                                 'CONFIDENCE_SCORE': None,
                                 'PROJECTED_SAVINGS_BYTES': 0, 'PROJECTED_SAVINGS_PCT': 0,
                                 'ANALYSIS_DURATION_SEC': None, 'SAMPLE_SIZE_ROWS': None,
                             })
+                        continue  # Skip to next partition
+
+                    # Non-composite partition — can be MOVE'd directly
+                    ph = part_dml.get(p['partition_name'], {}).get('hotness_score', 0)
+                    pa = TargetQueries._determine_target_compression(
+                        strategy_rules, 'TABLE', ph, ts, platform_type)
+                    pc = p.get('compress_for') or p.get('compression', 'NONE')
+                    if pc in ('DISABLED', None, ''):
+                        pc = 'NONE'
+                    results.append({
+                        'OWNER': tbl_owner, 'OBJECT_NAME': tbl_name, 'OBJECT_TYPE': 'PARTITION',
+                        'PARTITION_NAME': p['partition_name'], 'SUBPARTITION_NAME': None,
+                        'ORIGINAL_SIZE_BYTES': p.get('size_bytes', 0),
+                        'SIZE_BYTES': p.get('size_bytes', 0), 'ROW_COUNT': p.get('num_rows'),
+                        'BLOCK_COUNT': p.get('blocks'), 'AVG_ROW_LENGTH': None,
+                        'BASIC_RATIO': None, 'OLTP_RATIO': None, 'ADV_LOW_RATIO': None, 'ADV_HIGH_RATIO': None,
+                        'BLKCNT_UNCMP_BASIC': None, 'BLKCNT_CMP_BASIC': None,
+                        'BLKCNT_UNCMP_OLTP': None, 'BLKCNT_CMP_OLTP': None,
+                        'BLKCNT_UNCMP_ADV_LOW': None, 'BLKCNT_CMP_ADV_LOW': None,
+                        'BLKCNT_UNCMP_ADV_HIGH': None, 'BLKCNT_CMP_ADV_HIGH': None,
+                        'INSERT_COUNT': 0, 'UPDATE_COUNT': 0, 'DELETE_COUNT': 0,
+                        'LOGICAL_READS': None, 'PHYSICAL_READS': None,
+                        'ACCESS_FREQUENCY': None, 'LAST_ACCESS_DATE': None,
+                        'HOTNESS_SCORE': ph, 'READ_RATIO': None, 'WRITE_RATIO': None,
+                        'DML_24H_RATE': None, 'LAST_ANALYZED': None, 'DATA_AGE_DAYS': None,
+                        'CURRENT_COMPRESSION': pc, 'ADVISABLE_COMPRESSION': pa,
+                        'RECOMMENDATION_REASON': f'Quick scan partition: hotness={ph:.0f}',
+                        'CONFIDENCE_SCORE': None,
+                        'PROJECTED_SAVINGS_BYTES': 0, 'PROJECTED_SAVINGS_PCT': 0,
+                        'ANALYSIS_DURATION_SEC': None, 'SAMPLE_SIZE_ROWS': None,
+                    })
 
         # Create a lightweight run record for the quick scan
         if results:
