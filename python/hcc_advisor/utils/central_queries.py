@@ -275,7 +275,15 @@ class CentralQueries:
                 COALESCE(SUM(CASE WHEN a.advisable_compression IS NOT NULL
                            AND a.advisable_compression != 'NONE'
                            AND (h.operation_status IS NULL OR h.operation_status != 'SUCCESS')
-                           THEN a.projected_savings_mb ELSE 0 END), 0) as pending_savings_mb
+                           THEN a.projected_savings_mb ELSE 0 END), 0) as pending_savings_mb,
+                COALESCE(SUM(CASE WHEN h.operation_status = 'SUCCESS'
+                           THEN NVL(a.original_size_bytes, a.size_bytes) / 1048576
+                           ELSE 0 END), 0) as compressed_original_mb,
+                COALESCE(SUM(CASE WHEN a.advisable_compression IS NOT NULL
+                           AND a.advisable_compression != 'NONE'
+                           AND (h.operation_status IS NULL OR h.operation_status != 'SUCCESS')
+                           THEN NVL(a.original_size_bytes, a.size_bytes) / 1048576
+                           ELSE 0 END), 0) as uncompressed_mb
             FROM t_compression_analysis a
             LEFT JOIN (
                 SELECT database_id, owner, object_name,
@@ -307,11 +315,14 @@ class CentralQueries:
                     'skipped': int(row.get('SKIPPED', 0)),
                     'saved_mb': float(row.get('SAVED_MB', 0)),
                     'pending_savings_mb': float(row.get('PENDING_SAVINGS_MB', 0)),
+                    'compressed_original_mb': float(row.get('COMPRESSED_ORIGINAL_MB', 0)),
+                    'uncompressed_mb': float(row.get('UNCOMPRESSED_MB', 0)),
                 }
         except Exception as e:
             log_error(e, "get_compression_progress")
         return {'total': 0, 'compressed': 0, 'pending': 0, 'skipped': 0,
-                'saved_mb': 0, 'pending_savings_mb': 0}
+                'saved_mb': 0, 'pending_savings_mb': 0,
+                'compressed_original_mb': 0, 'uncompressed_mb': 0}
 
     @staticmethod
     def get_savings_by_strategy(database_id: Optional[int] = None) -> pd.DataFrame:

@@ -461,22 +461,31 @@ def show_dashboard():
 
     with col1:
         st.subheader("Compression Progress")
-        compressed = progress.get('compressed', 0)
-        pending = progress.get('pending', 0)
-        skipped = progress.get('skipped', 0)
+        compressed_gb = progress.get('compressed_original_mb', 0) / 1024
+        uncompressed_gb = progress.get('uncompressed_mb', 0) / 1024
 
-        if compressed + pending + skipped > 0:
+        if compressed_gb + uncompressed_gb > 0:
+            total_eligible = compressed_gb + uncompressed_gb
+            pct_done = round(compressed_gb / total_eligible * 100, 1)
+
             import plotly.graph_objects as go
             fig = go.Figure(data=[go.Pie(
-                labels=['Compressed', 'Pending', 'Not Recommended'],
-                values=[compressed, pending, skipped],
-                marker_colors=['#28a745', '#ffc107', '#6c757d'],
+                labels=[f'Compressed ({compressed_gb:.2f} GB)',
+                        f'Not Yet Compressed ({uncompressed_gb:.2f} GB)'],
+                values=[compressed_gb, uncompressed_gb],
+                marker_colors=['#28a745', '#ffc107'],
                 hole=0.5,
-                textinfo='label+value'
+                textinfo='percent',
+                hovertemplate='%{label}<br>%{value:.2f} GB<extra></extra>'
             )])
-            fig.update_layout(height=300, margin=dict(t=20, b=20, l=20, r=20),
-                              showlegend=True, legend=dict(orientation='h', y=-0.1))
+            fig.update_layout(
+                height=300, margin=dict(t=20, b=20, l=20, r=20),
+                showlegend=True, legend=dict(orientation='h', y=-0.1),
+                annotations=[dict(text=f'{pct_done}%', x=0.5, y=0.5,
+                                  font_size=24, showarrow=False)]
+            )
             st.plotly_chart(fig, use_container_width=True)
+            st.caption(f"Eligible volume only — excludes IOTs, clustered tables, LONG columns")
         else:
             st.info("No analysis data yet. Run an analysis first.")
 
