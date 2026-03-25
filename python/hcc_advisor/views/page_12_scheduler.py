@@ -6,6 +6,7 @@ Cross-database job queue monitor with auto-refresh and pending queue drain
 import streamlit as st
 import pandas as pd
 import time
+from datetime import datetime, timedelta
 from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.target_queries import TargetQueries
 
@@ -34,6 +35,7 @@ def show_scheduler_page():
     with col2:
         if st.button("Refresh Now", key="sched_refresh", use_container_width=True):
             _do_refresh(db_id)
+            st.session_state['scheduler_last_refresh'] = datetime.now()
             st.rerun()
     with col3:
         interval = st.selectbox("Interval", [1, 2, 5, 10], index=2,
@@ -107,8 +109,22 @@ def show_scheduler_page():
 
     # Auto-refresh logic (at the end so page renders first)
     if st.session_state.scheduler_auto_refresh:
-        st.caption(f"Auto-refreshing every {interval} minute(s)... (click Stop to disable)")
+        last = st.session_state.get('scheduler_last_refresh')
+        if last:
+            elapsed = (datetime.now() - last).total_seconds()
+            remaining = max(0, interval * 60 - elapsed)
+            rem_min = int(remaining // 60)
+            rem_sec = int(remaining % 60)
+            st.caption(
+                f"Last refresh: **{last.strftime('%H:%M:%S')}** — "
+                f"Next in **{rem_min}m {rem_sec}s** (every {interval} min) — "
+                f"click Stop to disable"
+            )
+        else:
+            st.caption(f"Auto-refreshing every {interval} minute(s)... (click Stop to disable)")
+
         _do_refresh(db_id)
+        st.session_state['scheduler_last_refresh'] = datetime.now()
         time.sleep(interval * 60)
         st.rerun()
 
