@@ -2733,6 +2733,22 @@ ONLINE PARALLEL {parallel_degree};"""
             return pd.DataFrame()
 
     @staticmethod
+    def get_running_total_dop(database_id: int) -> int:
+        """Get total DOP consumed by running HCC jobs from central history."""
+        from hcc_advisor.utils.central_connector import CentralConnector
+        try:
+            df = CentralConnector.execute_query("""
+                SELECT NVL(SUM(NVL(parallel_degree, 1)), 0) as total_dop
+                FROM t_compression_history
+                WHERE database_id = :db AND operation_status = 'IN_PROGRESS'
+            """, {'db': database_id})
+            if not df.empty:
+                return int(df.iloc[0]['TOTAL_DOP'] or 0)
+        except Exception:
+            pass
+        return 0
+
+    @staticmethod
     def check_completed_jobs(database_id: int) -> List[Dict]:
         """Check DBA_SCHEDULER_JOB_RUN_DETAILS for recently completed HCC_% jobs.
         Updates t_compression_history from IN_PROGRESS to SUCCESS/FAILED."""

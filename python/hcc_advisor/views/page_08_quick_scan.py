@@ -12,6 +12,13 @@ from hcc_advisor.config import config
 COMP_OPTIONS = ['OLTP', 'QUERY LOW', 'QUERY HIGH', 'ARCHIVE LOW', 'ARCHIVE HIGH']
 DOP_OPTIONS = list(range(1, 65))  # will be capped at runtime by CPU_COUNT/2
 
+# Throttle profiles: DOP divisor + max concurrent jobs fraction of CPU_COUNT
+THROTTLE_PROFILES = {
+    'Low': {'dop_divisor': 4, 'concurrency_divisor': 4, 'label': 'Low — minimal impact (CPU/4)'},
+    'Medium': {'dop_divisor': 3, 'concurrency_divisor': 3, 'label': 'Medium — balanced (CPU/3)'},
+    'High': {'dop_divisor': 2, 'concurrency_divisor': 2, 'label': 'High — maximum throughput (CPU/2)'},
+}
+
 
 def show_quick_scan_page():
     st.title("Quick Action")
@@ -26,20 +33,27 @@ def show_quick_scan_page():
     # Controls row
     schemas = TargetQueries.get_available_schemas(db_id)
     cpu_count = TargetQueries.get_cpu_count(db_id)
-    max_dop = max(1, cpu_count // 2)
+    dop_budget = max(1, cpu_count // 2)  # Total DOP budget = CPU_COUNT/2
 
     col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
     with col1:
         schema = st.selectbox("Schema", ["All Schemas"] + schemas, key="qs_schema")
     with col2:
-        max_queue = st.slider("Max Concurrent Jobs", 1, max(1, cpu_count // 2),
-                              min(2, max(1, cpu_count // 2)), key="qs_max_queue",
-                              help=f"Max jobs running simultaneously (CPU_COUNT/2 = {cpu_count // 2})")
+        throttle = st.selectbox(
+            "Throttle", list(THROTTLE_PROFILES.keys()), index=1, key="qs_throttle",
+            format_func=lambda k: THROTTLE_PROFILES[k]['label']
+        )
+        profile = THROTTLE_PROFILES[throttle]
+        max_dop = max(1, cpu_count // profile['dop_divisor'])
+        max_queue = max(1, cpu_count // profile['concurrency_divisor'])
     with col3:
         show_running = st.checkbox("Running Only", key="qs_running_only")
     with col4:
         st.markdown("<br>", unsafe_allow_html=True)
         refresh = st.button("Refresh", key="qs_refresh", use_container_width=True)
+
+    st.caption(f"CPU_COUNT={cpu_count} | DOP budget={dop_budget} | "
+               f"Per-job DOP up to {max_dop} | Max concurrent={max_queue}")
 
     schema_param = None if schema == "All Schemas" else schema
 
@@ -299,7 +313,9 @@ def _render_schemas_tab(db_id, max_queue, max_dop):
 
 
 def _bulk_submit(candidates, db_id, max_queue, default_dop):
-    """Submit candidates with per-database slot limits. Overflow goes to session_state queue."""
+    """Submit candidates respecting per-database DOP budget (CPU_COUNT/2).
+    Total DOP of running jobs + new job DOP must not exceed the budget.
+    Overflow goes to session_state queue for background drain."""
     from collections import defaultdict
 
     # Group candidates by database_id
@@ -308,17 +324,16 @@ def _bulk_submit(candidates, db_id, max_queue, default_dop):
         did = item.get('database_id', db_id)
         by_db[did].append(item)
 
-    # Calculate available slots per database
-    db_slots = {}
+    # Calculate DOP budget and current usage per database
+    db_dop_remaining = {}
     for did in by_db:
         try:
             cpu = TargetQueries.get_cpu_count(did)
-            max_q = max(1, cpu // 2)
-            running_df = TargetQueries.get_running_compression_jobs(did)
-            running_count = len(running_df) if not running_df.empty else 0
-            db_slots[did] = max(0, max_q - running_count)
+            budget = max(1, cpu // 2)
+            used = TargetQueries.get_running_total_dop(did)
+            db_dop_remaining[did] = max(0, budget - used)
         except Exception:
-            db_slots[did] = max(0, max_queue)
+            db_dop_remaining[did] = max(0, default_dop)
 
     submitted = 0
     failed = 0
@@ -326,16 +341,17 @@ def _bulk_submit(candidates, db_id, max_queue, default_dop):
 
     for did, items in by_db.items():
         for item in items:
-            if db_slots.get(did, 0) > 0:
+            item_dop = int(item.get('dop', default_dop) or default_dop)
+            if db_dop_remaining.get(did, 0) >= item_dop:
                 result = TargetQueries.submit_compression_job(
                     did, item['owner'], item['table_name'],
                     item['compression_type'],
                     partition_name=item.get('partition_name'),
-                    parallel_degree=item.get('dop', default_dop)
+                    parallel_degree=item_dop
                 )
                 if result.get('success'):
                     submitted += 1
-                    db_slots[did] -= 1
+                    db_dop_remaining[did] -= item_dop
                 elif 'already has a running job' not in result.get('error', ''):
                     failed += 1
             else:

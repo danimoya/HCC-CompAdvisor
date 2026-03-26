@@ -185,12 +185,12 @@ def _do_refresh(db_id):
 
 
 def _drain_pending_queue(db_id):
-    """Submit pending items grouped by database_id, each with independent slot limits."""
+    """Submit pending items respecting per-database DOP budget (CPU_COUNT/2).
+    Total DOP of running jobs + new job DOP must not exceed the budget."""
     queue = st.session_state.get('scheduler_pending_queue', [])
     if not queue:
         return
 
-    # Group pending items by database_id
     from collections import defaultdict
     by_db = defaultdict(list)
     for item in queue:
@@ -198,36 +198,35 @@ def _drain_pending_queue(db_id):
         if did:
             by_db[int(did)].append(item)
 
-    # Per-database slot calculation and drain
     submitted = 0
     remaining = []
-    db_slots = {}
+    db_dop_remaining = {}
 
     for did, items in by_db.items():
-        if did not in db_slots:
+        if did not in db_dop_remaining:
             try:
                 cpu = TargetQueries.get_cpu_count(did)
-                max_q = max(1, cpu // 2)
-                running_df = TargetQueries.get_running_compression_jobs(did)
-                running_count = len(running_df) if not running_df.empty else 0
-                db_slots[did] = max(0, max_q - running_count)
+                budget = max(1, cpu // 2)
+                used = TargetQueries.get_running_total_dop(did)
+                db_dop_remaining[did] = max(0, budget - used)
             except Exception:
-                db_slots[did] = 0
+                db_dop_remaining[did] = 0
 
         for item in items:
-            if db_slots[did] <= 0:
-                remaining.append(item)
-                continue
-            result = TargetQueries.submit_compression_job(
-                did, item['owner'], item['table_name'],
-                item['compression_type'],
-                partition_name=item.get('partition_name'),
-                parallel_degree=item.get('dop', 4)
-            )
-            if result.get('success'):
-                submitted += 1
-                db_slots[did] -= 1
-            elif 'already has a running job' not in result.get('error', ''):
+            item_dop = int(item.get('dop', 4) or 4)
+            if db_dop_remaining.get(did, 0) >= item_dop:
+                result = TargetQueries.submit_compression_job(
+                    did, item['owner'], item['table_name'],
+                    item['compression_type'],
+                    partition_name=item.get('partition_name'),
+                    parallel_degree=item_dop
+                )
+                if result.get('success'):
+                    submitted += 1
+                    db_dop_remaining[did] -= item_dop
+                elif 'already has a running job' not in result.get('error', ''):
+                    remaining.append(item)
+            else:
                 remaining.append(item)
 
     st.session_state.scheduler_pending_queue = remaining
