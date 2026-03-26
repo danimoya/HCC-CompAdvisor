@@ -622,6 +622,17 @@ class CentralQueries:
         db_filter = "AND a.database_id = :database_id" if database_id else ""
         hist_db_filter = "AND database_id = :database_id" if database_id else ""
         executed_filter = "" if show_executed else "AND (h.operation_status IS NULL OR h.operation_status != 'SUCCESS')"
+        # Always exclude objects that failed with permanent errors (not retryable)
+        permanent_fail_filter = """AND NOT EXISTS (
+            SELECT 1 FROM t_compression_history pf
+            WHERE pf.database_id = a.database_id AND pf.owner = a.owner
+              AND pf.object_name = a.object_name
+              AND NVL(pf.partition_name, '~') = NVL(a.partition_name, '~')
+              AND pf.operation_status = 'FAILED'
+              AND (pf.error_message LIKE '%ORA-14257%'
+                   OR pf.error_message LIKE '%ORA-14808%'
+                   OR pf.error_message LIKE '%ORA-14086%')
+        )"""
         query = f"""
             SELECT
                 a.analysis_id as recommendation_id,
@@ -671,6 +682,7 @@ class CentralQueries:
               AND (:strategy IS NULL OR a.advisable_compression = :strategy)
               {db_filter}
               {executed_filter}
+              {permanent_fail_filter}
             ORDER BY a.projected_savings_mb DESC
             FETCH FIRST :limit ROWS ONLY
         """
