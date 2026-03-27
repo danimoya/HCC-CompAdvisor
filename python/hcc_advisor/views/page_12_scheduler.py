@@ -19,11 +19,12 @@ def show_scheduler_page():
     db_id = st.session_state.get('active_database_id')
     mode = "single" if db_id else "cross"
 
-    # Initialize session state
+    # Initialize session state — auto-refresh OFF on startup, user must start it
     if 'scheduler_auto_refresh' not in st.session_state:
-        st.session_state.scheduler_auto_refresh = True
+        st.session_state.scheduler_auto_refresh = False
     if 'scheduler_pending_queue' not in st.session_state:
-        st.session_state.scheduler_pending_queue = []
+        # Reload queued items from central DB (survives app restart)
+        st.session_state.scheduler_pending_queue = _load_persistent_queue(db_id)
 
     # Controls row
     col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
@@ -52,11 +53,6 @@ def show_scheduler_page():
                 st.session_state.scheduler_auto_refresh = True
                 st.rerun()
 
-    # Show pending local queue
-    pending = st.session_state.get('scheduler_pending_queue', [])
-    if pending:
-        st.warning(f"Local queue: **{len(pending)}** items waiting to be submitted as slots free up")
-
     st.markdown("---")
 
     # Metrics
@@ -65,9 +61,9 @@ def show_scheduler_page():
     with col1:
         st.metric("Total (24h)", summary['total'])
     with col2:
-        st.metric("Running", summary['running'])
+        st.metric("Queued", summary['queued'])
     with col3:
-        st.metric("Queued", len(pending))
+        st.metric("Running", summary['running'])
     with col4:
         st.metric("Succeeded", summary['succeeded'])
     with col5:
@@ -230,5 +226,72 @@ def _drain_pending_queue(db_id):
                 remaining.append(item)
 
     st.session_state.scheduler_pending_queue = remaining
+    _save_persistent_queue(remaining)
     if submitted > 0:
         st.toast(f"Drained {submitted} from queue ({len(remaining)} remaining)")
+
+
+def _load_persistent_queue(db_id) -> list:
+    """Load QUEUED items from t_compression_history that haven't been submitted yet."""
+    from hcc_advisor.utils.central_connector import CentralConnector
+    try:
+        db_filter = "AND database_id = :db" if db_id else ""
+        params = {'db': db_id} if db_id else {}
+        df = CentralConnector.execute_query(f"""
+            SELECT database_id, owner, object_name, partition_name,
+                   compression_type_applied as compression_type,
+                   parallel_degree as dop
+            FROM t_compression_history
+            WHERE operation_status = 'QUEUED' {db_filter}
+            ORDER BY start_time
+        """, params if params else None)
+        if not df.empty:
+            df.columns = [c.lower() for c in df.columns]
+            items = []
+            for _, r in df.iterrows():
+                pn = r.get('partition_name')
+                items.append({
+                    'database_id': int(r['database_id']),
+                    'owner': r['owner'],
+                    'table_name': r['object_name'],
+                    'compression_type': r['compression_type'],
+                    'partition_name': pn if pn and str(pn) != 'None' else None,
+                    'dop': int(r.get('dop') or 4),
+                })
+            return items
+    except Exception:
+        pass
+    return []
+
+
+def _save_persistent_queue(queue: list):
+    """Persist the pending queue to t_compression_history with status QUEUED.
+    Replaces all existing QUEUED rows."""
+    from hcc_advisor.utils.central_connector import CentralConnector
+    try:
+        # Delete old QUEUED rows
+        CentralConnector.execute_dml(
+            "DELETE FROM t_compression_history WHERE operation_status = 'QUEUED'"
+        )
+        # Insert current queue
+        if queue:
+            for item in queue:
+                CentralConnector.execute_dml("""
+                    INSERT INTO t_compression_history (
+                        database_id, owner, object_name, object_type,
+                        partition_name, compression_type_applied,
+                        parallel_degree, operation_status, start_time, executed_by
+                    ) VALUES (
+                        :db, :owner, :tbl, :otype, :part, :comp,
+                        :dop, 'QUEUED', SYSTIMESTAMP, 'HCC_ADVISOR'
+                    )
+                """, {
+                    'db': item['database_id'], 'owner': item['owner'],
+                    'tbl': item['table_name'],
+                    'otype': 'PARTITION' if item.get('partition_name') else 'TABLE',
+                    'part': item.get('partition_name'),
+                    'comp': item['compression_type'],
+                    'dop': item.get('dop', 4),
+                })
+    except Exception:
+        pass

@@ -82,6 +82,7 @@ class CentralQueries:
         db_filter = "AND database_id = :database_id" if database_id else ""
         query = f"""
             SELECT
+                SUM(CASE WHEN operation_status = 'QUEUED' THEN 1 ELSE 0 END) as queued,
                 SUM(CASE WHEN operation_status = 'IN_PROGRESS' THEN 1 ELSE 0 END) as running,
                 SUM(CASE WHEN operation_status = 'SUCCESS' THEN 1 ELSE 0 END) as succeeded,
                 SUM(CASE WHEN operation_status = 'FAILED' THEN 1 ELSE 0 END) as failed,
@@ -95,6 +96,7 @@ class CentralQueries:
             if not df.empty:
                 row = df.iloc[0]
                 return {
+                    'queued': int(row.get('QUEUED') or 0),
                     'running': int(row.get('RUNNING') or 0),
                     'succeeded': int(row.get('SUCCEEDED') or 0),
                     'failed': int(row.get('FAILED') or 0),
@@ -102,7 +104,7 @@ class CentralQueries:
                 }
         except Exception as e:
             log_error(e, "get_scheduler_job_summary")
-        return {'running': 0, 'succeeded': 0, 'failed': 0, 'total': 0}
+        return {'queued': 0, 'running': 0, 'succeeded': 0, 'failed': 0, 'total': 0}
 
     @staticmethod
     def get_scheduler_job_details(database_id: Optional[int] = None) -> pd.DataFrame:

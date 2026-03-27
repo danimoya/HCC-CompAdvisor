@@ -357,10 +357,14 @@ def _bulk_submit(candidates, db_id, max_queue, default_dop):
             else:
                 overflow.append(item)
 
-    # Store overflow in session_state for Scheduler to drain
+    # Store overflow in session_state + persist to central DB
     if 'scheduler_pending_queue' not in st.session_state:
         st.session_state.scheduler_pending_queue = []
     st.session_state.scheduler_pending_queue.extend(overflow)
+
+    # Persist queue to t_compression_history (survives app restart)
+    from hcc_advisor.views.page_12_scheduler import _save_persistent_queue
+    _save_persistent_queue(st.session_state.scheduler_pending_queue)
 
     return {'submitted': submitted, 'queued': len(overflow), 'failed': failed}
 
