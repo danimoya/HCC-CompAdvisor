@@ -42,14 +42,17 @@ def decrypt_password(encrypted: str) -> str:
 
 
 def test_target_connection(conn_details: Dict) -> Tuple[bool, str, Optional[str]]:
-    """Test a target database connection directly"""
+    """Test a target database connection directly. Supports SYSDBA mode."""
     try:
         dsn = f"{conn_details['host']}:{conn_details['port']}/{conn_details['service']}"
-        connection = oracledb.connect(
-            user=conn_details['username'],
-            password=conn_details['password'],
-            dsn=dsn
-        )
+        connect_kwargs = {
+            'user': conn_details['username'],
+            'password': conn_details['password'],
+            'dsn': dsn,
+        }
+        if conn_details.get('mode', 'NORMAL') == 'SYSDBA':
+            connect_kwargs['mode'] = oracledb.AUTH_MODE_SYSDBA
+        connection = oracledb.connect(**connect_kwargs)
         cursor = connection.cursor()
         cursor.execute("SELECT 1 FROM DUAL")
         cursor.fetchone()
@@ -185,10 +188,12 @@ def show_connections_page():
             with tc2:
                 _t_port = st.number_input("Port", value=1521, min_value=1, max_value=65535, key="pretest_port")
                 _t_pass = st.text_input("Password", type="password", key="pretest_pass")
+                _t_mode = st.selectbox("Connection Mode", ["NORMAL", "SYSDBA"], key="pretest_mode",
+                                       help="Use SYSDBA for SYS user connections")
                 if st.button("Test Connection", use_container_width=True, type="primary", key="pretest_btn"):
                     if all([_t_host, _t_service, _t_user, _t_pass]):
                         conn_cfg = {'host': _t_host, 'port': _t_port, 'service': _t_service,
-                                    'username': _t_user, 'password': _t_pass}
+                                    'username': _t_user, 'password': _t_pass, 'mode': _t_mode}
                         with st.spinner("Testing..."):
                             ok, msg, ver = test_target_connection(conn_cfg)
                         if ok:
@@ -213,6 +218,8 @@ def show_connections_page():
                 platform_type = st.selectbox("Platform", options=['STANDARD', 'EXADATA'])
                 port = st.number_input("Port *", min_value=1, max_value=65535, value=1521)
                 username = st.text_input("Username *", placeholder="e.g., COMPRESSION_MGR")
+                conn_mode = st.selectbox("Connection Mode", ["NORMAL", "SYSDBA"],
+                                          help="Use SYSDBA for SYS user connections")
                 description = st.text_input("Description", placeholder="Optional description")
 
             set_active = st.checkbox("Set as active database", value=True)
@@ -223,7 +230,8 @@ def show_connections_page():
                     st.error("Please fill in all required fields")
                 else:
                     # Test first
-                    test_conn = {'host': host, 'port': port, 'service': service, 'username': username, 'password': password}
+                    test_conn = {'host': host, 'port': port, 'service': service,
+                                 'username': username, 'password': password, 'mode': conn_mode}
                     with st.spinner("Testing connection..."):
                         success, msg, version = test_target_connection(test_conn)
 
@@ -239,6 +247,7 @@ def show_connections_page():
                             'description': description,
                             'environment': environment,
                             'platform_type': platform_type,
+                            'connection_mode': conn_mode,
                             'oracle_version': version
                         }
                         ok, result_msg, new_id = CentralQueries.add_target_database(db_data)

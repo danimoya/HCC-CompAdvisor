@@ -38,14 +38,17 @@ class TargetConnector:
             return cls._pools[database_id]
 
         try:
-            pool = oracledb.create_pool(
-                user=conn_config['username'],
-                password=conn_config['password'],
-                dsn=f"{conn_config['host']}:{conn_config['port']}/{conn_config['service']}",
-                min=config.TARGET_POOL_MIN,
-                max=config.TARGET_POOL_MAX,
-                increment=1
-            )
+            pool_kwargs = {
+                'user': conn_config['username'],
+                'password': conn_config['password'],
+                'dsn': f"{conn_config['host']}:{conn_config['port']}/{conn_config['service']}",
+                'min': config.TARGET_POOL_MIN,
+                'max': config.TARGET_POOL_MAX,
+                'increment': 1,
+            }
+            if conn_config.get('connection_mode', 'NORMAL') == 'SYSDBA':
+                pool_kwargs['mode'] = oracledb.AUTH_MODE_SYSDBA
+            pool = oracledb.create_pool(**pool_kwargs)
             cls._pools[database_id] = pool
             cls._pool_configs[database_id] = conn_config
             log_info(f"Target pool created for database_id={database_id}")
@@ -502,11 +505,14 @@ class TargetConnector:
         connection = None
         try:
             dsn = f"{conn_config['host']}:{conn_config['port']}/{conn_config['service']}"
-            connection = oracledb.connect(
-                user=conn_config['username'],
-                password=conn_config['password'],
-                dsn=dsn
-            )
+            connect_kwargs = {
+                'user': conn_config['username'],
+                'password': conn_config['password'],
+                'dsn': dsn,
+            }
+            if conn_config.get('connection_mode', 'NORMAL') == 'SYSDBA':
+                connect_kwargs['mode'] = oracledb.AUTH_MODE_SYSDBA
+            connection = oracledb.connect(**connect_kwargs)
             cursor = connection.cursor()
             cursor.execute("SELECT 1 FROM DUAL")
             cursor.fetchone()

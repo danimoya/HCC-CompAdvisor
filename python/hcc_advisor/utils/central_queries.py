@@ -1895,11 +1895,13 @@ class CentralQueries:
             INSERT INTO t_target_databases (
                 database_name, display_name, db_host, port, service_name,
                 username, password_encrypted, description, environment,
-                platform_type, oracle_version, is_active, created_date, created_by
+                platform_type, connection_mode, oracle_version,
+                is_active, created_date, created_by
             ) VALUES (
                 :database_name, :display_name, :db_host, :port, :service_name,
                 :username, :password_encrypted, :description, :environment,
-                :platform_type, :oracle_version, 'Y', SYSDATE, USER
+                :platform_type, NVL(:connection_mode, 'NORMAL'), :oracle_version,
+                'Y', SYSDATE, USER
             )
         """
 
