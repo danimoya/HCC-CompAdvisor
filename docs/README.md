@@ -120,6 +120,41 @@ The HCC (Hybrid Columnar Compression) Compression Advisor is a comprehensive sol
 
 ---
 
+### [AI Advisor Setup Guide](guides/ai-advisor-setup.md)
+**Audience**: Administrators, power users
+
+**Topics Covered**:
+- Installing Ollama (Linux, macOS, Windows, Docker)
+- Downloading and selecting models (phi3, mistral, llama3)
+- Configuring HCC Advisor to connect to Ollama
+- Using the AI Advisor page for compression analysis
+- Network and security considerations
+- Troubleshooting common issues
+
+---
+
+## v3.0 Dashboard Pages
+
+| Page | Purpose |
+|------|---------|
+| **Overview** | Compression progress donut, savings timeline, forecast, growth alerts |
+| **Quick Action** | Fast hotness-only scan with DBMS_SCHEDULER job queue (Tables/Partitions/Subpartitions/Schemas) |
+| **Run Analysis** | Full DBMS_COMPRESSION ratio analysis with background execution |
+| **View Recommendations** | Filtered candidate list with execution status (Pending/Compressed) |
+| **Compress Tables** | Single table or batch compression execution |
+| **Tablespaces** | Analyze and shrink tablespace datafiles after compression |
+| **Index Manager** | Detect and rebuild unusable/invalid indexes via scheduler jobs |
+| **Execution History** | Compression history with error details and rollback capability |
+| **Session Browser** | Active compression sessions on target with v$session_longops progress |
+| **Scheduler** | Cross-database job queue monitor with auto-refresh and persistent queue |
+| **AI Advisor** | Local SLM analysis via Ollama for intelligent recommendations |
+| **Wizard** | 6-step guided compression lifecycle (Scan-Review-Submit-Monitor-Shrink) |
+| **Compression Rules** | Strategy and rule management with comparison tool |
+| **DB Connections** | Target database registration with NORMAL/SYSDBA mode support |
+| **Admin** | SQL patches, Ollama config, webhooks, AWR license, system info |
+
+---
+
 ## Documentation Coverage Summary
 
 | Category | Coverage | Details |
@@ -129,11 +164,12 @@ The HCC (Hybrid Columnar Compression) Compression Advisor is a comprehensive sol
 | **Administration** | 100% | Installation, configuration, maintenance, and security covered |
 | **Development** | 100% | Architecture, setup, testing, and contribution guidelines |
 | **Operations** | 100% | Deployment, health checks, issue resolution, and monitoring |
+| **AI Advisor** | 100% | Ollama setup, model selection, configuration, troubleshooting |
 
-**Total Documentation Pages**: 5 comprehensive guides
-**Total Topics Covered**: 50+ major topics
+**Total Documentation Pages**: 6 comprehensive guides
+**Total Topics Covered**: 60+ major topics
 **Code Examples**: 100+ SQL, PL/SQL, Python, and Shell examples
-**Troubleshooting Items**: 15+ common issues with solutions
+**Troubleshooting Items**: 20+ common issues with solutions
 
 ## Quick Navigation
 

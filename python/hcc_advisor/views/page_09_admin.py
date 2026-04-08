@@ -334,14 +334,70 @@ def show_ollama_config():
                 pass
 
     st.markdown("---")
-    st.markdown("**Recommended models** (download via `ollama pull <model>`):")
-    st.markdown("""
-| Model | Size | Best For |
-|-------|------|----------|
-| `phi3:mini` | ~2 GB | Fast per-object analysis |
-| `mistral` | ~4 GB | Good schema-level reasoning |
-| `llama3` | ~5 GB | Best overall for technical analysis |
-| `llama3:70b` | ~40 GB | Most capable (requires GPU) |
+    st.markdown("### Setup Guide")
+
+    with st.expander("1. Install Ollama", expanded=False):
+        st.markdown("""
+**Linux / macOS:**
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+```
+
+**Windows:** Download from [ollama.com/download](https://ollama.com/download)
+
+**Docker (headless server):**
+```bash
+docker run -d --gpus=all -v ollama:/root/.ollama -p 11434:11434 --name ollama ollama/ollama
+```
+
+After installation, verify Ollama is running:
+```bash
+curl http://localhost:11434/api/tags
+```
+""")
+
+    with st.expander("2. Download a Model", expanded=False):
+        st.markdown("""
+```bash
+# Recommended for most use cases:
+ollama pull llama3
+
+# Lighter alternative (faster, less RAM):
+ollama pull phi3:mini
+
+# For deeper analysis (more capable):
+ollama pull mistral
+```
+
+**Model comparison:**
+
+| Model | RAM Required | Speed | Analysis Quality |
+|-------|-------------|-------|-----------------|
+| `phi3:mini` (3.8B) | ~3 GB | Fast | Good for per-object |
+| `mistral` (7B) | ~5 GB | Medium | Good schema-level |
+| `llama3` (8B) | ~5 GB | Medium | Best overall |
+| `llama3:70b` (70B) | ~40 GB | Slow | Most capable (GPU required) |
+""")
+
+    with st.expander("3. Configure in HCC Advisor", expanded=False):
+        st.markdown("""
+1. Enter the **Ollama URL** above (default: `http://localhost:11434`)
+   - If Ollama runs on a different server: `http://<server-ip>:11434`
+   - If Ollama runs in Docker on the same host: `http://host.docker.internal:11434`
+2. Enter the **Model** name (must match a downloaded model exactly)
+3. Click **Save**
+4. Click **Test Connection** to verify
+5. Go to **AI Advisor** page to start analyzing
+""")
+
+    with st.expander("4. Network & Security Notes", expanded=False):
+        st.markdown("""
+- **All data stays local** — Ollama runs on your network, no data sent to cloud
+- **No API keys** required — Ollama is open-source and free
+- **Air-gapped compatible** — download model once, runs offline
+- **Firewall**: Port 11434 must be accessible from the HCC Advisor server
+- **GPU optional** — CPU inference works for 7B models (slower but functional)
+- **Privacy**: Table names, schemas, and sizes are sent to the local model only
 """)
 
 
