@@ -15,18 +15,23 @@ def show_admin_page():
     st.markdown("System maintenance and SQL patch management")
     st.markdown("---")
 
-    tab1, tab2, tab3, tab4 = st.tabs(["SQL Patches", "Webhooks", "AWR License", "System Info"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "SQL Patches", "AI / Ollama", "Webhooks", "AWR License", "System Info"
+    ])
 
     with tab1:
         show_sql_patches()
 
     with tab2:
-        show_webhooks()
+        show_ollama_config()
 
     with tab3:
-        show_awr_disclaimer()
+        show_webhooks()
 
     with tab4:
+        show_awr_disclaimer()
+
+    with tab5:
         show_system_info()
 
 
@@ -248,6 +253,96 @@ def show_sql_patches():
                                 st.error(f"Patch failed: {e}")
             else:
                 st.warning("No `patch.sql` found.")
+
+
+def show_ollama_config():
+    """Configure Ollama URL and model for AI Advisor."""
+    st.subheader("AI / Ollama Configuration")
+    st.markdown("Configure the local Ollama instance for AI-powered compression analysis.")
+
+    import json
+    import urllib.request
+
+    # Load current values
+    current_url = ''
+    current_model = 'llama3'
+    try:
+        df = CentralConnector.execute_query(
+            "SELECT key, value FROM t_schema_metadata WHERE key IN ('ollama_url', 'ollama_model')"
+        )
+        if not df.empty:
+            for _, r in df.iterrows():
+                if r['KEY'] == 'ollama_url':
+                    current_url = r['VALUE'] or ''
+                elif r['KEY'] == 'ollama_model':
+                    current_model = r['VALUE'] or 'llama3'
+    except Exception:
+        pass
+
+    col1, col2 = st.columns(2)
+    with col1:
+        url = st.text_input("Ollama URL", value=current_url,
+                             placeholder="http://localhost:11434", key="admin_ollama_url")
+    with col2:
+        model = st.text_input("Model", value=current_model,
+                               placeholder="llama3, mistral, phi3...", key="admin_ollama_model")
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.button("Save", key="ollama_save", use_container_width=True):
+            try:
+                for k, v in [('ollama_url', url), ('ollama_model', model)]:
+                    CentralConnector.execute_dml("""
+                        MERGE INTO t_schema_metadata tgt
+                        USING (SELECT :k as key FROM DUAL) src ON (tgt.key = src.key)
+                        WHEN MATCHED THEN UPDATE SET value = :v
+                        WHEN NOT MATCHED THEN INSERT (key, value) VALUES (:k, :v)
+                    """, {'k': k, 'v': v})
+                st.session_state['ollama_url'] = url
+                st.session_state['ollama_model'] = model
+                st.success("Ollama configuration saved!")
+            except Exception as e:
+                st.error(f"Failed: {e}")
+
+    with col2:
+        if st.button("Test Connection", key="ollama_test", use_container_width=True):
+            if url:
+                try:
+                    resp = urllib.request.urlopen(f"{url}/api/tags", timeout=10)
+                    data = json.loads(resp.read())
+                    models = [m['name'] for m in data.get('models', [])]
+                    if models:
+                        st.success(f"Connected! Available models: {', '.join(models)}")
+                    else:
+                        st.warning("Connected but no models found. Run: `ollama pull llama3`")
+                except Exception as e:
+                    st.error(f"Cannot reach Ollama at {url}: {e}")
+            else:
+                st.warning("Enter a URL first")
+
+    with col3:
+        if st.button("Clear", key="ollama_clear", use_container_width=True):
+            try:
+                CentralConnector.execute_dml(
+                    "DELETE FROM t_schema_metadata WHERE key IN ('ollama_url', 'ollama_model')"
+                )
+                st.session_state.pop('ollama_url', None)
+                st.session_state.pop('ollama_model', None)
+                st.success("Ollama configuration cleared")
+                st.rerun()
+            except Exception:
+                pass
+
+    st.markdown("---")
+    st.markdown("**Recommended models** (download via `ollama pull <model>`):")
+    st.markdown("""
+| Model | Size | Best For |
+|-------|------|----------|
+| `phi3:mini` | ~2 GB | Fast per-object analysis |
+| `mistral` | ~4 GB | Good schema-level reasoning |
+| `llama3` | ~5 GB | Best overall for technical analysis |
+| `llama3:70b` | ~40 GB | Most capable (requires GPU) |
+""")
 
 
 def show_webhooks():

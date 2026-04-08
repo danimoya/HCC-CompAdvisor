@@ -222,10 +222,11 @@ def main():
             "Overview": 0, "Quick Action": 1, "Run Analysis": 2, "View Recommendations": 3,
             "Compress Tables": 4, "Tablespaces": 5, "Index Manager": 6,
             "Execution History": 7, "Session Browser": 8, "Scheduler": 9,
-            "Compression Rules": 10, "DB Connections": 11, "Admin": 12,
+            "AI Advisor": 10, "Wizard": 11,
+            "Compression Rules": 12, "DB Connections": 13, "Admin": 14,
             # Legacy mappings
             "Dashboard": 0, "Analysis": 2, "Recommendations": 3,
-            "Execution": 4, "History": 7, "Sessions": 8, "Strategies": 10, "Connections": 11
+            "Execution": 4, "History": 7, "Sessions": 8, "Strategies": 12, "Connections": 13
         }
         default_page_index = page_mapping.get(st.session_state.selected_page, 0)
         st.session_state.selected_page = None  # Clear after use
@@ -248,6 +249,8 @@ def main():
                 "Execution History",
                 "Session Browser",
                 "Scheduler",
+                "AI Advisor",
+                "Wizard",
                 "Compression Rules",
                 "DB Connections",
                 "Admin"
@@ -263,6 +266,8 @@ def main():
                 "journal-text",           # Execution History
                 "binoculars-fill",        # Session Browser
                 "calendar-check",         # Scheduler
+                "robot",                  # AI Advisor
+                "magic",                  # Wizard
                 "gear-fill",              # Compression Rules
                 "plug-fill",              # DB Connections
                 "wrench-adjustable"       # Admin
@@ -364,6 +369,12 @@ def main():
     elif selected == "Scheduler":
         from hcc_advisor.views.page_12_scheduler import show_scheduler_page
         show_scheduler_page()
+    elif selected == "AI Advisor":
+        from hcc_advisor.views.page_13_ai_advisor import show_ai_advisor_page
+        show_ai_advisor_page()
+    elif selected == "Wizard":
+        from hcc_advisor.views.page_14_wizard import show_wizard_page
+        show_wizard_page()
     elif selected == "Compression Rules":
         from hcc_advisor.views.page_05_strategies import show_strategies_page
         show_strategies_page()
