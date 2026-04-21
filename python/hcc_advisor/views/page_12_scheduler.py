@@ -97,6 +97,11 @@ def show_scheduler_page():
     else:
         st.info("No compression jobs recorded in the last 24 hours.")
 
+    # Export to SQL section
+    st.markdown("---")
+    with st.expander("Export Operations to SQL File"):
+        _render_export_section(db_id)
+
     # Recurring Analysis section
     if db_id:
         st.markdown("---")
@@ -123,6 +128,151 @@ def show_scheduler_page():
         st.session_state['scheduler_last_refresh'] = datetime.now()
         time.sleep(interval * 60)
         st.rerun()
+
+
+def _render_export_section(current_db_id):
+    """Export scheduled operations as a SQL file with filtering."""
+    st.markdown("Export all compression operations as a SQL script that can be "
+                "executed outside of HCC Advisor.")
+
+    # Database filter
+    dbs_df = CentralQueries.get_target_databases()
+    if not dbs_df.empty:
+        dbs_df.columns = [c.lower() for c in dbs_df.columns]
+        db_options = {'All Databases': None}
+        for _, db in dbs_df.iterrows():
+            label = db.get('display_name') or db.get('database_name', f"db_{db.get('database_id')}")
+            db_options[label] = int(db.get('database_id'))
+    else:
+        db_options = {'All Databases': None}
+
+    col1, col2 = st.columns(2)
+    with col1:
+        default_label = 'All Databases'
+        if current_db_id:
+            for label, did in db_options.items():
+                if did == current_db_id:
+                    default_label = label
+                    break
+        default_idx = list(db_options.keys()).index(default_label)
+        selected_db = st.selectbox("Database Filter", list(db_options.keys()),
+                                    index=default_idx, key="export_db")
+        export_db_id = db_options[selected_db]
+    with col2:
+        status_map = {
+            'All': None,
+            'Pending (QUEUED)': 'QUEUED',
+            'Running (IN_PROGRESS)': 'IN_PROGRESS',
+            'Completed (SUCCESS)': 'SUCCESS',
+            'Failed (FAILED)': 'FAILED',
+        }
+        selected_status_label = st.selectbox("Status Filter", list(status_map.keys()),
+                                              key="export_status")
+        export_status = status_map[selected_status_label]
+
+    # Preview + generate SQL
+    df = CentralQueries.get_scheduler_jobs_for_export(
+        database_id=export_db_id, status_filter=export_status
+    )
+
+    if df.empty:
+        st.info("No operations match the selected filters.")
+        return
+
+    df.columns = [c.lower() for c in df.columns]
+    st.caption(f"**{len(df)}** operations will be included in the export")
+
+    # Preview first 10
+    preview_cols = ['database_display', 'owner', 'object_name', 'partition_name',
+                    'compression_type_applied', 'parallel_degree', 'operation_status']
+    available = [c for c in preview_cols if c in df.columns]
+    st.dataframe(df[available].head(10), use_container_width=True, hide_index=True)
+    if len(df) > 10:
+        st.caption(f"Showing first 10 of {len(df)} rows")
+
+    # Build SQL script
+    sql_script = _build_sql_script(df, selected_status_label, selected_db)
+    filename = f"hcc_export_{selected_db.replace(' ', '_').lower()}_{export_status or 'all'}.sql"
+
+    st.download_button(
+        label=f"Download SQL Script ({len(df)} operations)",
+        data=sql_script,
+        file_name=filename,
+        mime="text/plain",
+        type="primary",
+        key="export_download"
+    )
+
+
+def _build_sql_script(df, status_label: str, db_label: str) -> str:
+    """Build a SQL script from the exported operations."""
+    from datetime import datetime as _dt
+
+    lines = [
+        f"-- HCC Compression Advisor - Exported Operations",
+        f"-- Generated: {_dt.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"-- Database Filter: {db_label}",
+        f"-- Status Filter: {status_label}",
+        f"-- Total Operations: {len(df)}",
+        f"-- ",
+        f"-- Run these ALTER TABLE MOVE statements to apply the compression",
+        f"-- recommendations. Review before executing in production.",
+        f"-- ",
+        "",
+        "SET SERVEROUTPUT ON;",
+        "SET TIMING ON;",
+        "",
+    ]
+
+    current_db = None
+    for _, row in df.iterrows():
+        db_name = row.get('database_display') or row.get('database_name') or f"db_{row.get('database_id', '?')}"
+        owner = row['owner']
+        obj = row['object_name']
+        part = row.get('partition_name')
+        comp_type = row.get('compression_type_applied') or 'OLTP'
+        dop = int(row.get('parallel_degree') or 4)
+        status = row.get('operation_status', '')
+        err = row.get('error_message', '')
+
+        if db_name != current_db:
+            lines.append("")
+            lines.append(f"-- ==================================================")
+            lines.append(f"-- Database: {db_name}")
+            lines.append(f"-- ==================================================")
+            current_db = db_name
+
+        # Map compression type to DDL clause
+        clause_map = {
+            'OLTP': 'COMPRESS FOR OLTP',
+            'QUERY LOW': 'COMPRESS FOR QUERY LOW',
+            'QUERY HIGH': 'COMPRESS FOR QUERY HIGH',
+            'ARCHIVE LOW': 'COMPRESS FOR ARCHIVE LOW',
+            'ARCHIVE HIGH': 'COMPRESS FOR ARCHIVE HIGH',
+            'BASIC': 'COMPRESS BASIC',
+            'NONE': 'NOCOMPRESS',
+        }
+        clause = clause_map.get(str(comp_type).upper(), f'COMPRESS FOR {comp_type}')
+
+        # Comment line with status
+        status_marker = f" [{status}]"
+        if status == 'FAILED' and err:
+            status_marker += f" -- error: {str(err)[:100]}"
+        lines.append(f"-- {owner}.{obj}{'.' + part if part and str(part) != 'None' else ''}{status_marker}")
+
+        # DDL
+        if part and str(part) != 'None':
+            lines.append(f"ALTER TABLE {owner}.{obj} MOVE PARTITION {part} {clause} ONLINE PARALLEL {dop};")
+        else:
+            lines.append(f"ALTER TABLE {owner}.{obj} MOVE {clause} ONLINE PARALLEL {dop};")
+
+        # Index rebuild reminder
+        lines.append(f"-- Remember to rebuild unusable indexes for {owner}.{obj}")
+        lines.append("")
+
+    lines.append("")
+    lines.append("-- End of generated script")
+    return "\n".join(lines)
 
 
 def _render_recurring_jobs(db_id):

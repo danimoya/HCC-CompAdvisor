@@ -107,6 +107,47 @@ class CentralQueries:
         return {'queued': 0, 'running': 0, 'succeeded': 0, 'failed': 0, 'total': 0}
 
     @staticmethod
+    def get_scheduler_jobs_for_export(
+        database_id: Optional[int] = None,
+        status_filter: Optional[str] = None
+    ) -> pd.DataFrame:
+        """Get ALL jobs (no time restriction) for export as SQL script.
+
+        Args:
+            database_id: Filter by target database. None = all databases.
+            status_filter: QUEUED, IN_PROGRESS, SUCCESS, FAILED, or None (all).
+        """
+        db_filter = "AND h.database_id = :database_id" if database_id else ""
+        status_clause = ""
+        params = {}
+        if database_id:
+            params['database_id'] = database_id
+        if status_filter and status_filter != 'All':
+            status_clause = "AND h.operation_status = :status"
+            params['status'] = status_filter
+
+        query = f"""
+            SELECT
+                d.database_name, d.display_name as database_display,
+                h.database_id, h.owner, h.object_name,
+                h.object_type, h.partition_name,
+                h.compression_type_applied,
+                NVL(h.parallel_degree, 4) as parallel_degree,
+                h.operation_status,
+                TO_CHAR(h.start_time, 'YYYY-MM-DD HH24:MI:SS') as start_time,
+                h.error_message
+            FROM t_compression_history h
+            LEFT JOIN t_target_databases d ON d.database_id = h.database_id
+            WHERE 1=1 {db_filter} {status_clause}
+            ORDER BY h.database_id, h.start_time DESC
+        """
+        try:
+            return CentralConnector.execute_query(query, params if params else None)
+        except Exception as e:
+            log_error(e, "get_scheduler_jobs_for_export")
+            return pd.DataFrame()
+
+    @staticmethod
     def get_scheduler_job_details(database_id: Optional[int] = None) -> pd.DataFrame:
         """Get detailed job list for Scheduler monitor."""
         db_filter = "AND h.database_id = :database_id" if database_id else ""
