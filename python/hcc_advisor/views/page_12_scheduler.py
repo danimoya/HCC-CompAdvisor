@@ -190,8 +190,17 @@ def _render_export_section(current_db_id):
     if len(df) > 10:
         st.caption(f"Showing first 10 of {len(df)} rows")
 
-    # Build SQL script
-    sql_script = _build_sql_script(df, selected_status_label, selected_db)
+    include_indexes = st.checkbox(
+        "Include index rebuild statements (queries target for dependent objects)",
+        value=True, key="export_include_indexes",
+        help="Adds ALTER INDEX ... REBUILD for all indexes that would become UNUSABLE after MOVE"
+    )
+
+    # Build SQL script (with index rebuild DDL if requested)
+    with st.spinner("Generating SQL script..."):
+        index_map = _gather_indexes(df) if include_indexes else {}
+        sql_script = _build_sql_script(df, selected_status_label, selected_db, index_map)
+
     filename = f"hcc_export_{selected_db.replace(' ', '_').lower()}_{export_status or 'all'}.sql"
 
     st.download_button(
@@ -204,9 +213,98 @@ def _render_export_section(current_db_id):
     )
 
 
-def _build_sql_script(df, status_label: str, db_label: str) -> str:
+def _gather_indexes(df):
+    """Query target databases for indexes on each affected table.
+
+    Returns: dict keyed by (database_id, owner, object_name) with
+        {'indexes': [{'owner', 'name', 'partitioned'}], 'ind_partitions': {(idx_owner, idx_name): [part_name, ...]}}
+    """
+    from hcc_advisor.utils.target_connector import TargetConnector
+
+    df_cols = [c.lower() for c in df.columns]
+    df.columns = df_cols
+
+    # Group (owner, table) by database_id
+    by_db = {}
+    for _, row in df.iterrows():
+        did = int(row.get('database_id') or 0)
+        if did == 0:
+            continue
+        key = (row['owner'], row['object_name'])
+        by_db.setdefault(did, set()).add(key)
+
+    result = {}
+    for did, objects in by_db.items():
+        if not objects:
+            continue
+        # Build an IN-list of (owner, table_name) pairs — use owner filter + multiple table names
+        owners = list({o for o, _ in objects})
+        tables = list({t for _, t in objects})
+
+        try:
+            # Batch query: all indexes for these tables
+            idx_query = """
+                SELECT i.owner as index_owner, i.index_name,
+                       i.table_owner, i.table_name, i.partitioned
+                FROM all_indexes i
+                WHERE i.table_owner IN :owners_list
+                  AND i.table_name IN :tables_list
+                  AND i.index_type NOT IN ('LOB', 'IOT - TOP')
+            """
+            # oracledb doesn't support IN-list with tuples directly; use dynamic SQL
+            owners_csv = ",".join(f"'{o}'" for o in owners)
+            tables_csv = ",".join(f"'{t}'" for t in tables)
+            idx_query_inline = f"""
+                SELECT i.owner as index_owner, i.index_name,
+                       i.table_owner, i.table_name, i.partitioned
+                FROM all_indexes i
+                WHERE i.table_owner IN ({owners_csv})
+                  AND i.table_name IN ({tables_csv})
+                  AND i.index_type NOT IN ('LOB', 'IOT - TOP')
+            """
+            idx_df = TargetConnector.execute_query(did, idx_query_inline)
+            if idx_df.empty:
+                continue
+            idx_df.columns = [c.lower() for c in idx_df.columns]
+
+            # For partitioned indexes, also get partition names
+            partitioned_idx = idx_df[idx_df['partitioned'] == 'YES']
+            ind_partitions = {}
+            if not partitioned_idx.empty:
+                ip_owners = ",".join(f"'{o}'" for o in partitioned_idx['index_owner'].unique())
+                ip_names = ",".join(f"'{n}'" for n in partitioned_idx['index_name'].unique())
+                ip_query = f"""
+                    SELECT index_owner, index_name, partition_name
+                    FROM all_ind_partitions
+                    WHERE index_owner IN ({ip_owners}) AND index_name IN ({ip_names})
+                """
+                ip_df = TargetConnector.execute_query(did, ip_query)
+                if not ip_df.empty:
+                    ip_df.columns = [c.lower() for c in ip_df.columns]
+                    for _, r in ip_df.iterrows():
+                        k = (r['index_owner'], r['index_name'])
+                        ind_partitions.setdefault(k, []).append(r['partition_name'])
+
+            # Build result keyed by (db_id, table_owner, table_name)
+            for _, r in idx_df.iterrows():
+                k = (did, r['table_owner'], r['table_name'])
+                entry = result.setdefault(k, {'indexes': [], 'ind_partitions': ind_partitions})
+                entry['indexes'].append({
+                    'owner': r['index_owner'],
+                    'name': r['index_name'],
+                    'partitioned': r['partitioned'],
+                })
+        except Exception:
+            pass
+
+    return result
+
+
+def _build_sql_script(df, status_label: str, db_label: str, index_map: dict = None) -> str:
     """Build a SQL script from the exported operations."""
     from datetime import datetime as _dt
+    if index_map is None:
+        index_map = {}
 
     lines = [
         f"-- HCC Compression Advisor - Exported Operations",
@@ -214,6 +312,7 @@ def _build_sql_script(df, status_label: str, db_label: str) -> str:
         f"-- Database Filter: {db_label}",
         f"-- Status Filter: {status_label}",
         f"-- Total Operations: {len(df)}",
+        f"-- Index rebuild statements: {'INCLUDED' if index_map else 'NOT INCLUDED'}",
         f"-- ",
         f"-- Run these ALTER TABLE MOVE statements to apply the compression",
         f"-- recommendations. Review before executing in production.",
@@ -261,13 +360,48 @@ def _build_sql_script(df, status_label: str, db_label: str) -> str:
         lines.append(f"-- {owner}.{obj}{'.' + part if part and str(part) != 'None' else ''}{status_marker}")
 
         # DDL
-        if part and str(part) != 'None':
+        is_partition_move = bool(part and str(part) != 'None')
+        if is_partition_move:
             lines.append(f"ALTER TABLE {owner}.{obj} MOVE PARTITION {part} {clause} ONLINE PARALLEL {dop};")
         else:
             lines.append(f"ALTER TABLE {owner}.{obj} MOVE {clause} ONLINE PARALLEL {dop};")
 
-        # Index rebuild reminder
-        lines.append(f"-- Remember to rebuild unusable indexes for {owner}.{obj}")
+        # Index rebuild statements for dependent objects
+        did = int(row.get('database_id') or 0)
+        key = (did, owner, obj)
+        entry = index_map.get(key)
+        if entry and entry.get('indexes'):
+            indexes = entry['indexes']
+            ind_partitions = entry.get('ind_partitions', {})
+            lines.append(f"-- Rebuild {len(indexes)} dependent index(es) for {owner}.{obj}")
+            for idx in indexes:
+                idx_owner = idx['owner']
+                idx_name = idx['name']
+                idx_full = f"{idx_owner}.{idx_name}"
+
+                if is_partition_move:
+                    # Local partitioned index: rebuild only the matching partition
+                    # Global (non-partitioned) index: rebuild whole (goes UNUSABLE on MOVE PARTITION)
+                    if idx['partitioned'] == 'YES':
+                        # Local partitioned: rebuild matching partition (typically same name)
+                        lines.append(f"ALTER INDEX {idx_full} REBUILD PARTITION {part} ONLINE PARALLEL {dop};")
+                    else:
+                        # Global non-partitioned
+                        lines.append(f"ALTER INDEX {idx_full} REBUILD ONLINE PARALLEL {dop};")
+                else:
+                    # Whole table MOVE — all indexes become UNUSABLE
+                    if idx['partitioned'] == 'YES':
+                        # Rebuild each partition of the partitioned index
+                        parts_list = ind_partitions.get((idx_owner, idx_name), [])
+                        if parts_list:
+                            for pn in parts_list:
+                                lines.append(f"ALTER INDEX {idx_full} REBUILD PARTITION {pn} ONLINE PARALLEL {dop};")
+                        else:
+                            lines.append(f"-- WARNING: could not enumerate partitions for {idx_full}; rebuild manually")
+                    else:
+                        lines.append(f"ALTER INDEX {idx_full} REBUILD ONLINE PARALLEL {dop};")
+        else:
+            lines.append(f"-- No dependent indexes found for {owner}.{obj} (or index info unavailable)")
         lines.append("")
 
     lines.append("")
