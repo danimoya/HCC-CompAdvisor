@@ -97,14 +97,7 @@ class TargetQueries:
                 log_warning(f"Could not load strategy rules: {e}")
 
             # 3. Flush monitoring info on target (best effort)
-            try:
-                TargetConnector.execute_plsql(
-                    database_id,
-                    "BEGIN DBMS_STATS.FLUSH_DATABASE_MONITORING_INFO; END;",
-                    commit=False
-                )
-            except Exception:
-                pass
+            TargetQueries._safe_flush_monitoring_info(database_id)
 
             # 4. Discover eligible tables on target
             tables = TargetQueries._discover_analysis_tables(database_id, owner)
@@ -1602,6 +1595,31 @@ ONLINE PARALLEL {parallel_degree};"""
             pass
         return 8  # safe default
 
+    @staticmethod
+    def _safe_flush_monitoring_info(database_id: int) -> bool:
+        """Call DBMS_STATS.FLUSH_DATABASE_MONITORING_INFO, silently skipping
+        ORA-20000 (insufficient privileges). This flush only updates the DML
+        counters in DBA_TAB_MODIFICATIONS — it does NOT affect column statistics
+        or any data in dba_tab_col_statistics. Requires ANALYZE ANY privilege."""
+        try:
+            with TargetConnector.get_connection(database_id) as conn:
+                cursor = conn.cursor()
+                cursor.execute("BEGIN DBMS_STATS.FLUSH_DATABASE_MONITORING_INFO; END;")
+                cursor.close()
+                log_info(f"[Target db_id={database_id}] Flushed monitoring info")
+                return True
+        except Exception as e:
+            # ORA-20000 (insufficient privileges) is expected when user lacks
+            # ANALYZE ANY; silently continue without flushing — DML counts will
+            # still be read from DBA_TAB_MODIFICATIONS (just slightly stale).
+            err_str = str(e)
+            if 'ORA-20000' in err_str or 'ORA-01031' in err_str:
+                log_debug(f"[Target db_id={database_id}] FLUSH_DATABASE_MONITORING_INFO "
+                          "skipped (missing ANALYZE ANY privilege); using cached DML counts")
+            else:
+                log_warning(f"[Target db_id={database_id}] Flush monitoring info failed: {err_str[:200]}")
+            return False
+
     # ============================================================================
     # SCHEMA DISCOVERY (queries target data dictionary)
     # ============================================================================
@@ -2454,11 +2472,7 @@ ONLINE PARALLEL {parallel_degree};"""
             pass
 
         # Flush monitoring info
-        try:
-            TargetConnector.execute_plsql(database_id,
-                "BEGIN DBMS_STATS.FLUSH_DATABASE_MONITORING_INFO; END;", commit=False)
-        except Exception:
-            pass
+        TargetQueries._safe_flush_monitoring_info(database_id)
 
         tables = TargetQueries._discover_analysis_tables(database_id, owner)
         if not tables:
