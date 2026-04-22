@@ -9,7 +9,7 @@ from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.target_queries import TargetQueries
 from hcc_advisor.config import config
 
-COMP_OPTIONS = ['OLTP', 'QUERY LOW', 'QUERY HIGH', 'ARCHIVE LOW', 'ARCHIVE HIGH']
+COMP_OPTIONS = ['NONE', 'OLTP', 'QUERY LOW', 'QUERY HIGH', 'ARCHIVE LOW', 'ARCHIVE HIGH']
 DOP_OPTIONS = list(range(1, 65))  # will be capped at runtime by CPU_COUNT/2
 
 # Throttle profiles: DOP divisor + max concurrent jobs fraction of CPU_COUNT
@@ -96,10 +96,11 @@ def show_quick_scan_page():
 
     st.markdown("---")
 
-    # Load recommendations with execution status
+    # Load all analyzed objects (including NONE-advised) with execution status.
+    # No row limit: Quick Action should mirror the full analyzed set from t_compression_analysis.
     df = CentralQueries.get_recommendations(
-        schema=schema_param, limit=500, min_savings_pct=0, min_size_mb=0,
-        database_id=db_id, show_executed=True
+        schema=schema_param, limit=None, min_savings_pct=0, min_size_mb=0,
+        database_id=db_id, show_executed=True, include_none=True
     )
 
     if df.empty:
@@ -219,10 +220,15 @@ def _render_scan_tab(df, obj_type, db_id, max_queue, max_dop, running_set):
 
             if st.button(f"Submit {can_submit} Job(s)", key=f"qs_submit_{obj_type}", type="primary"):
                 submitted = 0
+                skipped_none = 0
                 for _, row in selected.head(can_submit).iterrows():
                     owner = row['table_owner']
                     table = row['table_name']
                     comp = row['recommended_strategy']
+                    # Skip rows still advised as NONE — override to a real type to submit
+                    if not comp or str(comp).upper() == 'NONE':
+                        skipped_none += 1
+                        continue
                     part = row.get('partition_name')
                     if pd.notna(part) and part:
                         pass
@@ -239,6 +245,9 @@ def _render_scan_tab(df, obj_type, db_id, max_queue, max_dop, running_set):
                         st.toast(f"Submitted: {owner}.{table} → {result.get('job_name')}")
                     else:
                         st.error(f"Failed {owner}.{table}: {result.get('error')}")
+
+                if skipped_none > 0:
+                    st.warning(f"Skipped {skipped_none} row(s) with Advised=NONE — change the advised type to submit.")
 
                 if submitted > 0:
                     st.success(f"{submitted} job(s) submitted to DBMS_SCHEDULER")

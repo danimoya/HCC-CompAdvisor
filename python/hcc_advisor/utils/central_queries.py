@@ -643,9 +643,10 @@ class CentralQueries:
         strategy: Optional[str] = None,
         min_savings_pct: float = 10.0,
         min_size_mb: float = 0.0,
-        limit: int = 100,
+        limit: Optional[int] = 100,
         database_id: Optional[int] = None,
-        show_executed: bool = True
+        show_executed: bool = True,
+        include_none: bool = False
     ) -> pd.DataFrame:
         """
         Get compression recommendations from T_COMPRESSION_ANALYSIS with execution status.
@@ -655,9 +656,11 @@ class CentralQueries:
             strategy: Filter by compression strategy (None for all)
             min_savings_pct: Minimum savings percentage
             min_size_mb: Minimum table size in MB
-            limit: Maximum number of results
+            limit: Maximum number of results (None for no cap)
             database_id: Optional target database ID to filter results
             show_executed: If False, hide objects already compressed successfully
+            include_none: If True, also include objects whose advised compression is NONE
+                (very hot tables from hotness-only scans). Default False for backward compat.
 
         Returns:
             DataFrame with recommendations including execution_status column
@@ -665,6 +668,8 @@ class CentralQueries:
         db_filter = "AND a.database_id = :database_id" if database_id else ""
         hist_db_filter = "AND database_id = :database_id" if database_id else ""
         executed_filter = "" if show_executed else "AND (h.operation_status IS NULL OR h.operation_status != 'SUCCESS')"
+        none_filter = "" if include_none else "AND a.advisable_compression != 'NONE'"
+        limit_clause = "FETCH FIRST :limit ROWS ONLY" if limit is not None else ""
         # Always exclude objects that failed with permanent errors (not retryable)
         permanent_fail_filter = """AND NOT EXISTS (
             SELECT 1 FROM t_compression_history pf
@@ -718,16 +723,16 @@ class CentralQueries:
                AND h.owner = a.owner AND h.object_name = a.object_name
                AND h.pn = NVL(a.partition_name, '~') AND h.rn = 1
             WHERE a.advisable_compression IS NOT NULL
-              AND a.advisable_compression != 'NONE'
-              AND a.projected_savings_pct >= :min_savings_pct
-              AND a.size_mb >= :min_size_mb
+              {none_filter}
+              AND NVL(a.projected_savings_pct, 0) >= :min_savings_pct
+              AND NVL(a.size_mb, 0) >= :min_size_mb
               AND (:schema IS NULL OR a.owner = :schema)
               AND (:strategy IS NULL OR a.advisable_compression = :strategy)
               {db_filter}
               {executed_filter}
               {permanent_fail_filter}
-            ORDER BY a.projected_savings_mb DESC
-            FETCH FIRST :limit ROWS ONLY
+            ORDER BY NVL(a.projected_savings_mb, 0) DESC, NVL(a.size_mb, 0) DESC
+            {limit_clause}
         """
 
         params = {
@@ -735,8 +740,9 @@ class CentralQueries:
             'strategy': strategy,
             'min_savings_pct': min_savings_pct,
             'min_size_mb': min_size_mb,
-            'limit': limit
         }
+        if limit is not None:
+            params['limit'] = limit
         if database_id:
             params['database_id'] = database_id
 
