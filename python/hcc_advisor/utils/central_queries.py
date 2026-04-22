@@ -1952,6 +1952,25 @@ class CentralQueries:
             )
         """
 
+        db_name = db_data.get('database_name')
+
+        # Pre-check: a row with this database_name may already exist
+        try:
+            existing = CentralConnector.execute_query(
+                "SELECT database_id FROM t_target_databases WHERE database_name = :database_name",
+                {'database_name': db_name}
+            )
+            if not existing.empty:
+                existing_id = int(existing.iloc[0]['DATABASE_ID'])
+                return (
+                    False,
+                    f"A target database named '{db_name}' already exists (ID {existing_id}). "
+                    f"Edit or delete it from the Databases tab instead of re-adding.",
+                    existing_id
+                )
+        except Exception:
+            pass  # fall through to insert and let the DB enforce uniqueness
+
         try:
             rows_affected = CentralConnector.execute_dml(insert_query, db_data)
             if rows_affected:
@@ -1961,16 +1980,18 @@ class CentralQueries:
                     FROM t_target_databases
                     WHERE database_name = :database_name
                 """
-                df = CentralConnector.execute_query(id_query, {
-                    'database_name': db_data.get('database_name')
-                })
+                df = CentralConnector.execute_query(id_query, {'database_name': db_name})
                 new_id = int(df.iloc[0]['DATABASE_ID']) if not df.empty else None
-                log_info(f"Target database registered: {db_data.get('database_name')} (ID: {new_id})")
+                log_info(f"Target database registered: {db_name} (ID: {new_id})")
                 return True, "Target database registered successfully", new_id
             return False, "Failed to register target database", None
         except Exception as e:
             log_error(e, "add_target_database", db_data)
-            return False, str(e), None
+            msg = str(e)
+            if 'ORA-00001' in msg and 'UNQ_DATABASE_NAME' in msg.upper():
+                msg = (f"A target database named '{db_name}' already exists. "
+                       f"Edit or delete it from the Databases tab instead of re-adding.")
+            return False, msg, None
 
     @staticmethod
     def update_target_database(database_id: int, db_data: Dict[str, Any]) -> Tuple[bool, str]:

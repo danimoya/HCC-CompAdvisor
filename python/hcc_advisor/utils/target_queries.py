@@ -12,6 +12,24 @@ from hcc_advisor.utils.target_connector import TargetConnector
 from hcc_advisor.utils.logger import log_error, log_info, log_debug, log_warning
 
 
+def _safe_int(val) -> int:
+    """Coerce a possibly-NaN/None value to int. NaN and None map to 0."""
+    if val is None:
+        return 0
+    if isinstance(val, float) and pd.isna(val):
+        return 0
+    return int(val)
+
+
+def _safe_float(val) -> float:
+    """Coerce a possibly-NaN/None value to float. NaN and None map to 0.0."""
+    if val is None:
+        return 0.0
+    if isinstance(val, float) and pd.isna(val):
+        return 0.0
+    return float(val)
+
+
 class TargetQueries:
     """Data access layer for operations on remote target Oracle databases"""
 
@@ -471,11 +489,6 @@ class TargetQueries:
             df = TargetConnector.execute_query(database_id, query, params if params else None)
             if df.empty:
                 return []
-            def _safe_int(val):
-                if val is None or (isinstance(val, float) and pd.isna(val)):
-                    return 0
-                return int(val)
-
             tables = []
             for _, row in df.iterrows():
                 tables.append({
@@ -489,7 +502,7 @@ class TargetQueries:
                     'compression': row.get('COMPRESSION', 'NONE'),
                     'compress_for': row.get('COMPRESS_FOR'),
                     'size_bytes': _safe_int(row.get('SIZE_BYTES')),
-                    'size_mb': float(row.get('SIZE_MB') or 0),
+                    'size_mb': _safe_float(row.get('SIZE_MB')),
                 })
             return tables
         except Exception as e:
@@ -528,10 +541,10 @@ class TargetQueries:
                     'composite': row.get('COMPOSITE', 'NO'),
                     'compression': row.get('COMPRESSION', 'NONE'),
                     'compress_for': row.get('COMPRESS_FOR'),
-                    'num_rows': int(row.get('NUM_ROWS') or 0),
-                    'blocks': int(row.get('BLOCKS') or 0),
-                    'size_bytes': int(row.get('SIZE_BYTES') or 0),
-                    'size_mb': float(row.get('SIZE_MB') or 0),
+                    'num_rows': _safe_int(row.get('NUM_ROWS')),
+                    'blocks': _safe_int(row.get('BLOCKS')),
+                    'size_bytes': _safe_int(row.get('SIZE_BYTES')),
+                    'size_mb': _safe_float(row.get('SIZE_MB')),
                 })
             return parts
         except Exception as e:
@@ -573,10 +586,10 @@ class TargetQueries:
                     'subpartition_name': row['SUBPARTITION_NAME'],
                     'compression': row.get('COMPRESSION', 'NONE'),
                     'compress_for': row.get('COMPRESS_FOR'),
-                    'num_rows': int(row.get('NUM_ROWS') or 0),
-                    'blocks': int(row.get('BLOCKS') or 0),
-                    'size_bytes': int(row.get('SIZE_BYTES') or 0),
-                    'size_mb': float(row.get('SIZE_MB') or 0),
+                    'num_rows': _safe_int(row.get('NUM_ROWS')),
+                    'blocks': _safe_int(row.get('BLOCKS')),
+                    'size_bytes': _safe_int(row.get('SIZE_BYTES')),
+                    'size_mb': _safe_float(row.get('SIZE_MB')),
                 })
             return subparts
         except Exception as e:
