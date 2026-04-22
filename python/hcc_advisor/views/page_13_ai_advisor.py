@@ -6,6 +6,7 @@ Local SLM analysis via Ollama for compression recommendations
 import streamlit as st
 import pandas as pd
 import json
+import time
 import urllib.request
 from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.target_queries import TargetQueries
@@ -45,21 +46,50 @@ def show_ai_advisor_page():
 
     # Analyze button
     if st.button("Analyze", type="primary", use_container_width=True, key="ai_analyze"):
-        with st.spinner(f"Gathering data and consulting {ollama_model}..."):
-            context = _gather_context(db_id, schema_filter, table_filter)
-            prompt = _build_prompt(context, scope)
+        try:
+            with st.status("Running AI Analysis...", expanded=True) as status:
+                # Step 1: Gather data
+                st.write("1. Gathering estate data from central DB...")
+                t0 = time.time()
+                context = _gather_context(db_id, schema_filter, table_filter)
+                gather_t = time.time() - t0
+                st.write(
+                    f"   Context ready in {gather_t:.1f}s: "
+                    f"{len(context.get('candidates', []))} candidates, "
+                    f"{len(context.get('failures', []))} failures, "
+                    f"{len(context.get('growth_alerts', []))} growth alerts"
+                )
 
-            try:
-                response = _call_ollama(prompt, ollama_url, ollama_model)
-                st.session_state['ai_last_response'] = response
-                st.session_state['ai_last_context'] = context
-                st.session_state['ai_chat_history'] = [
-                    {'role': 'user', 'content': f'Analyze {scope}'},
-                    {'role': 'assistant', 'content': response}
-                ]
-            except Exception as e:
-                st.error(f"Ollama error: {e}")
-                st.info(f"Verify Ollama is running at {ollama_url} with model {ollama_model}")
+                # Step 2: Build prompt
+                st.write("2. Building structured prompt...")
+                prompt = _build_prompt(context, scope)
+                st.write(f"   Prompt: {len(prompt):,} chars (~{len(prompt) // 4:,} tokens)")
+
+                # Step 3: Call Ollama (streaming)
+                st.write(f"3. Querying **{ollama_model}** at {ollama_url}...")
+                st.caption(
+                    "Waiting on model. Small models (phi3:mini) respond in ~5-15s. "
+                    "Larger models (llama3, mistral) may take 30-90s. "
+                    "70B models can take several minutes."
+                )
+                stream_placeholder = st.empty()
+                response = _call_ollama_streaming(
+                    prompt, ollama_url, ollama_model, stream_placeholder
+                )
+                status.update(label="AI Analysis Complete", state="complete", expanded=False)
+
+            st.session_state['ai_last_response'] = response
+            st.session_state['ai_last_context'] = context
+            st.session_state['ai_chat_history'] = [
+                {'role': 'user', 'content': f'Analyze {scope}'},
+                {'role': 'assistant', 'content': response}
+            ]
+        except Exception as e:
+            st.error(f"Ollama error: {e}")
+            st.info(
+                f"Verify Ollama is running at {ollama_url} with model {ollama_model}. "
+                "Large models may exceed the 300s timeout — try phi3:mini for faster responses."
+            )
 
     # Display last response
     last_response = st.session_state.get('ai_last_response')
@@ -80,16 +110,22 @@ def show_ai_advisor_page():
 
             followup_prompt = _build_followup_prompt(context, history, followup)
 
-            with st.spinner("Thinking..."):
-                try:
-                    answer = _call_ollama(followup_prompt, ollama_url, ollama_model)
-                    history.append({'role': 'user', 'content': followup})
-                    history.append({'role': 'assistant', 'content': answer})
-                    st.session_state['ai_chat_history'] = history
-                    st.markdown("**Answer:**")
-                    st.markdown(answer)
-                except Exception as e:
-                    st.error(f"Ollama error: {e}")
+            try:
+                with st.status(f"Asking {ollama_model}...", expanded=True) as status:
+                    st.write(f"Prompt: {len(followup_prompt):,} chars")
+                    st.caption("Streaming response from Ollama...")
+                    placeholder = st.empty()
+                    answer = _call_ollama_streaming(
+                        followup_prompt, ollama_url, ollama_model, placeholder
+                    )
+                    status.update(label="Answer ready", state="complete", expanded=False)
+                history.append({'role': 'user', 'content': followup})
+                history.append({'role': 'assistant', 'content': answer})
+                st.session_state['ai_chat_history'] = history
+                st.markdown("**Answer:**")
+                st.markdown(answer)
+            except Exception as e:
+                st.error(f"Ollama error: {e}")
 
         # Show chat history
         history = st.session_state.get('ai_chat_history', [])
@@ -247,8 +283,8 @@ def _build_followup_prompt(context: dict, history: list, question: str) -> str:
     return prompt
 
 
-def _call_ollama(prompt: str, url: str, model: str) -> str:
-    """Call the Ollama API for text generation."""
+def _call_ollama(prompt: str, url: str, model: str, timeout: int = 300) -> str:
+    """Call the Ollama API (non-streaming)."""
     payload = json.dumps({
         'model': model,
         'prompt': prompt,
@@ -261,9 +297,62 @@ def _call_ollama(prompt: str, url: str, model: str) -> str:
         data=payload,
         headers={'Content-Type': 'application/json'}
     )
-    resp = urllib.request.urlopen(req, timeout=120)
+    resp = urllib.request.urlopen(req, timeout=timeout)
     result = json.loads(resp.read())
     return result.get('response', 'No response from model.')
+
+
+def _call_ollama_streaming(prompt: str, url: str, model: str, placeholder,
+                            timeout: int = 300) -> str:
+    """Call Ollama with stream=true, update the placeholder incrementally.
+    Returns the full response text once generation completes."""
+    payload = json.dumps({
+        'model': model,
+        'prompt': prompt,
+        'stream': True,
+        'options': {'temperature': 0.3, 'num_predict': 2000}
+    }).encode('utf-8')
+
+    req = urllib.request.Request(
+        f"{url}/api/generate",
+        data=payload,
+        headers={'Content-Type': 'application/json'}
+    )
+
+    start = time.time()
+    full_text = ''
+    token_count = 0
+    last_update = start
+
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        for line in resp:
+            if not line.strip():
+                continue
+            try:
+                chunk = json.loads(line.decode('utf-8'))
+            except Exception:
+                continue
+
+            piece = chunk.get('response', '')
+            if piece:
+                full_text += piece
+                token_count += 1
+
+            # Refresh placeholder every 200ms to avoid excessive reruns
+            now = time.time()
+            if now - last_update > 0.2 or chunk.get('done'):
+                elapsed = now - start
+                tok_per_sec = token_count / elapsed if elapsed > 0 else 0
+                header = f"*Generating... {token_count} tokens, {elapsed:.1f}s ({tok_per_sec:.1f} tok/s)*\n\n---\n\n"
+                placeholder.markdown(header + full_text)
+                last_update = now
+
+            if chunk.get('done'):
+                # Final update — remove the generating header
+                placeholder.markdown(full_text)
+                break
+
+    return full_text
 
 
 if __name__ == "__main__":
