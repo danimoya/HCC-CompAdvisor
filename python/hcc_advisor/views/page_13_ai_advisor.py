@@ -8,6 +8,7 @@ import pandas as pd
 import json
 import time
 import urllib.request
+import requests
 from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.target_queries import TargetQueries
 from hcc_advisor.utils.central_connector import CentralConnector
@@ -44,8 +45,22 @@ def show_ai_advisor_page():
         st.markdown("<br>", unsafe_allow_html=True)
         st.caption(f"Model: **{ollama_model}**")
 
-    # Analyze button
-    if st.button("Analyze", type="primary", use_container_width=True, key="ai_analyze"):
+    # Analyze + Diagnostic buttons
+    col_a, col_b = st.columns([3, 1])
+    with col_a:
+        analyze_clicked = st.button(
+            "Analyze", type="primary", use_container_width=True, key="ai_analyze"
+        )
+    with col_b:
+        diag_clicked = st.button(
+            "Test Generate", use_container_width=True, key="ai_test_generate",
+            help="Send a trivial prompt to verify Ollama generation works"
+        )
+
+    if diag_clicked:
+        _run_diagnostic(ollama_url, ollama_model)
+
+    if analyze_clicked:
         try:
             with st.status("Running AI Analysis...", expanded=True) as status:
                 # Step 1: Gather data
@@ -65,12 +80,17 @@ def show_ai_advisor_page():
                 prompt = _build_prompt(context, scope)
                 st.write(f"   Prompt: {len(prompt):,} chars (~{len(prompt) // 4:,} tokens)")
 
-                # Step 3: Call Ollama (streaming)
-                st.write(f"3. Querying **{ollama_model}** at {ollama_url}...")
+                # Step 3: Warm up model (load into RAM)
+                st.write(f"3. Preloading **{ollama_model}**...")
+                warm_out = st.empty()
+                _warm_model(ollama_url, ollama_model,
+                            lambda msg: warm_out.write(f"   {msg}"))
+
+                # Step 4: Call Ollama (streaming)
+                st.write(f"4. Querying model at {ollama_url}...")
                 st.caption(
-                    "Waiting on model. Small models (phi3:mini) respond in ~5-15s. "
-                    "Larger models (llama3, mistral) may take 30-90s. "
-                    "70B models can take several minutes."
+                    "Streaming response. TTFT (time to first token) depends on model size. "
+                    "Model stays loaded for 30 min via keep_alive."
                 )
                 stream_placeholder = st.empty()
                 response = _call_ollama_streaming(
@@ -84,11 +104,20 @@ def show_ai_advisor_page():
                 {'role': 'user', 'content': f'Analyze {scope}'},
                 {'role': 'assistant', 'content': response}
             ]
+        except requests.exceptions.Timeout as e:
+            st.error(f"Ollama request timed out: {e}")
+            st.info(
+                "The model did not respond within 10 minutes. Possible causes: "
+                "(1) model is still loading on a slow disk, "
+                "(2) firewall/proxy blocking `/api/generate` (tags endpoint works but generate doesn't), "
+                "(3) Ollama is out of memory. "
+                "Try **Test Generate** to verify basic connectivity, or switch to a smaller model (phi3:mini)."
+            )
         except Exception as e:
             st.error(f"Ollama error: {e}")
             st.info(
                 f"Verify Ollama is running at {ollama_url} with model {ollama_model}. "
-                "Large models may exceed the 300s timeout — try phi3:mini for faster responses."
+                "Click **Test Generate** to run a quick diagnostic."
             )
 
     # Display last response
@@ -283,72 +312,218 @@ def _build_followup_prompt(context: dict, history: list, question: str) -> str:
     return prompt
 
 
-def _call_ollama(prompt: str, url: str, model: str, timeout: int = 300) -> str:
+def _run_diagnostic(url: str, model: str):
+    """Run a minimal test generation and show detailed diagnostics.
+    Helps isolate connectivity vs model loading vs generation issues."""
+    with st.status("Running diagnostic...", expanded=True) as status:
+        # Step 1: /api/tags (list models)
+        st.write("1. Testing /api/tags (list models)...")
+        try:
+            t0 = time.time()
+            r = requests.get(f"{url}/api/tags", timeout=10)
+            r.raise_for_status()
+            tags = r.json().get('models', [])
+            st.write(f"   [OK] {len(tags)} models available ({time.time() - t0:.2f}s)")
+            model_names = [m.get('name') for m in tags]
+            if model_names:
+                st.caption(f"   Models: {', '.join(model_names)}")
+            if model not in model_names and f"{model}:latest" not in model_names:
+                st.warning(f"   Model '{model}' not in list. Run `ollama pull {model}` first.")
+        except Exception as e:
+            st.error(f"   [FAIL] /api/tags unreachable: {e}")
+            status.update(label="Diagnostic FAILED", state="error", expanded=True)
+            return
+
+        # Step 2: /api/show (model info)
+        st.write(f"2. Testing /api/show for '{model}'...")
+        try:
+            t0 = time.time()
+            r = requests.post(f"{url}/api/show", json={'name': model}, timeout=30)
+            r.raise_for_status()
+            info = r.json()
+            fmt = info.get('details', {}).get('format', '?')
+            family = info.get('details', {}).get('family', '?')
+            params = info.get('details', {}).get('parameter_size', '?')
+            st.write(f"   [OK] family={family}, params={params}, format={fmt} ({time.time() - t0:.2f}s)")
+        except Exception as e:
+            st.error(f"   [FAIL] /api/show error: {e}")
+            status.update(label="Diagnostic FAILED", state="error", expanded=True)
+            return
+
+        # Step 3: Minimal generation (stream=false, num_predict=20)
+        st.write("3. Testing /api/generate with trivial prompt (non-streaming)...")
+        try:
+            t0 = time.time()
+            r = requests.post(
+                f"{url}/api/generate",
+                json={
+                    'model': model,
+                    'prompt': 'Say hi in 3 words.',
+                    'stream': False,
+                    'keep_alive': '30m',
+                    'options': {'num_predict': 20}
+                },
+                timeout=300
+            )
+            r.raise_for_status()
+            data = r.json()
+            elapsed = time.time() - t0
+            resp_text = (data.get('response') or '').strip()
+            load_dur = data.get('load_duration', 0) / 1e9  # ns -> s
+            eval_count = data.get('eval_count', 0)
+            eval_dur = data.get('eval_duration', 0) / 1e9
+            tok_per_sec = eval_count / eval_dur if eval_dur > 0 else 0
+            st.write(f"   [OK] Generated in {elapsed:.1f}s "
+                     f"(load: {load_dur:.1f}s, {eval_count} tokens at {tok_per_sec:.1f} tok/s)")
+            st.code(resp_text or '(empty response)', language='text')
+        except requests.exceptions.Timeout:
+            st.error("   [FAIL] Generation timed out after 300s — likely model load failed or OOM")
+            status.update(label="Diagnostic FAILED", state="error", expanded=True)
+            return
+        except Exception as e:
+            st.error(f"   [FAIL] Generation error: {e}")
+            status.update(label="Diagnostic FAILED", state="error", expanded=True)
+            return
+
+        # Step 4: Streaming test
+        st.write("4. Testing /api/generate with streaming...")
+        try:
+            t0 = time.time()
+            tokens = 0
+            first_token_at = None
+            with requests.post(
+                f"{url}/api/generate",
+                json={
+                    'model': model,
+                    'prompt': 'Count from 1 to 5.',
+                    'stream': True,
+                    'keep_alive': '30m',
+                    'options': {'num_predict': 30}
+                },
+                stream=True,
+                timeout=300
+            ) as sr:
+                sr.raise_for_status()
+                for line in sr.iter_lines(decode_unicode=True):
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except Exception:
+                        continue
+                    if chunk.get('response'):
+                        if first_token_at is None:
+                            first_token_at = time.time()
+                        tokens += 1
+                    if chunk.get('done'):
+                        break
+            elapsed = time.time() - t0
+            ttft = (first_token_at - t0) if first_token_at else None
+            if tokens > 0:
+                st.write(f"   [OK] Streamed {tokens} tokens in {elapsed:.1f}s "
+                         f"(TTFT: {ttft:.1f}s)" if ttft else f"   [OK] Streamed {tokens} tokens in {elapsed:.1f}s")
+            else:
+                st.error("   [FAIL] No tokens received from stream")
+        except Exception as e:
+            st.error(f"   [FAIL] Streaming error: {e}")
+            status.update(label="Diagnostic FAILED (streaming)", state="error", expanded=True)
+            return
+
+        status.update(label="Diagnostic: all checks passed", state="complete", expanded=False)
+        st.success("Ollama is reachable and generating correctly. "
+                   "If the main Analyze still fails, the prompt may be too large for the model's context window.")
+
+
+def _call_ollama(prompt: str, url: str, model: str, timeout: int = 600) -> str:
     """Call the Ollama API (non-streaming)."""
-    payload = json.dumps({
+    payload = {
         'model': model,
         'prompt': prompt,
         'stream': False,
+        'keep_alive': '30m',
         'options': {'temperature': 0.3, 'num_predict': 2000}
-    }).encode('utf-8')
+    }
+    resp = requests.post(f"{url}/api/generate", json=payload, timeout=timeout)
+    resp.raise_for_status()
+    return resp.json().get('response', 'No response from model.')
 
-    req = urllib.request.Request(
-        f"{url}/api/generate",
-        data=payload,
-        headers={'Content-Type': 'application/json'}
-    )
-    resp = urllib.request.urlopen(req, timeout=timeout)
-    result = json.loads(resp.read())
-    return result.get('response', 'No response from model.')
+
+def _warm_model(url: str, model: str, status_write, timeout: int = 600) -> bool:
+    """Preload the model into memory so the first real call returns fast.
+    Uses an empty prompt which Ollama treats as a load-only request."""
+    try:
+        status_write("Warming up model (loading into RAM)...")
+        t0 = time.time()
+        # Ollama accepts an empty prompt to just load the model
+        resp = requests.post(
+            f"{url}/api/generate",
+            json={'model': model, 'prompt': '', 'stream': False, 'keep_alive': '30m'},
+            timeout=timeout
+        )
+        resp.raise_for_status()
+        elapsed = time.time() - t0
+        status_write(f"Model loaded in {elapsed:.1f}s")
+        return True
+    except Exception as e:
+        status_write(f"Warmup failed ({str(e)[:100]}); continuing anyway...")
+        return False
 
 
 def _call_ollama_streaming(prompt: str, url: str, model: str, placeholder,
-                            timeout: int = 300) -> str:
-    """Call Ollama with stream=true, update the placeholder incrementally.
-    Returns the full response text once generation completes."""
-    payload = json.dumps({
+                            timeout: int = 600) -> str:
+    """Call Ollama with stream=true using requests for reliable chunked streaming.
+    Updates the placeholder incrementally. Returns the full response text."""
+    payload = {
         'model': model,
         'prompt': prompt,
         'stream': True,
+        'keep_alive': '30m',
         'options': {'temperature': 0.3, 'num_predict': 2000}
-    }).encode('utf-8')
-
-    req = urllib.request.Request(
-        f"{url}/api/generate",
-        data=payload,
-        headers={'Content-Type': 'application/json'}
-    )
+    }
 
     start = time.time()
+    first_token_at = None
     full_text = ''
     token_count = 0
     last_update = start
+    placeholder.markdown("*Connecting to Ollama...*")
 
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        for line in resp:
-            if not line.strip():
+    with requests.post(f"{url}/api/generate", json=payload, stream=True,
+                        timeout=timeout) as resp:
+        resp.raise_for_status()
+        placeholder.markdown("*Waiting for first token (model may be loading)...*")
+
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line:
                 continue
             try:
-                chunk = json.loads(line.decode('utf-8'))
+                chunk = json.loads(line)
             except Exception:
                 continue
 
             piece = chunk.get('response', '')
             if piece:
+                if first_token_at is None:
+                    first_token_at = time.time()
                 full_text += piece
                 token_count += 1
 
-            # Refresh placeholder every 200ms to avoid excessive reruns
+            # Refresh placeholder every ~200ms
             now = time.time()
             if now - last_update > 0.2 or chunk.get('done'):
                 elapsed = now - start
-                tok_per_sec = token_count / elapsed if elapsed > 0 else 0
-                header = f"*Generating... {token_count} tokens, {elapsed:.1f}s ({tok_per_sec:.1f} tok/s)*\n\n---\n\n"
+                if first_token_at:
+                    gen_elapsed = now - first_token_at
+                    tok_per_sec = token_count / gen_elapsed if gen_elapsed > 0 else 0
+                    ttft = first_token_at - start
+                    header = (f"*Generating... {token_count} tokens, "
+                             f"{elapsed:.1f}s total (TTFT: {ttft:.1f}s, {tok_per_sec:.1f} tok/s)*\n\n---\n\n")
+                else:
+                    header = f"*Loading model... {elapsed:.1f}s elapsed*\n\n---\n\n"
                 placeholder.markdown(header + full_text)
                 last_update = now
 
             if chunk.get('done'):
-                # Final update — remove the generating header
                 placeholder.markdown(full_text)
                 break
 
