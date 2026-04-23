@@ -146,7 +146,8 @@ def show_connections_page():
                                 'port': int(db.get('port', 1521)),
                                 'service': db.get('service_name'),
                                 'username': db.get('username'),
-                                'password': pwd
+                                'password': pwd,
+                                'mode': db.get('connection_mode') or 'NORMAL',
                             }
                             with st.spinner("Testing..."):
                                 success, msg, version = test_target_connection(conn)
@@ -274,9 +275,12 @@ def show_connections_page():
         with col2:
             test_port = st.number_input("Port", value=1521, key="test_port")
             test_username = st.text_input("Username", value="COMPRESSION_MGR", key="test_username")
+            test_mode = st.selectbox("Connection Mode", ["NORMAL", "SYSDBA"], key="quick_test_mode",
+                                      help="Use SYSDBA for SYS user connections")
 
         if st.button("Test Connection", key="quick_test", use_container_width=True, type="primary"):
-            test_conn = {'host': test_host, 'port': test_port, 'service': test_service, 'username': test_username, 'password': test_password}
+            test_conn = {'host': test_host, 'port': test_port, 'service': test_service,
+                         'username': test_username, 'password': test_password, 'mode': test_mode}
             with st.spinner("Testing..."):
                 success, msg, version = test_target_connection(test_conn)
             if success:
