@@ -1613,14 +1613,28 @@ ONLINE PARALLEL {parallel_degree};"""
         """Call DBMS_STATS.FLUSH_DATABASE_MONITORING_INFO, silently skipping
         ORA-20000 (insufficient privileges). This flush only updates the DML
         counters in DBA_TAB_MODIFICATIONS — it does NOT affect column statistics
-        or any data in dba_tab_col_statistics. Requires ANALYZE ANY privilege."""
+        or any data in dba_tab_col_statistics. Requires ANALYZE ANY privilege.
+
+        Bypasses TargetConnector.get_connection because that wrapper logs every
+        oracledb.Error before re-raising, which would drown the log in noisy
+        tracebacks for the benign ORA-20000 case.
+        """
+        from hcc_advisor.utils.central_queries import CentralQueries
+        db_info = CentralQueries.get_target_database(database_id)
+        if not db_info:
+            return False
+
+        connection = None
         try:
-            with TargetConnector.get_connection(database_id) as conn:
-                cursor = conn.cursor()
+            pool = TargetConnector.get_pool(database_id, db_info)
+            connection = pool.acquire()
+            cursor = connection.cursor()
+            try:
                 cursor.execute("BEGIN DBMS_STATS.FLUSH_DATABASE_MONITORING_INFO; END;")
-                cursor.close()
                 log_info(f"[Target db_id={database_id}] Flushed monitoring info")
                 return True
+            finally:
+                cursor.close()
         except Exception as e:
             # ORA-20000 (insufficient privileges) is expected when user lacks
             # ANALYZE ANY; silently continue without flushing — DML counts will
@@ -1632,6 +1646,12 @@ ONLINE PARALLEL {parallel_degree};"""
             else:
                 log_warning(f"[Target db_id={database_id}] Flush monitoring info failed: {err_str[:200]}")
             return False
+        finally:
+            if connection is not None:
+                try:
+                    pool.release(connection)
+                except Exception:
+                    pass
 
     # ============================================================================
     # SCHEMA DISCOVERY (queries target data dictionary)
