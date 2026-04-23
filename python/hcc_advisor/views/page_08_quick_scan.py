@@ -142,10 +142,13 @@ def show_quick_scan_page():
 def _render_export_section(db_id, df, default_dop):
     """Export the current Quick Action analyzed set as an ALTER TABLE MOVE script.
 
-    Reuses the Scheduler's _build_sql_script / _gather_indexes by adapting the
-    Quick Action recommendation columns to the shape those helpers expect.
+    Reuses sql_builder.build_compression_script / gather_dependent_indexes by
+    adapting Quick Action recommendation columns to the shape those helpers expect.
     """
-    from hcc_advisor.views.page_12_scheduler import _build_sql_script, _gather_indexes
+    from hcc_advisor.utils.sql_builder import (
+        build_compression_script,
+        gather_dependent_indexes,
+    )
 
     st.markdown("Export analyzed objects as a SQL script that can be executed "
                 "outside of HCC Advisor.")
@@ -237,8 +240,8 @@ def _render_export_section(db_id, df, default_dop):
     )
 
     with st.spinner("Generating SQL script..."):
-        index_map = _gather_indexes(script_df) if include_indexes else {}
-        sql_script = _build_sql_script(
+        index_map = gather_dependent_indexes(script_df) if include_indexes else {}
+        sql_script = build_compression_script(
             script_df, selected_status_label, db_label, index_map
         )
 
