@@ -79,6 +79,8 @@ def show_ai_advisor_page():
                 st.write("2. Building structured prompt...")
                 prompt = _build_prompt(context, scope)
                 st.write(f"   Prompt: {len(prompt):,} chars (~{len(prompt) // 4:,} tokens)")
+                with st.expander("View prompt", expanded=False):
+                    st.code(prompt, language="markdown")
 
                 # Step 3: Warm up model (load into RAM)
                 st.write(f"3. Preloading **{ollama_model}**...")
@@ -141,7 +143,9 @@ def show_ai_advisor_page():
 
             try:
                 with st.status(f"Asking {ollama_model}...", expanded=True) as status:
-                    st.write(f"Prompt: {len(followup_prompt):,} chars")
+                    st.write(f"Prompt: {len(followup_prompt):,} chars (~{len(followup_prompt) // 4:,} tokens)")
+                    with st.expander("View prompt", expanded=False):
+                        st.code(followup_prompt, language="markdown")
                     st.caption("Streaming response from Ollama...")
                     placeholder = st.empty()
                     answer = _call_ollama_streaming(
