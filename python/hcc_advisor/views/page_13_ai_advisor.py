@@ -79,8 +79,9 @@ def show_ai_advisor_page():
                 st.write("2. Building structured prompt...")
                 prompt = _build_prompt(context, scope)
                 st.write(f"   Prompt: {len(prompt):,} chars (~{len(prompt) // 4:,} tokens)")
-                with st.expander("View prompt", expanded=False):
-                    st.code(prompt, language="markdown")
+                # st.expander can't be nested inside st.status — stash the
+                # prompt and render the "View prompt" expander below.
+                st.session_state['ai_last_prompt'] = prompt
 
                 # Step 3: Warm up model (load into RAM)
                 st.write(f"3. Preloading **{ollama_model}**...")
@@ -122,6 +123,15 @@ def show_ai_advisor_page():
                 "Click **Test Generate** to run a quick diagnostic."
             )
 
+    # Show last prompt (outside any status/expander to avoid nesting)
+    last_prompt = st.session_state.get('ai_last_prompt')
+    if last_prompt:
+        with st.expander(
+            f"View prompt ({len(last_prompt):,} chars, ~{len(last_prompt) // 4:,} tokens)",
+            expanded=False,
+        ):
+            st.code(last_prompt, language="markdown")
+
     # Display last response
     last_response = st.session_state.get('ai_last_response')
     if last_response:
@@ -144,8 +154,7 @@ def show_ai_advisor_page():
             try:
                 with st.status(f"Asking {ollama_model}...", expanded=True) as status:
                     st.write(f"Prompt: {len(followup_prompt):,} chars (~{len(followup_prompt) // 4:,} tokens)")
-                    with st.expander("View prompt", expanded=False):
-                        st.code(followup_prompt, language="markdown")
+                    st.session_state['ai_last_followup_prompt'] = followup_prompt
                     st.caption("Streaming response from Ollama...")
                     placeholder = st.empty()
                     answer = _call_ollama_streaming(
@@ -155,6 +164,12 @@ def show_ai_advisor_page():
                 history.append({'role': 'user', 'content': followup})
                 history.append({'role': 'assistant', 'content': answer})
                 st.session_state['ai_chat_history'] = history
+                with st.expander(
+                    f"View follow-up prompt ({len(followup_prompt):,} chars, "
+                    f"~{len(followup_prompt) // 4:,} tokens)",
+                    expanded=False,
+                ):
+                    st.code(followup_prompt, language="markdown")
                 st.markdown("**Answer:**")
                 st.markdown(answer)
             except Exception as e:
