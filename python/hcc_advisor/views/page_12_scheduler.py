@@ -5,7 +5,6 @@ Cross-database job queue monitor with auto-refresh and pending queue drain
 
 import streamlit as st
 import pandas as pd
-import time
 from datetime import datetime, timedelta
 from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.target_queries import TargetQueries
@@ -13,6 +12,7 @@ from hcc_advisor.utils.sql_builder import (
     build_compression_script,
     gather_dependent_indexes,
 )
+from hcc_advisor.utils.logger import log_warning
 
 
 def show_scheduler_page():
@@ -112,26 +112,27 @@ def show_scheduler_page():
         with st.expander("Recurring Stats Refresh Jobs"):
             _render_recurring_jobs(db_id)
 
-    # Auto-refresh logic (at the end so page renders first)
+    # Auto-refresh logic: runs _do_refresh immediately on the current render
+    # and schedules the next page load via an HTML meta-refresh tag — this
+    # keeps every control on the page (Stop, interval selector, filters)
+    # responsive during the wait, unlike time.sleep which blocks the thread.
     if st.session_state.scheduler_auto_refresh:
-        last = st.session_state.get('scheduler_last_refresh')
-        if last:
-            elapsed = (datetime.now() - last).total_seconds()
-            remaining = max(0, interval * 60 - elapsed)
-            rem_min = int(remaining // 60)
-            rem_sec = int(remaining % 60)
-            st.caption(
-                f"Last refresh: **{last.strftime('%H:%M:%S')}** — "
-                f"Next in **{rem_min}m {rem_sec}s** (every {interval} min) — "
-                f"click Stop to disable"
-            )
-        else:
-            st.caption(f"Auto-refreshing every {interval} minute(s)... (click Stop to disable)")
-
         _do_refresh(db_id)
         st.session_state['scheduler_last_refresh'] = datetime.now()
-        time.sleep(interval * 60)
-        st.rerun()
+
+        last = st.session_state['scheduler_last_refresh']
+        next_at = last + timedelta(minutes=interval)
+        st.caption(
+            f"Last refresh: **{last.strftime('%H:%M:%S')}** — "
+            f"Next at **{next_at.strftime('%H:%M:%S')}** (every {interval} min) — "
+            f"click Stop to disable"
+        )
+
+        # Browser-side auto-reload; never blocks Python rendering.
+        st.markdown(
+            f'<meta http-equiv="refresh" content="{int(interval * 60)}">',
+            unsafe_allow_html=True,
+        )
 
 
 def _render_export_section(current_db_id):
@@ -255,6 +256,7 @@ def _do_refresh(db_id):
         TargetQueries.check_completed_jobs(db_id)
     else:
         # Cross-database: poll all registered databases
+        poll_failures = []
         try:
             dbs = CentralQueries.get_target_databases()
             if not dbs.empty:
@@ -264,10 +266,18 @@ def _do_refresh(db_id):
                     if did:
                         try:
                             TargetQueries.check_completed_jobs(int(did))
-                        except Exception:
-                            pass
-        except Exception:
-            pass
+                        except Exception as e:
+                            log_warning(f"Scheduler: polling db_id={did} failed: {e}")
+                            poll_failures.append(int(did))
+        except Exception as e:
+            log_warning(f"Scheduler: cross-DB poll setup failed: {e}")
+            st.toast(f"Cross-DB poll failed: {e}", icon="⚠️")
+        if poll_failures:
+            st.toast(
+                f"Polling failed for {len(poll_failures)} database(s): "
+                f"{', '.join(str(d) for d in poll_failures)}",
+                icon="⚠️",
+            )
     # Drain pending queue (handles per-database grouping internally)
     _drain_pending_queue(db_id)
 
@@ -297,7 +307,15 @@ def _drain_pending_queue(db_id):
                 budget = max(1, cpu // 2)
                 used = TargetQueries.get_running_total_dop(did)
                 db_dop_remaining[did] = max(0, budget - used)
-            except Exception:
+            except Exception as e:
+                log_warning(
+                    f"Scheduler: DOP-budget lookup for db_id={did} failed, "
+                    f"queue drain will skip this database: {e}"
+                )
+                st.toast(
+                    f"Queue drain skipped db_id={did} (budget lookup failed)",
+                    icon="⚠️",
+                )
                 db_dop_remaining[did] = 0
 
         for item in items:
@@ -324,7 +342,12 @@ def _drain_pending_queue(db_id):
 
 
 def _load_persistent_queue(db_id) -> list:
-    """Load QUEUED items from t_compression_history that haven't been submitted yet."""
+    """Load QUEUED items from t_compression_history that haven't been submitted yet.
+
+    Called at page init; stays silent on failure because the table may not
+    yet exist on a fresh deployment (schema not deployed). Errors here are
+    expected in that case, not drain-time bugs.
+    """
     from hcc_advisor.utils.central_connector import CentralConnector
     try:
         db_filter = "AND database_id = :db" if db_id else ""
@@ -385,5 +408,9 @@ def _save_persistent_queue(queue: list):
                     'comp': item['compression_type'],
                     'dop': item.get('dop', 4),
                 })
-    except Exception:
-        pass
+    except Exception as e:
+        log_warning(f"Scheduler: persisting pending queue failed, items may be lost on restart: {e}")
+        st.toast(
+            "Queue persistence failed — items may be lost on restart. Check logs.",
+            icon="⚠️",
+        )
