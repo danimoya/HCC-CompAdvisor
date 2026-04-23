@@ -284,21 +284,18 @@ def show_ollama_config():
         url = st.text_input("Ollama URL", value=current_url,
                              placeholder="http://localhost:11434", key="admin_ollama_url")
     with col2:
-        available_models = st.session_state.get('admin_ollama_models_list') or []
-        if available_models:
-            # Ensure the currently-saved model is in the list so the selectbox
-            # can render even if it's not reported by /api/tags yet.
-            options = list(available_models)
-            if current_model and current_model not in options:
-                options.insert(0, current_model)
-            idx = options.index(current_model) if current_model in options else 0
-            model = st.selectbox("Model", options=options, index=idx,
-                                  key="admin_ollama_model_select")
-        else:
-            model = st.text_input("Model", value=current_model,
-                                   placeholder="llama3, mistral, phi3...",
-                                   help="Click 'Test Connection' to populate a dropdown of installed models.",
-                                   key="admin_ollama_model_text")
+        # Always use a text_input as the source of truth — Ollama is picky about
+        # the exact tag string, so the user controls what gets saved verbatim.
+        # Test Connection lists the discovered models below as a reference.
+        model = st.text_input("Model", value=current_model,
+                               placeholder="llama3, mistral, phi3...",
+                               help="Type the exact model name as reported by `ollama list`.",
+                               key="admin_ollama_model")
+
+    available_models = st.session_state.get('admin_ollama_models_list') or []
+    if available_models:
+        st.caption("Available models (from `/api/tags`) — copy any name into the Model field above:")
+        st.markdown("\n".join(f"- `{m}`" for m in available_models))
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -326,9 +323,8 @@ def show_ollama_config():
                     models = [m['name'] for m in data.get('models', [])]
                     if models:
                         st.session_state['admin_ollama_models_list'] = models
-                        st.success(f"Connected! {len(models)} model(s) available:")
-                        st.markdown("\n".join(f"- `{m}`" for m in models))
-                        st.caption("The Model field above is now a dropdown. Rerun Test Connection after pulling new models.")
+                        st.success(f"Connected! {len(models)} model(s) available — see list below.")
+                        st.rerun()
                     else:
                         st.session_state.pop('admin_ollama_models_list', None)
                         st.warning("Connected but no models found. Run: `ollama pull llama3`")
