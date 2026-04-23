@@ -8,7 +8,48 @@ import pandas as pd
 import time
 from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.target_queries import TargetQueries
+from hcc_advisor.utils.sql_builder import (
+    build_compression_script,
+    gather_dependent_indexes,
+)
 from hcc_advisor.config import config
+
+
+def _db_label_for(db_id):
+    """Resolve a friendly display label for a target database."""
+    if not db_id:
+        return "unknown"
+    try:
+        dbs = CentralQueries.get_target_databases()
+        if not dbs.empty:
+            dbs.columns = [c.lower() for c in dbs.columns]
+            row = dbs[dbs['database_id'] == db_id]
+            if not row.empty:
+                return (row.iloc[0].get('display_name')
+                        or row.iloc[0].get('database_name')
+                        or f"db_{db_id}")
+    except Exception:
+        pass
+    return f"db_{db_id}"
+
+
+def _render_dry_run(operations_df: pd.DataFrame, db_label: str,
+                    include_indexes: bool, download_key: str,
+                    status_label: str = "Dry Run"):
+    """Render the preview DDL script from a sql_builder-shaped DataFrame."""
+    with st.spinner("Generating DDL preview..."):
+        index_map = gather_dependent_indexes(operations_df) if include_indexes else {}
+        sql_script = build_compression_script(
+            operations_df, status_label, db_label, index_map
+        )
+    st.code(sql_script, language="sql")
+    st.download_button(
+        label=f"Download Preview ({len(operations_df)} operation(s))",
+        data=sql_script,
+        file_name=f"hcc_dryrun_{db_label.replace(' ', '_').lower()}.sql",
+        mime="text/plain",
+        key=download_key,
+    )
 
 
 def show_execution_page():
@@ -86,10 +127,18 @@ def show_single_execution():
         )
 
     with col2:
+        dry_run = st.checkbox(
+            "Dry run (preview DDL only)",
+            value=True,
+            key="single_dry_run",
+            help="When enabled, shows the ALTER TABLE MOVE + dependent index "
+                 "REBUILD script without executing anything on the target."
+        )
         confirm_execution = st.checkbox(
             "Confirm Execution",
             value=False,
-            help="Confirm you want to execute this compression"
+            disabled=dry_run,
+            help="Required to run the real DDL. Ignored in dry-run mode."
         )
 
     # Display details
@@ -142,21 +191,40 @@ def show_single_execution():
     # Execute button
     st.markdown("---")
 
-    if not confirm_execution:
-        st.warning("Check 'Confirm Execution' to enable the button")
+    if not dry_run and not confirm_execution:
+        st.warning("Check 'Confirm Execution' to enable the button (or leave Dry run enabled).")
 
     col1, col2, col3 = st.columns([1, 1, 1])
 
     with col2:
+        button_label = "Preview DDL" if dry_run else "Execute Compression"
         execute_button = st.button(
-            "Execute Compression",
-            disabled=not confirm_execution,
-            use_container_width=True
+            button_label,
+            disabled=(not dry_run) and (not confirm_execution),
+            use_container_width=True,
+            type="primary" if not dry_run else "secondary",
         )
 
     if execute_button:
         if not db_id:
             st.error("Select a target database from the sidebar first.")
+        elif dry_run:
+            db_label = _db_label_for(db_id)
+            op_df = pd.DataFrame([{
+                'database_id': db_id,
+                'database_display': db_label,
+                'database_name': db_label,
+                'owner': str(owner).upper(),
+                'object_name': str(table_name).upper(),
+                'partition_name': partition_name if partition_name and pd.notna(partition_name) else None,
+                'compression_type_applied': recommended_strategy,
+                'parallel_degree': int(parallel_degree),
+                'operation_status': 'DRY_RUN',
+                'error_message': '',
+            }])
+            _render_dry_run(op_df, db_label, include_indexes=True,
+                            download_key="single_dry_run_download",
+                            status_label="Dry Run (single table)")
         else:
             with st.spinner("Executing compression..."):
                 result = TargetQueries.execute_compression(
@@ -280,45 +348,85 @@ def show_batch_execution():
             )
 
         with col3:
+            batch_dry_run = st.checkbox(
+                "Dry run (preview DDL only)",
+                value=True,
+                key="batch_dry_run",
+                help="When enabled, previews DDL for every selected table without executing."
+            )
             batch_confirm = st.checkbox(
                 "Confirm Batch Execution",
                 value=False,
-                key="batch_confirm"
+                key="batch_confirm",
+                disabled=batch_dry_run,
+                help="Required to run the real DDL. Ignored in dry-run mode."
             )
 
         # Execute batch
         col1, col2, col3 = st.columns([1, 1, 1])
 
         with col2:
-            if st.button("Execute Batch", use_container_width=True, disabled=not batch_confirm):
-                if not db_id:
-                    st.error("Select a target database from the sidebar first.")
-                else:
-                    # Build proper items list from selected recommendation IDs
-                    items = []
-                    for rec_id in selected_tables:
-                        match = df[df['recommendation_id'] == rec_id]
-                        if not match.empty:
-                            row = match.iloc[0]
-                            pn = row.get('partition_name')
-                            items.append({
-                                'owner': row['table_owner'],
-                                'table_name': row['table_name'],
-                                'compression_type': row['recommended_strategy'],
-                                'partition_name': pn if pd.notna(pn) else None
-                            })
+            batch_button_label = "Preview DDL" if batch_dry_run else "Execute Batch"
+            batch_go = st.button(
+                batch_button_label,
+                use_container_width=True,
+                disabled=(not batch_dry_run) and (not batch_confirm),
+                type="primary" if not batch_dry_run else "secondary",
+            )
 
-                    with st.spinner(f"Executing {len(items)} compressions..."):
-                        result = TargetQueries.batch_execute(
-                            db_id, items,
-                            dry_run=False,
-                            parallel_degree=batch_parallel,
-                            concurrency=batch_concurrency
-                        )
+        if batch_go:
+            if not db_id:
+                st.error("Select a target database from the sidebar first.")
+            elif batch_dry_run:
+                db_label = _db_label_for(db_id)
+                rows = []
+                for rec_id in selected_tables:
+                    match = df[df['recommendation_id'] == rec_id]
+                    if not match.empty:
+                        r = match.iloc[0]
+                        pn = r.get('partition_name')
+                        rows.append({
+                            'database_id': db_id,
+                            'database_display': db_label,
+                            'database_name': db_label,
+                            'owner': str(r['table_owner']).upper(),
+                            'object_name': str(r['table_name']).upper(),
+                            'partition_name': pn if pd.notna(pn) else None,
+                            'compression_type_applied': r['recommended_strategy'],
+                            'parallel_degree': int(batch_parallel),
+                            'operation_status': 'DRY_RUN',
+                            'error_message': '',
+                        })
+                op_df = pd.DataFrame(rows)
+                _render_dry_run(op_df, db_label, include_indexes=True,
+                                download_key="batch_dry_run_download",
+                                status_label="Dry Run (batch)")
+            else:
+                # Build proper items list from selected recommendation IDs
+                items = []
+                for rec_id in selected_tables:
+                    match = df[df['recommendation_id'] == rec_id]
+                    if not match.empty:
+                        row = match.iloc[0]
+                        pn = row.get('partition_name')
+                        items.append({
+                            'owner': row['table_owner'],
+                            'table_name': row['table_name'],
+                            'compression_type': row['recommended_strategy'],
+                            'partition_name': pn if pd.notna(pn) else None
+                        })
 
-                        if result.get('errors', 0) > 0:
-                            st.warning(f"Batch completed with {result.get('errors')} errors")
-                        st.success(f"Batch execution: {result.get('success', 0)} success, {result.get('errors', 0)} errors")
+                with st.spinner(f"Executing {len(items)} compressions..."):
+                    result = TargetQueries.batch_execute(
+                        db_id, items,
+                        dry_run=False,
+                        parallel_degree=batch_parallel,
+                        concurrency=batch_concurrency
+                    )
+
+                    if result.get('errors', 0) > 0:
+                        st.warning(f"Batch completed with {result.get('errors')} errors")
+                    st.success(f"Batch execution: {result.get('success', 0)} success, {result.get('errors', 0)} errors")
 
 
 def show_execution_monitor():
