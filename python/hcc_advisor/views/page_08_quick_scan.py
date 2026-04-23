@@ -122,6 +122,10 @@ def show_quick_scan_page():
             st.info("No running compression jobs.")
             return
 
+    # Export to SQL section (reuses the Scheduler's builder)
+    with st.expander("Export to SQL File"):
+        _render_export_section(db_id, df, max_dop)
+
     # Split into tabs by object_type + Schemas bulk tab
     tab1, tab2, tab3, tab4 = st.tabs(["Tables", "Partitions", "Subpartitions", "Schemas"])
 
@@ -133,6 +137,122 @@ def show_quick_scan_page():
         _render_scan_tab(df[df['object_type'] == 'SUBPARTITION'], 'SUBPARTITION', db_id, max_queue, max_dop, running_set)
     with tab4:
         _render_schemas_tab(db_id, max_queue, max_dop)
+
+
+def _render_export_section(db_id, df, default_dop):
+    """Export the current Quick Action analyzed set as an ALTER TABLE MOVE script.
+
+    Reuses the Scheduler's _build_sql_script / _gather_indexes by adapting the
+    Quick Action recommendation columns to the shape those helpers expect.
+    """
+    from hcc_advisor.views.page_12_scheduler import _build_sql_script, _gather_indexes
+
+    st.markdown("Export analyzed objects as a SQL script that can be executed "
+                "outside of HCC Advisor.")
+
+    if df.empty:
+        st.info("No analyzed objects to export. Run a scan first.")
+        return
+
+    # Resolve a friendly database label
+    db_label = f"db_{db_id}"
+    try:
+        dbs_df = CentralQueries.get_target_databases()
+        if not dbs_df.empty:
+            dbs_df.columns = [c.lower() for c in dbs_df.columns]
+            row = dbs_df[dbs_df['database_id'] == db_id]
+            if not row.empty:
+                db_label = row.iloc[0].get('display_name') or row.iloc[0].get('database_name') or db_label
+    except Exception:
+        pass
+
+    # Filters
+    status_map = {
+        'All': None,
+        'Pending (not yet compressed)': 'Pending',
+        'Compressed': 'Compressed',
+        'Failed': 'FAILED',
+    }
+    obj_type_map = {'All': None, 'Tables only': 'TABLE',
+                    'Partitions only': 'PARTITION', 'Subpartitions only': 'SUBPARTITION'}
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        selected_status_label = st.selectbox(
+            "Status Filter", list(status_map.keys()), key="qs_export_status"
+        )
+        status_filter = status_map[selected_status_label]
+    with col2:
+        selected_type_label = st.selectbox(
+            "Object Type", list(obj_type_map.keys()), key="qs_export_type"
+        )
+        type_filter = obj_type_map[selected_type_label]
+    with col3:
+        dop = st.number_input(
+            "Parallel Degree (DOP)", min_value=1, max_value=max(1, default_dop * 2),
+            value=default_dop, step=1, key="qs_export_dop",
+            help="DOP applied to every MOVE/REBUILD in the script"
+        )
+
+    # Apply filters
+    exp_df = df.copy()
+    if type_filter:
+        exp_df = exp_df[exp_df['object_type'] == type_filter]
+    if status_filter:
+        exp_df = exp_df[exp_df['status'].astype(str).str.upper() == status_filter.upper()]
+    # Drop NONE-advised rows — they have no valid MOVE DDL to emit
+    exp_df = exp_df[exp_df['recommended_strategy'].astype(str).str.upper() != 'NONE']
+
+    if exp_df.empty:
+        st.info("No operations match the selected filters.")
+        return
+
+    st.caption(f"**{len(exp_df)}** operations will be included in the export")
+
+    # Adapt columns to what _build_sql_script / _gather_indexes expect
+    script_df = pd.DataFrame({
+        'database_id': db_id,
+        'database_display': db_label,
+        'database_name': db_label,
+        'owner': exp_df['table_owner'].astype(str).str.upper(),
+        'object_name': exp_df['table_name'].astype(str).str.upper(),
+        'partition_name': exp_df['partition_name'] if 'partition_name' in exp_df.columns else None,
+        'compression_type_applied': exp_df['recommended_strategy'],
+        'parallel_degree': int(dop),
+        'operation_status': exp_df['status'],
+        'error_message': '',
+    })
+
+    # Preview first 10
+    preview_cols = ['owner', 'object_name', 'partition_name',
+                    'compression_type_applied', 'parallel_degree', 'operation_status']
+    st.dataframe(script_df[preview_cols].head(10), use_container_width=True, hide_index=True)
+    if len(script_df) > 10:
+        st.caption(f"Showing first 10 of {len(script_df)} rows")
+
+    include_indexes = st.checkbox(
+        "Include index rebuild statements (queries target for dependent objects)",
+        value=True, key="qs_export_include_indexes",
+        help="Adds ALTER INDEX ... REBUILD for all indexes that would become UNUSABLE after MOVE"
+    )
+
+    with st.spinner("Generating SQL script..."):
+        index_map = _gather_indexes(script_df) if include_indexes else {}
+        sql_script = _build_sql_script(
+            script_df, selected_status_label, db_label, index_map
+        )
+
+    filename = (f"hcc_quickaction_{db_label.replace(' ', '_').lower()}_"
+                f"{(status_filter or 'all').lower()}.sql")
+
+    st.download_button(
+        label=f"Download SQL Script ({len(script_df)} operations)",
+        data=sql_script,
+        file_name=filename,
+        mime="text/plain",
+        type="primary",
+        key="qs_export_download"
+    )
 
 
 def _render_scan_tab(df, obj_type, db_id, max_queue, max_dop, running_set):
