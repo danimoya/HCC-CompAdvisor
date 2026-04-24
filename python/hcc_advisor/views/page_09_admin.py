@@ -101,11 +101,15 @@ def show_sql_patches():
     st.subheader("SQL Patch Management")
     st.markdown("Apply versioned SQL patches to the central database without redeploying.")
 
-    # Find patches directory
+    # Find patches directory. Order: package layout (bundled/mounted into the
+    # container at hcc_advisor/sql/patches), dev layout (repo_root/sql/patches),
+    # then legacy absolute fallbacks.
+    here = Path(__file__).resolve()
     candidates = [
-        Path(__file__).resolve().parents[2] / 'sql' / 'patches',
-        Path(__file__).resolve().parents[3] / 'sql' / 'patches',
-        Path('/app/sql/patches'),
+        here.parent.parent / 'sql' / 'patches',   # /app/hcc_advisor/sql/patches (container bind mount)
+        here.parents[3] / 'sql' / 'patches',       # repo_root/sql/patches (dev)
+        here.parents[2] / 'sql' / 'patches',       # legacy dev fallback
+        Path('/app/sql/patches'),                   # legacy container fallback
     ]
     patches_dir = None
     for c in candidates:
