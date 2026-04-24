@@ -181,6 +181,8 @@ services:
       - streamlit-logs:/app/logs
       # Central schema SQL files for deployment wizard
       - ../sql/central:/app/hcc_advisor/sql/central:ro
+      # Versioned SQL patches for Admin → SQL Patches tab
+      - ../sql/patches:/app/hcc_advisor/sql/patches:ro
 
     # Depends on Central Database
     depends_on:

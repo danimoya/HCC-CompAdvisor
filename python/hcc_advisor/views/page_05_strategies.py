@@ -714,10 +714,20 @@ def show_sql_patches():
     st.subheader("SQL Patch Management")
     st.markdown("Apply versioned SQL patches to the central database without redeploying.")
 
-    patches_dir = Path(__file__).resolve().parents[2] / 'sql' / 'patches'
+    # Resolve patches location: mirror the logic used for sql/central in
+    # page_00_setup.py (package layout first, repo/dev layout second).
+    here = Path(__file__).resolve()
+    candidates = [
+        here.parent.parent / 'sql' / 'patches',        # /app/hcc_advisor/sql/patches (container bind mount)
+        here.parents[3] / 'sql' / 'patches',            # repo_root/sql/patches (dev)
+    ]
+    patches_dir = next((c for c in candidates if c.exists()), candidates[0])
 
     if not patches_dir.exists():
-        st.info(f"No patches directory found at `sql/patches/`.")
+        st.info(
+            "Patches directory not found. Expected at `sql/patches/` "
+            "(bundled with the package) or at repo-root `sql/patches/` in dev."
+        )
         return
 
     # Scan for patch directories (YYYYMMDD-description)
