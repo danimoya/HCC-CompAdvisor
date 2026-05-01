@@ -3,7 +3,7 @@
 --------------------------------------------------------------------------------
 -- Description: Master installation script for HCC Compression Advisor
 -- Version:     1.0.0
--- Author:      Daniel Moya (copyright), GitHub: github.com/danimoya Website: danielmoya.cv
+-- Author:      Daniel Moya (copyright), GitHub: github.com/danimoya Website: danimoya.com
 --
 -- Prerequisites:
 --   - Oracle Database 19c or later

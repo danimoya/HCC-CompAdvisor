@@ -1,7 +1,7 @@
 -- ============================================================================
 -- Script: 01-create-user.sql
 -- Description: Create dedicated user for HCC Compression Advisor
--- Author: Daniel Moya (copyright), GitHub: github.com/danimoya Website: danielmoya.cv
+-- Author: Daniel Moya (copyright), GitHub: github.com/danimoya Website: danimoya.com
 -- Database: Oracle 23c Free Edition
 -- ============================================================================
 

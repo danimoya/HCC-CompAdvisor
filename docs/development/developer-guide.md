@@ -809,4 +809,4 @@ elif page == "Custom Analysis":
 **Last Updated**: 2025-01-13
 **Author**: Daniel Moya (copyright)
 **GitHub**: [github.com/danimoya](https://github.com/danimoya)
-**Website**: [danielmoya.cv](https://danielmoya.cv)
+**Website**: [danimoya.com](https://danimoya.com)

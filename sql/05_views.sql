@@ -3,7 +3,7 @@
 -- ============================================================================
 -- Purpose: Comprehensive views for analyzing compression recommendations,
 --          monitoring execution status, and tracking space savings
--- Author: Daniel Moya (copyright), GitHub: github.com/danimoya Website: danielmoya.cv
+-- Author: Daniel Moya (copyright), GitHub: github.com/danimoya Website: danimoya.com
 -- Version: 1.0.0
 -- ============================================================================
 

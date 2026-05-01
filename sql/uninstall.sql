@@ -3,7 +3,7 @@
 --------------------------------------------------------------------------------
 -- Description: Removes all HCC Compression Advisor objects
 -- Version:     1.0.0
--- Author:      Daniel Moya (copyright), GitHub: github.com/danimoya Website: danielmoya.cv
+-- Author:      Daniel Moya (copyright), GitHub: github.com/danimoya Website: danimoya.com
 --
 -- WARNING:     This script will DROP all HCC Compression Advisor objects
 --              including tables, packages, views, and sequences.

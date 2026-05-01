@@ -223,7 +223,7 @@ networks:
         - subnet: 172.28.0.0/16
 
   # Pre-existing bridge on the host that NPM (nginx-proxy-manager) is on.
-  # Streamlit must be attached so the public host hcc.danielmoya.cv resolves.
+  # Streamlit must be attached so the public host hcc.danimoya.com resolves.
   # Marked external so `docker compose up` joins it without trying to manage it.
   management-network:
     external: true

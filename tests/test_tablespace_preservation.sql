@@ -1,7 +1,7 @@
 --------------------------------------------------------------------------------
 -- Test Script: Tablespace Preservation During Compression
 -- Purpose: Verify that all compression operations preserve original tablespace
--- Author: Daniel Moya (copyright), GitHub: github.com/danimoya Website: danielmoya.cv
+-- Author: Daniel Moya (copyright), GitHub: github.com/danimoya Website: danimoya.com
 -- Date: 2025-11-13
 --------------------------------------------------------------------------------
 

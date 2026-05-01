@@ -2,7 +2,7 @@
 # ============================================================================
 # Script: 04-run-installation.sh
 # Description: Run complete HCC Compression Advisor CENTRAL database installation
-# Author: Daniel Moya (copyright), GitHub: github.com/danimoya Website: danielmoya.cv
+# Author: Daniel Moya (copyright), GitHub: github.com/danimoya Website: danimoya.com
 # Database: Oracle 23c Free Edition (Central Metadata Server)
 #
 # NOTE: This installs the CENTRAL database which stores metadata, analysis

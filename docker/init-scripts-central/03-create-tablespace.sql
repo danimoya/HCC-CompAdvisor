@@ -1,7 +1,7 @@
 -- ============================================================================
 -- Script: 03-create-tablespace.sql
 -- Description: Create SCRATCH tablespace for central metadata storage
--- Author: Daniel Moya (copyright), GitHub: github.com/danimoya Website: danielmoya.cv
+-- Author: Daniel Moya (copyright), GitHub: github.com/danimoya Website: danimoya.com
 -- Database: Oracle 23c Free Edition (Central Metadata Server)
 --
 -- NOTE: Smaller sizes than the target DB version because the central DB

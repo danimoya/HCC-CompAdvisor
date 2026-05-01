@@ -300,7 +300,7 @@ This is a unified implementation merging best practices from multiple sources:
 Copyright © 2025 Daniel Moya. All rights reserved.
 Author: Daniel Moya
 GitHub: [github.com/danimoya](https://github.com/danimoya)
-Website: [danielmoya.cv](https://danielmoya.cv)
+Website: [danimoya.com](https://danimoya.com)
 
 ## 🆘 Support
 

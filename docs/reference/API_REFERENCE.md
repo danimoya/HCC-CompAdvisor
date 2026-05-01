@@ -1220,7 +1220,7 @@ Currently, no rate limits are enforced. For production environments, consider im
 Copyright (c) 2025 Daniel Moya. All rights reserved.
 Author: Daniel Moya
 GitHub: [github.com/danimoya](https://github.com/danimoya)
-Website: [danielmoya.cv](https://danielmoya.cv)
+Website: [danimoya.com](https://danimoya.com)
 
 This API is provided as-is without warranties. Use at your own risk in production environments.
 

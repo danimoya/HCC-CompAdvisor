@@ -1,7 +1,7 @@
 --------------------------------------------------------------------------------
 -- Package: PKG_COMPRESSION_EXECUTOR
 -- Purpose: Execute compression operations with safety checks and logging
--- Author: Daniel Moya (copyright), GitHub: github.com/danimoya Website: danielmoya.cv
+-- Author: Daniel Moya (copyright), GitHub: github.com/danimoya Website: danimoya.com
 -- Date: 2025-11-13
 --
 -- COMPRESSION TYPE SUPPORT:

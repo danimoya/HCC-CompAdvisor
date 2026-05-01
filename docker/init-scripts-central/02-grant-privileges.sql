@@ -1,7 +1,7 @@
 -- ============================================================================
 -- Script: 02-grant-privileges.sql
 -- Description: Grant REDUCED privileges to COMPRESSION_MGR user (Central DB)
--- Author: Daniel Moya (copyright), GitHub: github.com/danimoya Website: danielmoya.cv
+-- Author: Daniel Moya (copyright), GitHub: github.com/danimoya Website: danimoya.com
 -- Database: Oracle 23c Free Edition (Central Metadata Server)
 --
 -- NOTE: This is the CENTRAL database that stores metadata and results.

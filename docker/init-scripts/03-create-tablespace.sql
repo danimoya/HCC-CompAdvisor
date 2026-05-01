@@ -1,7 +1,7 @@
 -- ============================================================================
 -- Script: 03-create-tablespace.sql
 -- Description: Create SCRATCH tablespace for compression analysis
--- Author: Daniel Moya (copyright), GitHub: github.com/danimoya Website: danielmoya.cv
+-- Author: Daniel Moya (copyright), GitHub: github.com/danimoya Website: danimoya.com
 -- Database: Oracle 23c Free Edition
 -- ============================================================================
 
