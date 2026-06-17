@@ -238,7 +238,32 @@ def show_analysis_config():
     st.markdown("---")
     st.subheader("Top Compression Candidates")
 
-    recommendations_df = CentralQueries.get_recommendations(limit=10, min_savings_pct=10.0, database_id=db_id)
+    max_hotness = st.slider(
+        "Hotness score filter (show candidates at or below)",
+        min_value=0, max_value=100, value=100, step=5,
+        key="analysis_hotness_filter",
+        help="Restrict candidates to those with a hotness score at or below this "
+             "threshold. Lower it to focus on the coldest, safest-to-compress objects."
+    )
+    with st.expander("What is the hotness score?", expanded=False):
+        st.markdown(
+            "The **hotness score (0–100)** rates how much recent DML/access activity "
+            "an object sees — higher means hotter (more writes/reads).\n\n"
+            "- **0–29 · COLD / COOL** — little write activity. *Ideal* for aggressive "
+            "HCC (`QUERY HIGH` / `ARCHIVE`); recompression cost is rarely paid back on hot data.\n"
+            "- **30–69 · WARM** — balanced read/write. Most methods are fine; `QUERY LOW` "
+            "or `OLTP` are typical.\n"
+            "- **70–100 · HOT** — frequent DML. Aggressive HCC risks row migration and "
+            "decompress-on-update overhead — prefer `OLTP`, or leave uncompressed.\n\n"
+            "Slide the threshold **down** to surface only the colder candidates where "
+            "aggressive compression is safest."
+        )
+
+    # 100 means "no filter" (every score is <= 100); pass None to skip the clause.
+    hotness_param = None if max_hotness >= 100 else float(max_hotness)
+    recommendations_df = CentralQueries.get_recommendations(
+        limit=10, min_savings_pct=10.0, database_id=db_id, max_hotness=hotness_param
+    )
 
     if not recommendations_df.empty:
         # Normalize column names to lowercase

@@ -5,11 +5,48 @@ Handles analysis execution, compression execution, schema discovery,
 table introspection, and session monitoring on target instances.
 """
 
+import re
 import pandas as pd
 import streamlit as st
 from typing import Optional, Dict, Any, List
 from hcc_advisor.utils.target_connector import TargetConnector
 from hcc_advisor.utils.logger import log_error, log_info, log_debug, log_warning
+
+
+# SECURITY (CWE-89): Oracle DDL is built by interpolating identifiers into
+# EXECUTE IMMEDIATE. Identifiers (owner/table/partition/index) come from target-DB
+# metadata or strategy config and were never validated, allowing second-order
+# PL/SQL injection (e.g. a table named to break out of the q'[...]' literal).
+# Enforce a strict unquoted-identifier shape before any interpolation.
+_ORACLE_IDENTIFIER_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_$#]{0,127}$')
+
+
+def _validate_identifier(value: str, kind: str = "identifier") -> str:
+    """Validate an Oracle identifier (schema/table/partition/index name).
+
+    Accepts only the standard unquoted-identifier shape: starts with a letter,
+    followed by letters/digits/_/$/# (max 128 chars). Rejects whitespace, quotes,
+    dots, brackets and anything else that could break out of the DDL/q'[...]'
+    literal. Raises ValueError on anything unsafe.
+    """
+    if value is None or not isinstance(value, str) or not _ORACLE_IDENTIFIER_RE.match(value):
+        raise ValueError(f"Invalid Oracle {kind}: {value!r}")
+    return value
+
+
+def _acting_user() -> str:
+    """Return the authenticated session role/user for audit trails (executed_by).
+
+    Falls back to 'HCC_ADVISOR' when there is no Streamlit session (e.g. CLI /
+    scheduled runs) so the column is never empty and history stays attributable.
+    """
+    try:
+        user = st.session_state.get('username')
+        if user:
+            return str(user)[:128]
+    except Exception:
+        pass
+    return 'HCC_ADVISOR'
 
 
 def _safe_int(val) -> int:
@@ -28,6 +65,48 @@ def _safe_float(val) -> float:
     if isinstance(val, float) and pd.isna(val):
         return 0.0
     return float(val)
+
+
+# Compression types accepted by TargetQueries.generate_ddl (kept in sync with the
+# compression_clause_map inside that method). The Scheduler CSV import uses this
+# to reject manifest rows whose compression would otherwise raise ValueError deep
+# in the drain/submit path and crash the page.
+SUPPORTED_COMPRESSION_TYPES = frozenset({
+    'NONE', 'BASIC', 'OLTP', 'ADV_LOW', 'ADV_HIGH',
+    'QUERY LOW', 'QUERY HIGH', 'ARCHIVE LOW', 'ARCHIVE HIGH',
+    'QUERY_LOW', 'QUERY_HIGH', 'ARCHIVE_LOW', 'ARCHIVE_HIGH',
+})
+
+
+def is_supported_compression_type(value) -> bool:
+    """True if value maps to a compression clause generate_ddl can emit."""
+    return bool(value) and str(value).strip().upper() in SUPPORTED_COMPRESSION_TYPES
+
+
+# Canonical compression label for "is this object already at the target?"
+# comparisons. Oracle's data dictionary reports OLTP / Advanced Row compression
+# as compress_for='ADVANCED', and the 23c-Free ADV_LOW/ADV_HIGH aliases also
+# resolve to OLTP — so all of these must compare EQUAL to a planned 'OLTP',
+# otherwise an already-compressed table is needlessly re-queued for an expensive
+# MOVE.
+_COMPRESSION_CANON = {
+    'ADVANCED': 'OLTP', 'OLTP': 'OLTP', 'ADV_LOW': 'OLTP', 'ADV_HIGH': 'OLTP',
+    'BASIC': 'BASIC',
+    'QUERY LOW': 'QUERY LOW', 'QUERY_LOW': 'QUERY LOW',
+    'QUERY HIGH': 'QUERY HIGH', 'QUERY_HIGH': 'QUERY HIGH',
+    'ARCHIVE LOW': 'ARCHIVE LOW', 'ARCHIVE_LOW': 'ARCHIVE LOW',
+    'ARCHIVE HIGH': 'ARCHIVE HIGH', 'ARCHIVE_HIGH': 'ARCHIVE HIGH',
+    'NONE': 'NONE', 'NOCOMPRESS': 'NONE', 'DISABLED': 'NONE', '': 'NONE',
+}
+
+
+def canonical_compression(value) -> str:
+    """Normalize a planned strategy or an Oracle compress_for value to a single
+    canonical label so equivalent encodings (e.g. OLTP == ADVANCED) compare equal."""
+    if value is None:
+        return 'NONE'
+    key = str(value).strip().upper()
+    return _COMPRESSION_CANON.get(key, key)
 
 
 class TargetQueries:
@@ -1335,7 +1414,7 @@ class TargetQueries:
             'original_size_bytes': orig_size,
             'operation_status': 'IN_PROGRESS',
             'start_time': start_dt,
-            'executed_by': 'HCC_ADVISOR',
+            'executed_by': _acting_user(),
         }
         CentralQueries.store_compression_history(database_id, history_record)
 
@@ -1361,13 +1440,25 @@ class TargetQueries:
                     idx_df = TargetConnector.execute_query(database_id, idx_q, idx_params)
                     if not idx_df.empty:
                         it0 = _time.perf_counter()
+                        # parallel_degree is interpolated below; ensure it is a
+                        # bounded integer (defends the index-rebuild DDL too).
+                        try:
+                            _pd = int(parallel_degree)
+                        except (TypeError, ValueError):
+                            _pd = 4
+                        _pd = min(max(_pd, 1), 128)
                         for _, idx_row in idx_df.iterrows():
                             idx_owner = idx_row['OWNER']
                             idx_name = idx_row['INDEX_NAME']
                             try:
+                                # SECURITY (CWE-89): validate index identifiers
+                                # (second-order — they come from all_indexes) before
+                                # interpolating them into EXECUTE IMMEDIATE.
+                                _io = _validate_identifier(idx_owner, "index owner")
+                                _in = _validate_identifier(idx_name, "index name")
                                 TargetConnector.execute_plsql(
                                     database_id,
-                                    f"BEGIN EXECUTE IMMEDIATE 'ALTER INDEX {idx_owner}.{idx_name} REBUILD ONLINE PARALLEL {parallel_degree}'; END;"
+                                    f"BEGIN EXECUTE IMMEDIATE 'ALTER INDEX {_io}.{_in} REBUILD ONLINE PARALLEL {_pd}'; END;"
                                 )
                                 idx_rebuilt += 1
                             except Exception:
@@ -1568,10 +1659,27 @@ class TargetQueries:
             'ARCHIVE_HIGH': 'COMPRESS FOR ARCHIVE HIGH',
         }
 
-        compression_clause = compression_clause_map.get(
-            compression_type.upper() if compression_type else 'BASIC',
-            f'COMPRESS FOR {compression_type}'
-        )
+        # SECURITY (CWE-89): strict allowlist for the compression clause — never
+        # interpolate an unmapped compression_type verbatim into the DDL.
+        key = compression_type.upper() if compression_type else 'BASIC'
+        if key not in compression_clause_map:
+            raise ValueError(f"Unsupported compression_type: {compression_type!r}")
+        compression_clause = compression_clause_map[key]
+
+        # SECURITY (CWE-89): validate every identifier and coerce the parallel
+        # degree to a bounded integer before building the DDL.
+        owner = _validate_identifier(owner, "owner")
+        table_name = _validate_identifier(table_name, "table name")
+        if partition_name is not None:
+            partition_name = _validate_identifier(partition_name, "partition name")
+        if subpartition_name is not None:
+            subpartition_name = _validate_identifier(subpartition_name, "subpartition name")
+        try:
+            parallel_degree = int(parallel_degree)
+        except (TypeError, ValueError):
+            raise ValueError(f"Invalid parallel_degree: {parallel_degree!r}")
+        if not 1 <= parallel_degree <= 128:
+            raise ValueError(f"parallel_degree out of range (1-128): {parallel_degree}")
 
         if subpartition_name:
             ddl = f"""ALTER TABLE {owner}.{table_name}
@@ -2655,6 +2763,150 @@ ONLINE PARALLEL {parallel_degree};"""
 
         return results
 
+    @staticmethod
+    def check_objects_existence(database_id: int, objects: List[Dict]) -> List[Dict]:
+        """Verify a list of objects against a target database and report their
+        current compression.
+
+        Used by the Scheduler CSV import: a compression plan exported from one
+        database can be re-applied to another, but only after confirming each
+        object actually exists there and learning its current compress_for.
+
+        Args:
+            database_id: target database to check against
+            objects: list of dicts, each with at least ``owner`` and
+                ``object_name`` (``table_name`` accepted), optionally
+                ``partition_name`` / ``subpartition_name``.
+
+        Returns:
+            A list aligned with ``objects``; each item is
+                {exists, object_level, current_compression, current_compress_for}
+
+        IN-lists are chunked to stay under Oracle's 1000-expression limit
+        (ORA-01795). Identifiers from the (user-supplied) manifest are validated
+        before interpolation (CWE-89).
+        """
+        from hcc_advisor.utils.sql_builder import (
+            chunk_list, _sql_quote, _is_valid_identifier,
+        )
+
+        def _norm(v):
+            if v is None:
+                return None
+            s = str(v).strip()
+            return s if s and s.lower() not in ('none', 'nan') else None
+
+        norm_objs = []  # one (level, lookup_key_or_None) per input object, in order
+        table_keys = set()
+        part_keys = set()
+        subpart_keys = set()
+        for o in objects:
+            owner = _norm(o.get('owner'))
+            name = _norm(o.get('object_name') or o.get('table_name'))
+            part = _norm(o.get('partition_name'))
+            sub = _norm(o.get('subpartition_name'))
+            if not (owner and name and _is_valid_identifier(owner) and _is_valid_identifier(name)):
+                norm_objs.append(('TABLE', None))
+                continue
+            table_keys.add((owner, name))
+            # Resolve the lookup level ONCE here so the result pass below cannot
+            # drift from it. A present-but-invalid partition/subpartition name
+            # falls back to the table-level lookup rather than a phantom miss.
+            if sub and _is_valid_identifier(sub):
+                subpart_keys.add((owner, name, sub))
+                norm_objs.append(('SUBPARTITION', (owner, name, sub)))
+            elif part and _is_valid_identifier(part):
+                part_keys.add((owner, name, part))
+                norm_objs.append(('PARTITION', (owner, name, part)))
+            else:
+                norm_objs.append(('TABLE', (owner, name)))
+
+        # --- table level ---
+        tables_map = {}
+        if table_keys:
+            owners = {o for o, _ in table_keys}
+            tables = {t for _, t in table_keys}
+            for o_chunk in chunk_list(list(owners)):
+                if not o_chunk:
+                    continue
+                oc = ",".join(_sql_quote(o) for o in o_chunk)
+                for t_chunk in chunk_list(list(tables)):
+                    if not t_chunk:
+                        continue
+                    tc = ",".join(_sql_quote(t) for t in t_chunk)
+                    q = f"""SELECT owner, table_name, compression, compress_for
+                            FROM all_tables
+                            WHERE owner IN ({oc}) AND table_name IN ({tc})"""
+                    d = TargetConnector.execute_query(database_id, q)
+                    if d.empty:
+                        continue
+                    d.columns = [c.lower() for c in d.columns]
+                    for _, r in d.iterrows():
+                        tables_map[(r['owner'], r['table_name'])] = (
+                            r.get('compression'), r.get('compress_for'))
+
+        # --- partition level ---
+        parts_map = {}
+        if part_keys:
+            owners = {o for o, _, _ in part_keys}
+            tables = {t for _, t, _ in part_keys}
+            for o_chunk in chunk_list(list(owners)):
+                if not o_chunk:
+                    continue
+                oc = ",".join(_sql_quote(o) for o in o_chunk)
+                for t_chunk in chunk_list(list(tables)):
+                    if not t_chunk:
+                        continue
+                    tc = ",".join(_sql_quote(t) for t in t_chunk)
+                    q = f"""SELECT table_owner, table_name, partition_name,
+                                   compression, compress_for
+                            FROM dba_tab_partitions
+                            WHERE table_owner IN ({oc}) AND table_name IN ({tc})"""
+                    d = TargetConnector.execute_query(database_id, q)
+                    if d.empty:
+                        continue
+                    d.columns = [c.lower() for c in d.columns]
+                    for _, r in d.iterrows():
+                        parts_map[(r['table_owner'], r['table_name'], r['partition_name'])] = (
+                            r.get('compression'), r.get('compress_for'))
+
+        # --- subpartition level ---
+        subparts_map = {}
+        if subpart_keys:
+            owners = {o for o, _, _ in subpart_keys}
+            tables = {t for _, t, _ in subpart_keys}
+            for o_chunk in chunk_list(list(owners)):
+                if not o_chunk:
+                    continue
+                oc = ",".join(_sql_quote(o) for o in o_chunk)
+                for t_chunk in chunk_list(list(tables)):
+                    if not t_chunk:
+                        continue
+                    tc = ",".join(_sql_quote(t) for t in t_chunk)
+                    q = f"""SELECT table_owner, table_name, subpartition_name,
+                                   compression, compress_for
+                            FROM dba_tab_subpartitions
+                            WHERE table_owner IN ({oc}) AND table_name IN ({tc})"""
+                    d = TargetConnector.execute_query(database_id, q)
+                    if d.empty:
+                        continue
+                    d.columns = [c.lower() for c in d.columns]
+                    for _, r in d.iterrows():
+                        subparts_map[(r['table_owner'], r['table_name'], r['subpartition_name'])] = (
+                            r.get('compression'), r.get('compress_for'))
+
+        level_maps = {'TABLE': tables_map, 'PARTITION': parts_map, 'SUBPARTITION': subparts_map}
+        results = []
+        for level, key in norm_objs:
+            hit = level_maps[level].get(key) if key is not None else None
+            results.append({
+                'exists': hit is not None,
+                'object_level': level,
+                'current_compression': (hit[0] if hit else None),
+                'current_compress_for': (hit[1] if hit else None),
+            })
+        return results
+
     # ============================================================================
     # DBMS_SCHEDULER JOB SUBMISSION
     # ============================================================================
@@ -2752,7 +3004,7 @@ ONLINE PARALLEL {parallel_degree};"""
                 'execution_mode': 'ONLINE', 'parallel_degree': parallel_degree,
                 'original_size_bytes': orig_size,
                 'operation_status': 'IN_PROGRESS',
-                'start_time': datetime.now(), 'executed_by': 'HCC_ADVISOR',
+                'start_time': datetime.now(), 'executed_by': _acting_user(),
             })
 
             return {'success': True, 'job_name': job_name}

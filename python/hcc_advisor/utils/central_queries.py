@@ -16,6 +16,42 @@ from hcc_advisor.utils.central_connector import CentralConnector
 from hcc_advisor.utils.logger import log_error, log_info, log_debug, log_warning
 
 
+# Target-database registry changes rarely but is read on every Streamlit rerun
+# (sidebar selector, label lookups). Cache the query for a short TTL so widget
+# interactions don't round-trip Oracle each time. Writes call
+# CentralQueries.invalidate_target_databases_cache() to drop stale entries.
+_TARGET_DATABASES_TTL_SECONDS = 20
+
+
+@st.cache_data(ttl=_TARGET_DATABASES_TTL_SECONDS, show_spinner=False)
+def _cached_target_databases() -> pd.DataFrame:
+    """Cached read of the active target-database registry (see TTL above)."""
+    query = """
+        SELECT
+            database_id,
+            database_name,
+            display_name,
+            db_host,
+            port,
+            service_name,
+            username,
+            password_encrypted,
+            description,
+            environment,
+            platform_type,
+            is_active,
+            last_connected,
+            last_analysis_date,
+            oracle_version,
+            created_date,
+            created_by
+        FROM t_target_databases
+        WHERE is_active = 'Y'
+        ORDER BY display_name
+    """
+    return CentralConnector.execute_query(query)
+
+
 class CentralQueries:
     """Data access layer for centralized compression analysis operations"""
 
@@ -646,7 +682,8 @@ class CentralQueries:
         limit: Optional[int] = 100,
         database_id: Optional[int] = None,
         show_executed: bool = True,
-        include_none: bool = False
+        include_none: bool = False,
+        max_hotness: Optional[float] = None
     ) -> pd.DataFrame:
         """
         Get compression recommendations from T_COMPRESSION_ANALYSIS with execution status.
@@ -661,6 +698,8 @@ class CentralQueries:
             show_executed: If False, hide objects already compressed successfully
             include_none: If True, also include objects whose advised compression is NONE
                 (very hot tables from hotness-only scans). Default False for backward compat.
+            max_hotness: If set, only return objects whose hotness_score is <= this
+                value (NULL scores treated as 0/cold). None = no hotness filter.
 
         Returns:
             DataFrame with recommendations including execution_status column
@@ -726,6 +765,7 @@ class CentralQueries:
               {none_filter}
               AND NVL(a.projected_savings_pct, 0) >= :min_savings_pct
               AND NVL(a.size_mb, 0) >= :min_size_mb
+              AND (:max_hotness IS NULL OR NVL(a.hotness_score, 0) <= :max_hotness)
               AND (:schema IS NULL OR a.owner = :schema)
               AND (:strategy IS NULL OR a.advisable_compression = :strategy)
               {db_filter}
@@ -740,6 +780,7 @@ class CentralQueries:
             'strategy': strategy,
             'min_savings_pct': min_savings_pct,
             'min_size_mb': min_size_mb,
+            'max_hotness': max_hotness,
         }
         if limit is not None:
             params['limit'] = limit
@@ -1849,41 +1890,30 @@ class CentralQueries:
     @staticmethod
     def get_target_databases() -> pd.DataFrame:
         """
-        Get all active target databases
+        Get all active target databases (cached for a short TTL — see
+        _cached_target_databases / invalidate_target_databases_cache).
 
         Returns:
             DataFrame with target database information
         """
-        query = """
-            SELECT
-                database_id,
-                database_name,
-                display_name,
-                db_host,
-                port,
-                service_name,
-                username,
-                password_encrypted,
-                description,
-                environment,
-                platform_type,
-                is_active,
-                last_connected,
-                last_analysis_date,
-                oracle_version,
-                created_date,
-                created_by
-            FROM t_target_databases
-            WHERE is_active = 'Y'
-            ORDER BY display_name
-        """
-
         try:
-            return CentralConnector.execute_query(query)
+            df = _cached_target_databases()
+            # Return a copy so callers that mutate columns (e.g. lower-casing in
+            # place) don't corrupt the cached object.
+            return df.copy() if df is not None else pd.DataFrame()
         except Exception as e:
             log_error(e, "get_target_databases")
             st.error(f"Failed to get target databases: {e}")
             return pd.DataFrame()
+
+    @staticmethod
+    def invalidate_target_databases_cache() -> None:
+        """Drop the cached target-database registry. Call after any write
+        (register/delete/update) so the next read reflects the change."""
+        try:
+            _cached_target_databases.clear()
+        except Exception:
+            pass
 
     @staticmethod
     def get_target_database(database_id: int) -> Dict[str, Any]:
@@ -1911,13 +1941,20 @@ class CentralQueries:
                     row['host'] = row['db_host']
                 if 'service_name' in row:
                     row['service'] = row['service_name']
-                # Decrypt password for target connector
+                # Decrypt password for target connector.
+                # Fail closed: on decrypt failure do NOT fall back to passing the
+                # ciphertext as the password (it would never authenticate and could
+                # surface stored ciphertext); leave password unset and log instead.
+                # Logging the failure also makes a bad/rotated ENCRYPTION_KEY
+                # diagnosable instead of silently presenting as an auth failure.
                 if 'password_encrypted' in row and row['password_encrypted']:
                     try:
                         from hcc_advisor.views.page_06_connections import decrypt_password
                         row['password'] = decrypt_password(row['password_encrypted'])
-                    except Exception:
-                        row['password'] = row['password_encrypted']
+                    except Exception as exc:
+                        log_error(exc, "get_target_database.decrypt",
+                                  {'database_id': database_id})
+                        row['password'] = None
                 return row
         except Exception as e:
             log_error(e, "get_target_database", {'database_id': database_id})
@@ -1968,8 +2005,11 @@ class CentralQueries:
                     f"Edit or delete it from the Databases tab instead of re-adding.",
                     existing_id
                 )
-        except Exception:
-            pass  # fall through to insert and let the DB enforce uniqueness
+        except Exception as e:
+            # Pre-check failed; the DB UNIQUE constraint is the authoritative
+            # guard, so fall through to the insert. Log at debug so the skipped
+            # pre-check is traceable without alarming on the expected race path.
+            log_debug(f"add_target_database: duplicate pre-check skipped: {e}")
 
         try:
             rows_affected = CentralConnector.execute_dml(insert_query, db_data)
@@ -1983,6 +2023,7 @@ class CentralQueries:
                 df = CentralConnector.execute_query(id_query, {'database_name': db_name})
                 new_id = int(df.iloc[0]['DATABASE_ID']) if not df.empty else None
                 log_info(f"Target database registered: {db_name} (ID: {new_id})")
+                CentralQueries.invalidate_target_databases_cache()
                 return True, "Target database registered successfully", new_id
             return False, "Failed to register target database", None
         except Exception as e:
@@ -2045,6 +2086,7 @@ class CentralQueries:
             rows_affected = CentralConnector.execute_dml(query, params)
             if rows_affected:
                 log_info(f"Target database updated: ID {database_id}")
+                CentralQueries.invalidate_target_databases_cache()
                 return True, "Target database updated successfully"
             return False, "Failed to update target database"
         except Exception as e:
@@ -2072,6 +2114,7 @@ class CentralQueries:
             rows_affected = CentralConnector.execute_dml(query, {'database_id': database_id})
             if rows_affected:
                 log_info(f"Target database deactivated: ID {database_id}")
+                CentralQueries.invalidate_target_databases_cache()
                 return True, "Target database deactivated successfully"
             return False, "Failed to deactivate target database"
         except Exception as e:

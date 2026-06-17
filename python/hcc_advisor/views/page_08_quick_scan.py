@@ -489,14 +489,24 @@ def _bulk_submit(candidates, db_id, max_queue, default_dop):
             else:
                 overflow.append(item)
 
-    # Store overflow in session_state + persist to central DB
-    if 'scheduler_pending_queue' not in st.session_state:
-        st.session_state.scheduler_pending_queue = []
-    st.session_state.scheduler_pending_queue.extend(overflow)
-
-    # Persist queue to t_compression_history (survives app restart)
-    from hcc_advisor.views.page_12_scheduler import _save_persistent_queue
-    _save_persistent_queue(st.session_state.scheduler_pending_queue)
+    # Persist overflow by MERGING into the full cross-database queue. Reload the
+    # complete persisted set first so the global delete-then-reinsert in
+    # _save_persistent_queue can't drop other databases' QUEUED rows that were
+    # never loaded into this session.
+    from hcc_advisor.views.page_12_scheduler import (
+        _save_persistent_queue, _load_persistent_queue,
+    )
+    full_queue = _load_persistent_queue(None)
+    seen = {(q['database_id'], q['owner'], q['table_name'], q.get('partition_name'))
+            for q in full_queue}
+    for item in overflow:
+        k = (item.get('database_id', db_id), item['owner'], item['table_name'],
+             item.get('partition_name'))
+        if k not in seen:
+            full_queue.append(item)
+            seen.add(k)
+    st.session_state.scheduler_pending_queue = full_queue
+    _save_persistent_queue(full_queue)
 
     return {'submitted': submitted, 'queued': len(overflow), 'failed': failed}
 
