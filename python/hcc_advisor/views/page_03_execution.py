@@ -3,6 +3,7 @@ Execution Page - HCC Compression Advisor
 Execute compression recommendations
 """
 
+import html
 import streamlit as st
 import pandas as pd
 import time
@@ -13,6 +14,7 @@ from hcc_advisor.utils.sql_builder import (
     gather_dependent_indexes,
 )
 from hcc_advisor.config import config
+from hcc_advisor.auth import AuthManager, ROLE_OPERATOR
 
 
 def _db_label_for(db_id):
@@ -62,11 +64,21 @@ def show_execution_page():
     # Execution mode selector
     tab1, tab2, tab3 = st.tabs(["Single Table", "Batch Execution", "Monitor Progress"])
 
+    # Running compression DDL on a target requires the operator role (or admin);
+    # viewers may still watch progress on the Monitor tab.
+    can_execute = AuthManager.has_role(ROLE_OPERATOR)
+
     with tab1:
-        show_single_execution()
+        if can_execute:
+            show_single_execution()
+        else:
+            st.error("Executing compression requires the operator role.")
 
     with tab2:
-        show_batch_execution()
+        if can_execute:
+            show_batch_execution()
+        else:
+            st.error("Executing compression requires the operator role.")
 
     with tab3:
         show_execution_monitor()
@@ -160,7 +172,7 @@ def show_single_execution():
             <h4>Current State</h4>
             <strong>Size:</strong> {current_size:.2f} MB<br>
             <strong>Rows:</strong> {int(estimated_rows):,}<br>
-            <strong>Compression:</strong> {current_compression}
+            <strong>Compression:</strong> {html.escape(str(current_compression))}
         </div>
         """, unsafe_allow_html=True)
 
@@ -168,7 +180,7 @@ def show_single_execution():
         st.markdown(f"""
         <div class="metric-card success-card">
             <h4>After Compression</h4>
-            <strong>Strategy:</strong> {recommended_strategy}<br>
+            <strong>Strategy:</strong> {html.escape(str(recommended_strategy))}<br>
             <strong>Estimated Size:</strong> {estimated_size:.2f} MB<br>
             <strong>Savings:</strong> {savings_pct:.1f}% ({compression_ratio:.2f}x)
         </div>

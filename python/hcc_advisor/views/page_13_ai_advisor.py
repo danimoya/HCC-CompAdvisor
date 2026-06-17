@@ -27,6 +27,22 @@ def show_ai_advisor_page():
         st.warning("Configure Ollama URL in **Admin → AI / Ollama** tab first.")
         return
 
+    # SSRF guard: the Ollama URL is admin-configurable and every helper below
+    # issues server-side requests to it. Validate once here so a disallowed host
+    # (internal services, cloud metadata, loopback admin ports) is blocked before
+    # any request is made. Set OLLAMA_HOST_ALLOWLIST / SSRF_ALLOW_PRIVATE to
+    # permit a legitimate (e.g. localhost) Ollama endpoint.
+    from hcc_advisor.utils.url_guard import validate_outbound_url, UrlNotAllowed
+    try:
+        validate_outbound_url(ollama_url, 'ollama')
+    except UrlNotAllowed as ue:
+        st.error(
+            f"Ollama URL rejected by SSRF guard: {ue}. "
+            f"Configure OLLAMA_HOST_ALLOWLIST (and SSRF_ALLOW_PRIVATE for "
+            f"internal hosts) to permit it."
+        )
+        return
+
     db_id = st.session_state.get('active_database_id')
 
     # Scope selection
@@ -339,7 +355,7 @@ def _run_diagnostic(url: str, model: str):
         st.write("1. Testing /api/tags (list models)...")
         try:
             t0 = time.time()
-            r = requests.get(f"{url}/api/tags", timeout=10)
+            r = requests.get(f"{url}/api/tags", timeout=10, allow_redirects=False)
             r.raise_for_status()
             tags = r.json().get('models', [])
             st.write(f"   [OK] {len(tags)} models available ({time.time() - t0:.2f}s)")
@@ -357,7 +373,7 @@ def _run_diagnostic(url: str, model: str):
         st.write(f"2. Testing /api/show for '{model}'...")
         try:
             t0 = time.time()
-            r = requests.post(f"{url}/api/show", json={'name': model}, timeout=30)
+            r = requests.post(f"{url}/api/show", json={'name': model}, timeout=30, allow_redirects=False)
             r.raise_for_status()
             info = r.json()
             fmt = info.get('details', {}).get('format', '?')
@@ -382,7 +398,8 @@ def _run_diagnostic(url: str, model: str):
                     'keep_alive': '30m',
                     'options': {'num_predict': 20}
                 },
-                timeout=300
+                timeout=300,
+                allow_redirects=False
             )
             r.raise_for_status()
             data = r.json()
@@ -420,7 +437,8 @@ def _run_diagnostic(url: str, model: str):
                     'options': {'num_predict': 30}
                 },
                 stream=True,
-                timeout=300
+                timeout=300,
+                allow_redirects=False
             ) as sr:
                 sr.raise_for_status()
                 for line in sr.iter_lines(decode_unicode=True):
@@ -462,7 +480,7 @@ def _call_ollama(prompt: str, url: str, model: str, timeout: int = 600) -> str:
         'keep_alive': '30m',
         'options': {'temperature': 0.3, 'num_predict': 2000}
     }
-    resp = requests.post(f"{url}/api/generate", json=payload, timeout=timeout)
+    resp = requests.post(f"{url}/api/generate", json=payload, timeout=timeout, allow_redirects=False)
     resp.raise_for_status()
     return resp.json().get('response', 'No response from model.')
 
@@ -477,7 +495,8 @@ def _warm_model(url: str, model: str, status_write, timeout: int = 600) -> bool:
         resp = requests.post(
             f"{url}/api/generate",
             json={'model': model, 'prompt': '', 'stream': False, 'keep_alive': '30m'},
-            timeout=timeout
+            timeout=timeout,
+            allow_redirects=False
         )
         resp.raise_for_status()
         elapsed = time.time() - t0
@@ -508,7 +527,7 @@ def _call_ollama_streaming(prompt: str, url: str, model: str, placeholder,
     placeholder.markdown("*Connecting to Ollama...*")
 
     with requests.post(f"{url}/api/generate", json=payload, stream=True,
-                        timeout=timeout) as resp:
+                        timeout=timeout, allow_redirects=False) as resp:
         resp.raise_for_status()
         placeholder.markdown("*Waiting for first token (model may be loading)...*")
 

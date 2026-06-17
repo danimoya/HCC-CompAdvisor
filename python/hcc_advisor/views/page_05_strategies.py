@@ -9,6 +9,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.target_queries import TargetQueries
+from hcc_advisor.utils.logger import log_warning
 from hcc_advisor.config import config
 
 
@@ -748,8 +749,10 @@ def show_sql_patches():
         )
         if not df.empty:
             applied = set(df['PATCH_NAME'].tolist())
-    except Exception:
-        pass  # Table may not exist yet
+    except Exception as e:
+        # Table may not exist yet (expected on a fresh install) — log at warning
+        # so a real query failure here is still diagnosable.
+        log_warning(f"strategies: could not read applied patches from t_patch_history: {e}")
 
     for pdir in patch_dirs:
         patch_name = pdir.name

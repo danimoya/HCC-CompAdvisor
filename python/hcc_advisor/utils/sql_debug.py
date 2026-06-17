@@ -56,13 +56,21 @@ def is_debug_enabled():
     return st.session_state.get('sql_debug_enabled', False)
 
 
+# Substrings that mark a bind-parameter key as sensitive; matched
+# case-insensitively against the key name. Covers password / encrypted-password /
+# short-form pwd/passwd / dash_pwd / credential / secret / key / token variants.
+_SENSITIVE_PARAM_KEYS = (
+    'password', 'passwd', 'pwd', 'secret', 'key', 'token', 'cred',
+)
+
+
 def _sanitize_params(params):
     """Redact password-like parameters for safe display."""
     if not params:
         return None
     safe = {}
     for k, v in params.items():
-        if any(word in str(k).lower() for word in ('password', 'secret', 'key', 'token')):
+        if any(word in str(k).lower() for word in _SENSITIVE_PARAM_KEYS):
             safe[k] = '***'
         else:
             safe[k] = repr(v) if not isinstance(v, (str, int, float, type(None))) else v

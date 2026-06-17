@@ -3,6 +3,8 @@ Target Database Manager - HCC Compression Advisor
 Register and manage target Oracle databases for analysis
 """
 
+import html
+
 import streamlit as st
 import oracledb
 from typing import Dict, Optional, Tuple
@@ -11,6 +13,7 @@ from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.target_connector import TargetConnector
 from hcc_advisor.utils.logger import log_error, log_info
 from hcc_advisor.config import config
+from hcc_advisor.auth import AuthManager, ROLE_ADMIN
 
 # Try to import cryptography for password encryption
 try:
@@ -20,25 +23,59 @@ except ImportError:
     HAS_CRYPTO = False
 
 
+class CredentialEncryptionError(RuntimeError):
+    """Raised when a target credential cannot be encrypted/decrypted securely."""
+
+
 def encrypt_password(password: str) -> str:
-    """Encrypt password for storage"""
+    """Encrypt password for storage.
+
+    Fails closed: refuses to return plaintext when no usable encryption key /
+    cryptography library is available, so a misconfigured deployment can never
+    silently persist target-DB credentials in cleartext.
+    """
+    if not HAS_CRYPTO:
+        raise CredentialEncryptionError(
+            "cryptography library is not installed; cannot encrypt target credential. "
+            "Install 'cryptography' to store target databases securely."
+        )
     key = config.ENCRYPTION_KEY
-    if key and HAS_CRYPTO:
+    if not key:
+        raise CredentialEncryptionError(
+            "ENCRYPTION_KEY is not set; refusing to store target-DB password in plaintext. "
+            "Generate a Fernet key (Setup page) and set ENCRYPTION_KEY before registering targets."
+        )
+    try:
         f = Fernet(key.encode() if isinstance(key, str) else key)
         return f.encrypt(password.encode()).decode()
-    return password  # Store plain if no encryption key
+    except Exception as exc:
+        raise CredentialEncryptionError(f"Invalid ENCRYPTION_KEY: {exc}") from exc
 
 
 def decrypt_password(encrypted: str) -> str:
-    """Decrypt stored password"""
+    """Decrypt stored password.
+
+    Surfaces decrypt failures explicitly (raises) instead of silently returning
+    the raw stored value, which would mask key rotation/corruption and leak
+    ciphertext into a live connection attempt.
+    """
+    if not HAS_CRYPTO:
+        raise CredentialEncryptionError(
+            "cryptography library is not installed; cannot decrypt stored credential."
+        )
     key = config.ENCRYPTION_KEY
-    if key and HAS_CRYPTO:
-        try:
-            f = Fernet(key.encode() if isinstance(key, str) else key)
-            return f.decrypt(encrypted.encode()).decode()
-        except Exception:
-            return encrypted  # Return as-is if decryption fails
-    return encrypted
+    if not key:
+        raise CredentialEncryptionError(
+            "ENCRYPTION_KEY is not set; cannot decrypt stored target-DB password."
+        )
+    try:
+        f = Fernet(key.encode() if isinstance(key, str) else key)
+        return f.decrypt(encrypted.encode()).decode()
+    except Exception as exc:
+        raise CredentialEncryptionError(
+            "Failed to decrypt stored target-DB password (wrong/rotated ENCRYPTION_KEY "
+            "or corrupted ciphertext)."
+        ) from exc
 
 
 def test_target_connection(conn_details: Dict) -> Tuple[bool, str, Optional[str]]:
@@ -74,6 +111,13 @@ def show_connections_page():
     st.markdown("## Target Database Manager")
     st.markdown("Register and manage Oracle databases for compression analysis")
 
+    # Credential management (register/delete targets, view/decrypt-and-test stored
+    # DB passwords) is admin-only.
+    if not AuthManager.require_role(
+        ROLE_ADMIN, "Managing target-database credentials requires the admin role."
+    ):
+        return
+
     # Load target databases from central DB
     targets_df = CentralQueries.get_target_databases()
 
@@ -84,13 +128,20 @@ def show_connections_page():
         active_row = targets_df[targets_df['database_id'] == active_db_id]
         if not active_row.empty:
             active = active_row.iloc[0]
+            # Escape registered-DB metadata before injecting into raw HTML to
+            # prevent stored XSS via malicious display name / host / service.
+            _disp = html.escape(str(active.get('display_name', 'N/A')))
+            _user = html.escape(str(active.get('username', '')))
+            _host = html.escape(str(active.get('db_host', '')))
+            _port = html.escape(str(active.get('port', '')))
+            _svc = html.escape(str(active.get('service_name', '')))
             st.markdown(f"""
             <div style="background: linear-gradient(90deg, #1a1a2e 0%, #16213e 100%);
                         padding: 15px 20px; border-radius: 10px; margin-bottom: 20px;
                         border-left: 4px solid green;">
                 <span style="color: #888; font-size: 12px;">ACTIVE TARGET DATABASE</span>
-                <h3 style="margin: 5px 0; color: white;">{active.get('display_name', 'N/A')}</h3>
-                <code style="color: #4fc3f7;">{active.get('username', '')}@{active.get('db_host', '')}:{active.get('port', '')}/{active.get('service_name', '')}</code>
+                <h3 style="margin: 5px 0; color: white;">{_disp}</h3>
+                <code style="color: #4fc3f7;">{_user}@{_host}:{_port}/{_svc}</code>
             </div>
             """, unsafe_allow_html=True)
 
@@ -140,7 +191,11 @@ def show_connections_page():
                         st.markdown("**Actions**")
 
                         if st.button("Test", key=f"test_{db_id}", use_container_width=True):
-                            pwd = decrypt_password(db.get('password_encrypted', ''))
+                            try:
+                                pwd = decrypt_password(db.get('password_encrypted', ''))
+                            except CredentialEncryptionError as exc:
+                                st.error(str(exc))
+                                st.stop()
                             conn = {
                                 'host': db.get('db_host'),
                                 'port': int(db.get('port', 1521)),
@@ -237,6 +292,11 @@ def show_connections_page():
                         success, msg, version = test_target_connection(test_conn)
 
                     if success:
+                        try:
+                            password_encrypted = encrypt_password(password)
+                        except CredentialEncryptionError as exc:
+                            st.error(f"Cannot save database: {exc}")
+                            st.stop()
                         db_data = {
                             'database_name': db_name,
                             'display_name': display_name,
@@ -244,7 +304,7 @@ def show_connections_page():
                             'port': port,
                             'service_name': service,
                             'username': username,
-                            'password_encrypted': encrypt_password(password),
+                            'password_encrypted': password_encrypted,
                             'description': description,
                             'environment': environment,
                             'platform_type': platform_type,

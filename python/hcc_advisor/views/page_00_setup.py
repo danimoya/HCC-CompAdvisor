@@ -190,11 +190,17 @@ def show_deployment_page(mode: str = 'setup'):
     Args:
         mode: 'setup' for first-run, 'upgrade' for schema version mismatch
     """
-    st.set_page_config(
-        page_title="HCC Advisor - Setup",
-        page_icon="🔧",
-        layout="centered"
-    )
+    # Page config may already have been set by app.py (which now sets it first so
+    # the auth gate can render before this wizard). set_page_config can only be
+    # called once per run, so ignore the "already set" error in that case.
+    try:
+        st.set_page_config(
+            page_title="HCC Advisor - Setup",
+            page_icon="🔧",
+            layout="centered"
+        )
+    except st.errors.StreamlitAPIException:
+        pass
 
     st.markdown("""
     <style>

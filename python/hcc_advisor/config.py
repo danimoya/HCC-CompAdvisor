@@ -54,7 +54,19 @@ class Config:
     MAX_LOGIN_ATTEMPTS: int = int(os.getenv('MAX_LOGIN_ATTEMPTS', '3'))
 
     # Authentication
-    DASHBOARD_PASSWORD: str = os.getenv('DASHBOARD_PASSWORD', 'admin123')
+    # SECURITY: no built-in default password. If DASHBOARD_PASSWORD is unset the
+    # value is empty and AuthManager.login() fails closed (empty password is
+    # rejected), forcing the operator to set an explicit secret.
+    #
+    # DASHBOARD_PASSWORD is the ADMIN role password (full access). The optional
+    # OPERATOR_PASSWORD / VIEWER_PASSWORD enable role separation without a full
+    # user store: an operator may run analysis/compression but not manage
+    # credentials or patch SQL; a viewer is read-only. Roles are only active when
+    # the corresponding password env var is set, so existing single-password
+    # deployments keep working unchanged (admin-only).
+    DASHBOARD_PASSWORD: str = os.getenv('DASHBOARD_PASSWORD', '')
+    OPERATOR_PASSWORD: str = os.getenv('OPERATOR_PASSWORD', '')
+    VIEWER_PASSWORD: str = os.getenv('VIEWER_PASSWORD', '')
 
     # Database Configuration
     DB_HOST: str = os.getenv('DB_HOST', 'localhost')
@@ -67,6 +79,11 @@ class Config:
     ORDS_BASE_URL: str = os.getenv('ORDS_BASE_URL', 'https://localhost:8443/ords/hcc_advisor')
     ORDS_USERNAME: str = os.getenv('ORDS_USERNAME', 'hcc_advisor')
     ORDS_PASSWORD: str = os.getenv('ORDS_PASSWORD', '')
+    # TLS verification for ORDS calls. Defaults to True (secure). For internal
+    # self-signed CAs, set ORDS_CA_BUNDLE to a CA bundle path instead of disabling
+    # verification. Setting ORDS_VERIFY_SSL=false is an explicit, logged opt-out.
+    ORDS_VERIFY_SSL: bool = os.getenv('ORDS_VERIFY_SSL', 'true').lower() == 'true'
+    ORDS_CA_BUNDLE: str = os.getenv('ORDS_CA_BUNDLE', '')
 
     # SSL Configuration
     SSL_ENABLED: bool = os.getenv('SSL_ENABLED', 'true').lower() == 'true'
@@ -76,6 +93,17 @@ class Config:
     # Logging
     LOG_LEVEL: str = os.getenv('LOG_LEVEL', 'INFO')
     LOG_FILE: str = os.getenv('LOG_FILE', 'logs/app.log')
+
+    # SSRF guard (outbound HTTP from admin-configurable Ollama/webhook URLs).
+    # Comma-separated host allowlists. Webhooks must be https and match
+    # WEBHOOK_HOST_ALLOWLIST (default: Slack/Teams). Ollama may use http/https
+    # but its host must match OLLAMA_HOST_ALLOWLIST. Loopback/link-local/private
+    # ranges are blocked unless SSRF_ALLOW_PRIVATE=true (set this only when
+    # Ollama legitimately runs on localhost/an internal host).
+    WEBHOOK_HOST_ALLOWLIST: str = os.getenv(
+        'WEBHOOK_HOST_ALLOWLIST', 'hooks.slack.com,*.webhook.office.com')
+    OLLAMA_HOST_ALLOWLIST: str = os.getenv('OLLAMA_HOST_ALLOWLIST', '')
+    SSRF_ALLOW_PRIVATE: bool = os.getenv('SSRF_ALLOW_PRIVATE', 'false').lower() == 'true'
 
     # Page Configuration
     PAGE_TITLE: str = f"{APP_ICON} {APP_TITLE}"
@@ -158,6 +186,31 @@ class Config:
         if not cls.CENTRAL_DB_PASSWORD:
             errors.append("CENTRAL_DB_PASSWORD (or DB_PASSWORD) not set")
 
+        # Fail fast on a missing encryption key: without it, target-DB
+        # credentials would otherwise be stored in cleartext. Validate that the
+        # key is a usable Fernet key rather than just non-empty.
+        if not cls.ENCRYPTION_KEY:
+            errors.append(
+                "ENCRYPTION_KEY not set — target-database passwords cannot be "
+                "stored securely. Generate a Fernet key (Setup page) and set "
+                "ENCRYPTION_KEY before registering target databases."
+            )
+        else:
+            try:
+                from cryptography.fernet import Fernet
+                key = cls.ENCRYPTION_KEY
+                Fernet(key.encode() if isinstance(key, str) else key)
+            except ImportError:
+                errors.append(
+                    "ENCRYPTION_KEY is set but the 'cryptography' library is not "
+                    "installed — target credentials cannot be encrypted."
+                )
+            except Exception:
+                errors.append(
+                    "ENCRYPTION_KEY is not a valid Fernet key — generate one with "
+                    "Fernet.generate_key() (Setup page)."
+                )
+
         if cls.SSL_ENABLED:
             cert_path = Path(__file__).parent / cls.SSL_CERT_FILE
             key_path = Path(__file__).parent / cls.SSL_KEY_FILE
@@ -239,7 +292,9 @@ class Config:
         global _active_env_path
         _active_env_path = _load_env_multi()
 
-        cls.DASHBOARD_PASSWORD = os.getenv('DASHBOARD_PASSWORD', 'admin123')
+        cls.DASHBOARD_PASSWORD = os.getenv('DASHBOARD_PASSWORD', '')
+        cls.OPERATOR_PASSWORD = os.getenv('OPERATOR_PASSWORD', '')
+        cls.VIEWER_PASSWORD = os.getenv('VIEWER_PASSWORD', '')
         cls.CENTRAL_DB_HOST = os.getenv('CENTRAL_DB_HOST', os.getenv('DB_HOST', 'localhost'))
         cls.CENTRAL_DB_PORT = int(os.getenv('CENTRAL_DB_PORT', os.getenv('DB_PORT', '1521')))
         cls.CENTRAL_DB_SERVICE = os.getenv('CENTRAL_DB_SERVICE', os.getenv('DB_SERVICE', 'FREEPDB1'))

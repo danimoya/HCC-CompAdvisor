@@ -22,18 +22,19 @@ services:
 
     environment:
       # Oracle Database configuration
-      - ORACLE_PWD=${ORACLE_PWD:-Welcome123}
+      # SECURITY: no weak fallback defaults — fail-closed if unset in .env.
+      - ORACLE_PWD=${ORACLE_PWD:?ORACLE_PWD must be set in .env}
       - ORACLE_CHARACTERSET=AL32UTF8
       - ENABLE_ARCHIVELOG=false
       - ENABLE_FORCE_LOGGING=false
 
       # Compression Advisor configuration
       - COMPRESSION_USER=${COMPRESSION_USER:-COMPRESSION_MGR}
-      - COMPRESSION_PWD=${COMPRESSION_PWD:-Compress123}
+      - COMPRESSION_PWD=${COMPRESSION_PWD:?COMPRESSION_PWD must be set in .env}
       - COMPRESSION_TS=${COMPRESSION_TS:-SCRATCH_TS}
 
       # ORDS configuration
-      - ORDS_PWD=${ORDS_PWD:-Welcome123}
+      - ORDS_PWD=${ORDS_PWD:?ORDS_PWD must be set in .env}
 
       # Performance tuning
       - INIT_SGA_SIZE=2048

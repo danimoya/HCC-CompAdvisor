@@ -23,9 +23,12 @@ services:
     restart: unless-stopped
 
     # Port mappings
+    # SECURITY: bind to loopback only. The Oracle listener and EM Express
+    # console must NOT be reachable from the public host interface (0.0.0.0).
+    # For remote DB admin, tunnel over SSH/WireGuard to 127.0.0.1.
     ports:
-      - "1521:1521"   # Oracle Database listener
-      - "5500:5500"   # Oracle Enterprise Manager Express
+      - "127.0.0.1:1521:1521"   # Oracle Database listener (loopback only)
+      - "127.0.0.1:5500:5500"   # Oracle Enterprise Manager Express (loopback only)
 
     # Environment variables
     env_file:
@@ -33,14 +36,16 @@ services:
 
     environment:
       # Oracle Database configuration
-      - ORACLE_PWD=${ORACLE_PWD:-Welcome123}
+      # SECURITY: no weak fallback defaults — the stack refuses to start if the
+      # secret is not provided in .env (fail-closed). Set ORACLE_PWD in .env.
+      - ORACLE_PWD=${ORACLE_PWD:?ORACLE_PWD must be set in .env}
       - ORACLE_CHARACTERSET=AL32UTF8
       - ENABLE_ARCHIVELOG=false
       - ENABLE_FORCE_LOGGING=false
 
       # Compression Advisor central user
       - COMPRESSION_USER=${COMPRESSION_USER:-COMPRESSION_MGR}
-      - COMPRESSION_PWD=${COMPRESSION_PWD:-Compress123}
+      - COMPRESSION_PWD=${COMPRESSION_PWD:?COMPRESSION_PWD must be set in .env}
       - COMPRESSION_TS=${COMPRESSION_TS:-SCRATCH_TS}
 
       # Performance tuning
@@ -94,19 +99,21 @@ services:
     hostname: target-db
     restart: unless-stopped
 
+    # SECURITY: bind to loopback only. The target Oracle listener must NOT be
+    # reachable from the public host interface (0.0.0.0). Tunnel for remote access.
     ports:
-      - "1522:1521"
+      - "127.0.0.1:1522:1521"   # Oracle Database listener (loopback only)
 
     env_file:
       - .env
 
     environment:
-      - ORACLE_PWD=${ORACLE_PWD:-Welcome123}
+      - ORACLE_PWD=${ORACLE_PWD:?ORACLE_PWD must be set in .env}
       - ORACLE_CHARACTERSET=AL32UTF8
       - ENABLE_ARCHIVELOG=false
       - ENABLE_FORCE_LOGGING=false
       - COMPRESSION_USER=${COMPRESSION_USER:-COMPRESSION_MGR}
-      - COMPRESSION_PWD=${COMPRESSION_PWD:-Compress123}
+      - COMPRESSION_PWD=${COMPRESSION_PWD:?COMPRESSION_PWD must be set in .env}
 
       # Smaller SGA for test instance
       - INIT_SGA_SIZE=1024
@@ -147,9 +154,12 @@ services:
     hostname: streamlit
     restart: unless-stopped
 
-    # Port mapping for Streamlit
-    ports:
-      - "8501:8501"
+    # SECURITY: do NOT publish Streamlit to the host (no 0.0.0.0:8501).
+    # The dashboard is reached from the public hostname (hcc.danimoya.com)
+    # through nginx-proxy-manager on the external `management-network`, which
+    # terminates TLS and applies edge auth/headers. Publishing 8501 to the host
+    # would bypass the reverse proxy entirely. NPM reaches this container by name
+    # (streamlit:8501) over the shared network, so no host port is required.
 
     # Environment variables
     environment:
@@ -158,20 +168,21 @@ services:
       - CENTRAL_DB_PORT=1521
       - CENTRAL_DB_SERVICE=FREEPDB1
       - CENTRAL_DB_USER=${COMPRESSION_USER:-COMPRESSION_MGR}
-      - CENTRAL_DB_PASSWORD=${COMPRESSION_PWD:-Compress123}
+      - CENTRAL_DB_PASSWORD=${COMPRESSION_PWD:?COMPRESSION_PWD must be set in .env}
 
       # Legacy DB vars (fallback, point to central)
       - DB_HOST=central-db
       - DB_PORT=1521
       - DB_SERVICE=FREEPDB1
       - DB_USER=${COMPRESSION_USER:-COMPRESSION_MGR}
-      - DB_PASSWORD=${COMPRESSION_PWD:-Compress123}
+      - DB_PASSWORD=${COMPRESSION_PWD:?COMPRESSION_PWD must be set in .env}
 
       # Encryption key for target DB passwords
       - ENCRYPTION_KEY=${ENCRYPTION_KEY:-}
 
       # Dashboard authentication
-      - DASHBOARD_PASSWORD=${DASHBOARD_PASSWORD:-Dashboard123!}
+      # SECURITY: no fallback — fail-closed if DASHBOARD_PASSWORD is unset.
+      - DASHBOARD_PASSWORD=${DASHBOARD_PASSWORD:?DASHBOARD_PASSWORD must be set in .env}
 
       # SSL disabled in Docker
       - SSL_ENABLED=false

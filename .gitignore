@@ -33,3 +33,18 @@ hive-mind-prompt-*.txt
 
 # Project configuration (keep local only)
 CLAUDE.md
+
+# Python bytecode caches
+__pycache__/
+*.py[cod]
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+*.whl
+*.tar.gz
+
+# Runtime logs
+logs/
+*.log

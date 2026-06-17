@@ -3,17 +3,35 @@ Admin Page - HCC Compression Advisor
 SQL Patches, system maintenance, and administration tools
 """
 
+import urllib.request
 import streamlit as st
 import pandas as pd
 from pathlib import Path
 from hcc_advisor.utils.central_connector import CentralConnector
+from hcc_advisor.utils.logger import log_warning, log_error
 from hcc_advisor.config import config
+from hcc_advisor.auth import AuthManager, ROLE_ADMIN
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """urllib handler that refuses HTTP redirects (SSRF redirect-bounce guard)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url, code, f"Redirect to {newurl} blocked", headers, fp)
 
 
 def show_admin_page():
     st.title("Administration")
     st.markdown("System maintenance and SQL patch management")
     st.markdown("---")
+
+    # Admin-only: SQL patching, Ollama/webhook URL config (SSRF surface),
+    # system maintenance. Requires the admin role.
+    if not AuthManager.require_role(
+        ROLE_ADMIN, "Administration is restricted to the admin role."
+    ):
+        return
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "SQL Patches", "AI / Ollama", "Webhooks", "AWR License", "System Info"
@@ -43,8 +61,8 @@ def _ensure_patch_history_table():
         )
         if not df.empty:
             return True
-    except Exception:
-        pass
+    except Exception as e:
+        log_warning(f"_ensure_patch_history_table: existence check failed: {e}")
 
     try:
         CentralConnector.execute_plsql("""
@@ -63,7 +81,8 @@ def _ensure_patch_history_table():
             END;
         """)
         return True
-    except Exception:
+    except Exception as e:
+        log_error(e, "_ensure_patch_history_table: CREATE TABLE T_PATCH_HISTORY failed")
         return False
 
 
@@ -73,8 +92,8 @@ def _check_patch_applied(check_sql: str) -> bool:
         df = CentralConnector.execute_query(check_sql.strip())
         if not df.empty:
             return int(df.iloc[0]['RESULT'] or 0) > 0
-    except Exception:
-        pass
+    except Exception as e:
+        log_warning(f"_check_patch_applied: check.sql query failed: {e}")
     return False
 
 
@@ -91,8 +110,10 @@ def _record_patch(patch_name: str, status: str = 'SUCCESS', error: str = None):
                 "INSERT INTO t_patch_history (patch_name, status) VALUES (:n, :s)",
                 {'n': patch_name, 's': status}
             )
-    except Exception:
-        pass
+    except Exception as e:
+        # A failed insert here means the audit row (esp. a FAILED patch) is lost —
+        # surface it rather than swallowing silently.
+        log_error(e, "_record_patch", {'patch_name': patch_name, 'status': status})
 
 
 def show_sql_patches():
@@ -121,6 +142,27 @@ def show_sql_patches():
         st.warning("Patches directory not found. Expected at `sql/patches/` relative to the project root.")
         return
 
+    # Safety guardrail: the patch SQL is executed verbatim against the central DB,
+    # so the patch source must be a trusted, read-only directory. Refuse to run
+    # patches from a group/world-writable location, which would let any local
+    # process tamper with patch.sql and turn this admin panel into an
+    # arbitrary-SQL-execution primitive. The intended deployment mounts
+    # sql/patches read-only (`:ro`), which is not group/world-writable.
+    try:
+        import stat
+        mode = patches_dir.stat().st_mode
+        if mode & (stat.S_IWGRP | stat.S_IWOTH):
+            st.error(
+                "Refusing to load patches: the patches directory "
+                f"`{patches_dir}` is group/world-writable. Patch SQL must come "
+                "from a trusted, read-only location. Re-mount it read-only "
+                "(`:ro`) and ensure it is not writable by other users."
+            )
+            return
+    except OSError:
+        st.error(f"Could not verify permissions on patches directory `{patches_dir}`.")
+        return
+
     patch_dirs = sorted([d for d in patches_dir.iterdir() if d.is_dir()], key=lambda d: d.name)
     if not patch_dirs:
         st.info("No patch directories found.")
@@ -147,8 +189,8 @@ def show_sql_patches():
                             'status': r['STATUS'], 'date': r['APPLIED_DATE'],
                             'by': r.get('APPLIED_BY', '')
                         }
-        except Exception:
-            pass
+        except Exception as e:
+            log_warning(f"show_sql_patches: could not load recorded patch history: {e}")
 
     # Run check.sql for each patch to detect actual DB state
     detected = {}
@@ -231,22 +273,18 @@ def show_sql_patches():
                     if st.button(f"Apply Patch", key=f"apply_{patch_name}", type="primary"):
                         with st.spinner(f"Applying {patch_name}..."):
                             try:
-                                blocks = [b.strip() for b in sql_text.split('\n/\n') if b.strip()]
-                                if not blocks:
-                                    blocks = [sql_text.strip()]
+                                # Use the SQL*Plus-aware parser instead of naive
+                                # split('\n/\n')/split(';'), which mis-splits
+                                # statements containing string literals or PL/SQL
+                                # with embedded semicolons (silent schema
+                                # corruption / injection).
+                                from hcc_advisor.utils.sql_executor import parse_sql_text
 
-                                for block in blocks:
-                                    clean = block.rstrip().rstrip('/')
-                                    if not clean:
-                                        continue
-                                    upper = clean.lstrip().upper()
-                                    if upper.startswith('DECLARE') or upper.startswith('BEGIN'):
-                                        CentralConnector.execute_plsql(clean)
+                                for stmt_type, stmt_text in parse_sql_text(sql_text):
+                                    if stmt_type == 'PLSQL':
+                                        CentralConnector.execute_plsql(stmt_text)
                                     else:
-                                        for stmt in clean.split(';'):
-                                            stmt = stmt.strip()
-                                            if stmt:
-                                                CentralConnector.execute_dml(stmt)
+                                        CentralConnector.execute_dml(stmt_text)
 
                                 _record_patch(patch_name, 'SUCCESS')
                                 st.success(f"Patch **{patch_name}** applied!")
@@ -304,6 +342,13 @@ def show_ollama_config():
     col1, col2, col3 = st.columns(3)
     with col1:
         if st.button("Save", key="ollama_save", use_container_width=True):
+            from hcc_advisor.utils.url_guard import validate_outbound_url, UrlNotAllowed
+            try:
+                if url:
+                    validate_outbound_url(url, 'ollama')
+            except UrlNotAllowed as ue:
+                st.error(f"Ollama URL rejected: {ue}")
+                st.stop()
             try:
                 for k, v in [('ollama_url', url), ('ollama_model', model)]:
                     CentralConnector.execute_dml("""
@@ -322,7 +367,16 @@ def show_ollama_config():
         if st.button("Test Connection", key="ollama_test", use_container_width=True):
             if url:
                 try:
-                    resp = urllib.request.urlopen(f"{url}/api/tags", timeout=10)
+                    from hcc_advisor.utils.url_guard import validate_outbound_url, UrlNotAllowed
+                    try:
+                        validate_outbound_url(url, 'ollama')
+                    except UrlNotAllowed as ue:
+                        st.error(f"Ollama URL rejected: {ue}")
+                        st.stop()
+                    # No-redirect opener so an allowed host cannot 30x-bounce to
+                    # an internal target.
+                    opener = urllib.request.build_opener(_NoRedirect())
+                    resp = opener.open(f"{url.rstrip('/')}/api/tags", timeout=10)
                     data = json.loads(resp.read())
                     models = [m['name'] for m in data.get('models', [])]
                     if models:
@@ -444,6 +498,13 @@ def show_webhooks():
     col1, col2, col3 = st.columns(3)
     with col1:
         if st.button("Save", key="webhook_save", use_container_width=True):
+            from hcc_advisor.utils.url_guard import validate_outbound_url, UrlNotAllowed
+            try:
+                if url:
+                    validate_outbound_url(url, 'webhook')
+            except UrlNotAllowed as ue:
+                st.error(f"Webhook URL rejected: {ue}")
+                st.stop()
             try:
                 CentralConnector.execute_dml("""
                     MERGE INTO t_schema_metadata tgt
@@ -482,15 +543,22 @@ def show_webhooks():
 
 def _test_webhook(url: str):
     """Send a test message to the webhook URL."""
-    import urllib.request
     import json
+    from hcc_advisor.utils.url_guard import validate_outbound_url, UrlNotAllowed
+    try:
+        validate_outbound_url(url, 'webhook')
+    except UrlNotAllowed as ue:
+        st.error(f"Webhook URL rejected: {ue}")
+        return
     payload = json.dumps({
         "text": "HCC Compression Advisor — Test notification. Webhook is working!"
     }).encode('utf-8')
     try:
         req = urllib.request.Request(url, data=payload,
                                      headers={'Content-Type': 'application/json'})
-        resp = urllib.request.urlopen(req, timeout=10)
+        # No-redirect opener: an allowed webhook host must not 30x-bounce inward.
+        opener = urllib.request.build_opener(_NoRedirect())
+        resp = opener.open(req, timeout=10)
         if resp.status < 300:
             st.success("Test notification sent!")
         else:

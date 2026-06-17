@@ -3,15 +3,14 @@ ORDS REST API Client for HCC Compression Advisor
 Handles all REST API interactions with Oracle REST Data Services
 """
 
+import logging
 import requests
 import streamlit as st
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Union
 from requests.auth import HTTPBasicAuth
 from hcc_advisor.config import config
-import urllib3
 
-# Disable SSL warnings for self-signed certificates
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+logger = logging.getLogger(__name__)
 
 
 class ORDSClient:
@@ -21,7 +20,21 @@ class ORDSClient:
         self.base_url = config.ORDS_BASE_URL.rstrip('/')
         self.auth = HTTPBasicAuth(config.ORDS_USERNAME, config.ORDS_PASSWORD)
         self.timeout = config.API_TIMEOUT
-        self.verify_ssl = False  # Use False for self-signed certificates
+        # TLS verification: True by default. Prefer pointing ORDS_CA_BUNDLE at an
+        # internal CA bundle for self-signed certs rather than disabling checks.
+        # requests accepts True/False or a path to a CA bundle in `verify`.
+        self.verify_ssl: Union[bool, str]
+        if config.ORDS_CA_BUNDLE:
+            self.verify_ssl = config.ORDS_CA_BUNDLE
+        else:
+            self.verify_ssl = config.ORDS_VERIFY_SSL
+        if self.verify_ssl is False:
+            logger.warning(
+                "ORDS TLS certificate verification is DISABLED "
+                "(ORDS_VERIFY_SSL=false). Credentials and metadata are exposed "
+                "to on-path attackers. Set ORDS_CA_BUNDLE to a trusted CA bundle "
+                "instead."
+            )
 
     def _make_request(
         self,

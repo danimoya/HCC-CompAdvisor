@@ -35,6 +35,20 @@ def parse_sql_file(path: Union[str, Path]) -> List[Tuple[str, str]]:
     """
     path = Path(path)
     content = path.read_text(encoding='utf-8')
+    return parse_sql_text(content)
+
+
+def parse_sql_text(content: str) -> List[Tuple[str, str]]:
+    """
+    Parse SQL*Plus-formatted text (already in memory) into executable
+    statements. Same contract as parse_sql_file but takes a string, so callers
+    that have the SQL in hand (e.g. the admin patch panel) can reuse this
+    SQL*Plus-aware splitter instead of naive split(';'), which mis-splits
+    statements containing string literals or PL/SQL with embedded semicolons.
+
+    Returns a list of (stmt_type, stmt_text) tuples where stmt_type is one of:
+    'DDL', 'DML', 'PLSQL', 'SELECT', 'COMMIT'.
+    """
     lines = content.splitlines()
 
     statements: List[Tuple[str, str]] = []

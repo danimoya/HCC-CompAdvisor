@@ -114,12 +114,23 @@ TABLE_CONFIGS: Dict[str, Dict[str, Any]] = {
 # ---------------------------------------------------------------------------
 
 def encrypt_password(password: str) -> str:
-    """Encrypt a password for storage in T_TARGET_DATABASES."""
+    """Encrypt a password for storage in T_TARGET_DATABASES.
+
+    Fails closed: refuses to fall back to plaintext storage when ENCRYPTION_KEY
+    is unset/invalid, so a migration run can never silently persist target-DB
+    credentials in cleartext.
+    """
     key = config.ENCRYPTION_KEY
-    if key:
+    if not key:
+        raise SystemExit(
+            "ERROR: ENCRYPTION_KEY is not set; refusing to store the target-DB password "
+            "in plaintext. Generate a Fernet key and export ENCRYPTION_KEY before migrating."
+        )
+    try:
         f = Fernet(key.encode() if isinstance(key, str) else key)
         return f.encrypt(password.encode()).decode()
-    return password
+    except Exception as exc:
+        raise SystemExit(f"ERROR: invalid ENCRYPTION_KEY: {exc}")
 
 
 def get_central_connection() -> oracledb.Connection:

@@ -3,12 +3,28 @@ HCC Compression Advisor - Main Streamlit Application
 Oracle Hybrid Columnar Compression Analysis and Management Dashboard
 """
 
+import html
+
 import streamlit as st
 
 from hcc_advisor.config import config, Config
 from hcc_advisor import __version__
+from hcc_advisor.auth import AuthManager, render_logout_button
 
-# --- Pre-login deployment check (before set_page_config) ---
+# Page configuration MUST be the first Streamlit command, so it runs before any
+# auth/login widgets or the deployment wizard render.
+st.set_page_config(
+    page_title=config.PAGE_TITLE,
+    page_icon=config.APP_ICON,
+    layout=config.LAYOUT,
+    initial_sidebar_state=config.INITIAL_SIDEBAR_STATE
+)
+
+# --- Deployment check (AUTHENTICATED admins only) ---
+# SECURITY (CWE-306): the setup/upgrade wizard collects arbitrary Oracle
+# credentials and can RE-INSTALL / DROP the central schema. It must NEVER render
+# before authentication. Require an authenticated session first; this renders the
+# login page and st.stop()s for anonymous visitors.
 _needs_setup = config.is_first_run()
 _needs_upgrade = False
 if not _needs_setup and config.CENTRAL_DB_PASSWORD:
@@ -18,25 +34,30 @@ if not _needs_setup and config.CENTRAL_DB_PASSWORD:
         _needs_upgrade = (not _schema_deployed) or (_schema_ver is None) or (_schema_ver != __version__)
 
 if (_needs_setup or _needs_upgrade) and not st.session_state.get('setup_complete'):
+    # Gate the destructive deployment wizard behind authentication.
+    AuthManager.require_authentication()  # renders login + st.stop() if anonymous
     from hcc_advisor.views.page_00_setup import show_deployment_page
     show_deployment_page(mode='setup' if _needs_setup else 'upgrade')
     # show_deployment_page calls st.stop()
 
 # --- Normal dashboard ---
 from streamlit_option_menu import option_menu
-from hcc_advisor.auth import AuthManager, render_logout_button
 from hcc_advisor.utils.central_connector import CentralConnector
 from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.logger import get_recent_logs, get_error_logs, clear_logs
 from hcc_advisor.utils.sql_debug import get_sql_log, clear_sql_log, is_debug_enabled
 
-# Page configuration
-st.set_page_config(
-    page_title=config.PAGE_TITLE,
-    page_icon=config.APP_ICON,
-    layout=config.LAYOUT,
-    initial_sidebar_state=config.INITIAL_SIDEBAR_STATE
-)
+
+@st.cache_data(ttl=15, show_spinner=False)
+def _central_connection_ok() -> bool:
+    """Cached central-DB connection check for the sidebar status indicator.
+
+    Without this, every widget interaction triggered a fresh SELECT 1 FROM DUAL
+    round-trip on each rerun. A short TTL keeps the indicator responsive while
+    avoiding a per-rerun query.
+    """
+    return CentralConnector.test_connection()
+
 
 # Custom CSS - Full width layout
 st.markdown("""
@@ -326,7 +347,7 @@ def main():
         st.markdown("---")
         st.subheader("Connection Status")
 
-        if CentralConnector.test_connection():
+        if _central_connection_ok():
             st.success("Central DB Connected")
         else:
             st.error("Central DB Disconnected")
@@ -610,11 +631,16 @@ def show_dashboard():
         if not history_df.empty:
             # Handle column name case
             for _, row in history_df.iterrows():
-                table_name = row.get('TABLE_NAME', row.get('table_name', 'N/A'))
+                # HTML-escape DB-sourced values before embedding them in the
+                # unsafe_allow_html card below — table_name/strategy/start_time
+                # come from the target DB catalog and must not be able to inject
+                # markup (stored XSS, CWE-79). Escaped once here so the card
+                # template can use them directly.
+                table_name = html.escape(str(row.get('TABLE_NAME', row.get('table_name', 'N/A'))))
                 status = row.get('STATUS', row.get('status', 'UNKNOWN'))
-                strategy = row.get('STRATEGY', row.get('strategy', 'N/A'))
+                strategy = html.escape(str(row.get('STRATEGY', row.get('strategy', 'N/A'))))
                 savings_pct = row.get('SAVINGS_PCT', row.get('savings_pct', 0)) or 0
-                start_time = row.get('START_TIME', row.get('start_time', 'N/A'))
+                start_time = html.escape(str(row.get('START_TIME', row.get('start_time', 'N/A'))))
 
                 # Determine status class and icon
                 if status == 'SUCCESS':
@@ -718,14 +744,17 @@ def show_dashboard():
             lines = logs_content.split('\n')
             formatted_lines = []
             for line in lines:
+                # Escape log content (may embed DB-derived values) before
+                # rendering as raw HTML to prevent XSS in the log viewer.
+                safe_line = html.escape(line)
                 if '| ERROR' in line or '| CRITICAL' in line:
-                    formatted_lines.append(f'<span class="error-line">{line}</span>')
+                    formatted_lines.append(f'<span class="error-line">{safe_line}</span>')
                 elif '| WARNING' in line:
-                    formatted_lines.append(f'<span class="warning-line">{line}</span>')
+                    formatted_lines.append(f'<span class="warning-line">{safe_line}</span>')
                 elif '| INFO' in line:
-                    formatted_lines.append(f'<span class="info-line">{line}</span>')
+                    formatted_lines.append(f'<span class="info-line">{safe_line}</span>')
                 else:
-                    formatted_lines.append(line)
+                    formatted_lines.append(safe_line)
 
             st.markdown(
                 f'<div class="log-viewer">{chr(10).join(formatted_lines)}</div>',
