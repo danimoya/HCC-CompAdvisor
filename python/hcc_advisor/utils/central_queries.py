@@ -112,7 +112,6 @@ class CentralQueries:
         }
 
     @staticmethod
-    @staticmethod
     def get_scheduler_job_summary(database_id: Optional[int] = None) -> Dict[str, int]:
         """Get job status counts for the Scheduler monitor."""
         db_filter = "AND database_id = :database_id" if database_id else ""
