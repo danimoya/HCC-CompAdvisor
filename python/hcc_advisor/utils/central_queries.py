@@ -14,6 +14,7 @@ from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timedelta
 from hcc_advisor.utils.central_connector import CentralConnector
 from hcc_advisor.utils.logger import log_error, log_info, log_debug, log_warning
+from hcc_advisor.utils.target_connector import TargetConnector, parse_target_login
 
 
 # Target-database registry changes rarely but is read on every Streamlit rerun
@@ -22,34 +23,36 @@ from hcc_advisor.utils.logger import log_error, log_info, log_debug, log_warning
 # CentralQueries.invalidate_target_databases_cache() to drop stale entries.
 _TARGET_DATABASES_TTL_SECONDS = 20
 
+# Shown when T_TARGET_DATABASES.CONNECTION_MODE is missing and can't be added.
+_CONNECTION_MODE_PATCH_MSG = (
+    "The central schema is missing column T_TARGET_DATABASES.CONNECTION_MODE and it "
+    "could not be added automatically. Apply SQL patch '20260331-connection-mode-column' "
+    "in Admin → SQL Patches, then retry."
+)
+
 
 @st.cache_data(ttl=_TARGET_DATABASES_TTL_SECONDS, show_spinner=False)
 def _cached_target_databases() -> pd.DataFrame:
     """Cached read of the active target-database registry (see TTL above)."""
+    # SELECT * (not a column list) so CONNECTION_MODE is returned when present —
+    # the registered-database Test button needs it to log SYS on AS SYSDBA — while
+    # central schemas that predate that column still list their targets.
     query = """
-        SELECT
-            database_id,
-            database_name,
-            display_name,
-            db_host,
-            port,
-            service_name,
-            username,
-            password_encrypted,
-            description,
-            environment,
-            platform_type,
-            is_active,
-            last_connected,
-            last_analysis_date,
-            oracle_version,
-            created_date,
-            created_by
+        SELECT *
         FROM t_target_databases
         WHERE is_active = 'Y'
         ORDER BY display_name
     """
     return CentralConnector.execute_query(query)
+
+
+def _close_target_pool(database_id: int) -> None:
+    """Drop the cached connection pool of a target whose registration changed, so
+    the next connection re-reads its login (user/password/connection mode)."""
+    try:
+        TargetConnector.close_pool(int(database_id))
+    except Exception as e:
+        log_warning(f"Could not close target pool for database_id={database_id}: {e}")
 
 
 class CentralQueries:
@@ -1914,6 +1917,59 @@ class CentralQueries:
         except Exception:
             pass
 
+    # Set once T_TARGET_DATABASES.CONNECTION_MODE is known to exist, so the
+    # dictionary check runs at most once per process.
+    _connection_mode_column_ok = False
+
+    @staticmethod
+    def ensure_connection_mode_column() -> bool:
+        """
+        Make sure T_TARGET_DATABASES.CONNECTION_MODE exists.
+
+        Central schemas deployed before patch 20260331-connection-mode-column lack
+        the column, so registering a target failed with ORA-00904. Applies the
+        same idempotent DDL as that patch; the Admin → SQL Patches page then
+        detects it as applied through the patch's check.sql.
+
+        Returns:
+            bool: True if the column exists (or was added)
+        """
+        if CentralQueries._connection_mode_column_ok:
+            return True
+
+        check_query = """
+            SELECT COUNT(*) AS column_count
+            FROM user_tab_columns
+            WHERE table_name = 'T_TARGET_DATABASES' AND column_name = 'CONNECTION_MODE'
+        """
+
+        def _column_exists() -> bool:
+            df = CentralConnector.execute_query(check_query)
+            return not df.empty and int(df.iloc[0]['COLUMN_COUNT'] or 0) > 0
+
+        try:
+            if not _column_exists():
+                log_warning("T_TARGET_DATABASES.CONNECTION_MODE missing; "
+                            "applying patch 20260331-connection-mode-column")
+                CentralConnector.execute_plsql("""
+                    DECLARE
+                        v_exists NUMBER;
+                    BEGIN
+                        SELECT COUNT(*) INTO v_exists FROM user_tab_columns
+                        WHERE table_name = 'T_TARGET_DATABASES' AND column_name = 'CONNECTION_MODE';
+                        IF v_exists = 0 THEN
+                            EXECUTE IMMEDIATE 'ALTER TABLE t_target_databases ADD (connection_mode VARCHAR2(10) DEFAULT ''NORMAL'')';
+                        END IF;
+                    END;
+                """)
+                if not _column_exists():
+                    return False
+            CentralQueries._connection_mode_column_ok = True
+            return True
+        except Exception as e:
+            log_error(e, "ensure_connection_mode_column")
+            return False
+
     @staticmethod
     def get_target_database(database_id: int) -> Dict[str, Any]:
         """
@@ -1969,11 +2025,24 @@ class CentralQueries:
             db_data: Dictionary with database connection details:
                 - database_name, display_name, db_host, port, service_name,
                   username, password_encrypted, description, environment,
-                  platform_type
+                  platform_type, connection_mode, oracle_version
 
         Returns:
             Tuple of (success, message, new_database_id)
         """
+        # Store the clean login: "SYS AS SYSDBA" typed as the username is saved
+        # as username=SYS, connection_mode=SYSDBA (see parse_target_login).
+        db_data = dict(db_data)
+        try:
+            db_data['username'], db_data['connection_mode'] = parse_target_login(
+                db_data.get('username'), db_data.get('connection_mode')
+            )
+        except ValueError as e:
+            return False, str(e), None
+
+        if not CentralQueries.ensure_connection_mode_column():
+            return False, _CONNECTION_MODE_PATCH_MSG, None
+
         insert_query = """
             INSERT INTO t_target_databases (
                 database_name, display_name, db_host, port, service_name,
@@ -1993,11 +2062,21 @@ class CentralQueries:
         # Pre-check: a row with this database_name may already exist
         try:
             existing = CentralConnector.execute_query(
-                "SELECT database_id FROM t_target_databases WHERE database_name = :database_name",
+                "SELECT database_id, is_active FROM t_target_databases WHERE database_name = :database_name",
                 {'database_name': db_name}
             )
             if not existing.empty:
                 existing_id = int(existing.iloc[0]['DATABASE_ID'])
+                if existing.iloc[0]['IS_ACTIVE'] == 'N':
+                    # A removed (soft-deleted) target still owns the unique name but
+                    # is hidden from the Databases tab, so it can't be edited or
+                    # deleted there. Re-activate it with the new details instead
+                    # (e.g. the same database re-added to log on AS SYSDBA).
+                    ok, msg = CentralQueries.update_target_database(existing_id, db_data, reactivate=True)
+                    if ok:
+                        log_info(f"Target database re-activated: {db_name} (ID: {existing_id})")
+                        return True, "Previously removed target database re-activated", existing_id
+                    return False, msg, None
                 return (
                     False,
                     f"A target database named '{db_name}' already exists (ID {existing_id}). "
@@ -2034,18 +2113,25 @@ class CentralQueries:
             return False, msg, None
 
     @staticmethod
-    def update_target_database(database_id: int, db_data: Dict[str, Any]) -> Tuple[bool, str]:
+    def update_target_database(
+        database_id: int, db_data: Dict[str, Any], reactivate: bool = False
+    ) -> Tuple[bool, str]:
         """
         Update a target database registration
 
         Args:
             database_id: Target database ID
-            db_data: Dictionary with fields to update
+            db_data: Dictionary with fields to update (display_name, db_host,
+                     port, service_name, username, description, environment,
+                     platform_type required; connection_mode, oracle_version and
+                     password_encrypted optional)
+            reactivate: Also set is_active='Y' (re-registering a removed target)
 
         Returns:
             Tuple of (success, message)
         """
-        query = """
+        reactivate_sql = "is_active = 'Y'," if reactivate else ""
+        query = f"""
             UPDATE t_target_databases SET
                 display_name = :display_name,
                 db_host = :db_host,
@@ -2055,13 +2141,33 @@ class CentralQueries:
                 description = :description,
                 environment = :environment,
                 platform_type = :platform_type,
+                connection_mode = :connection_mode,
+                oracle_version = NVL(:oracle_version, oracle_version),
+                {reactivate_sql}
                 modified_date = SYSDATE,
                 modified_by = USER
             WHERE database_id = :database_id
         """
 
-        params = dict(db_data)
+        # Bind exactly the placeholders above: python-oracledb rejects unused
+        # named binds (DPY-4008), so passing db_data through as-is failed whenever
+        # it also carried password_encrypted / connection_mode.
+        try:
+            params = {k: db_data[k] for k in (
+                'display_name', 'db_host', 'port', 'service_name', 'username',
+                'description', 'environment', 'platform_type')}
+            params['username'], params['connection_mode'] = parse_target_login(
+                db_data['username'], db_data.get('connection_mode')
+            )
+        except KeyError as e:
+            return False, f"Missing field for target database update: {e}"
+        except ValueError as e:
+            return False, str(e)
+        params['oracle_version'] = db_data.get('oracle_version')
         params['database_id'] = database_id
+
+        if not CentralQueries.ensure_connection_mode_column():
+            return False, _CONNECTION_MODE_PATCH_MSG
 
         # If password_encrypted is provided, update it separately
         if 'password_encrypted' in db_data and db_data['password_encrypted']:
@@ -2086,6 +2192,7 @@ class CentralQueries:
             if rows_affected:
                 log_info(f"Target database updated: ID {database_id}")
                 CentralQueries.invalidate_target_databases_cache()
+                _close_target_pool(database_id)
                 return True, "Target database updated successfully"
             return False, "Failed to update target database"
         except Exception as e:
@@ -2114,6 +2221,7 @@ class CentralQueries:
             if rows_affected:
                 log_info(f"Target database deactivated: ID {database_id}")
                 CentralQueries.invalidate_target_databases_cache()
+                _close_target_pool(database_id)
                 return True, "Target database deactivated successfully"
             return False, "Failed to deactivate target database"
         except Exception as e:
