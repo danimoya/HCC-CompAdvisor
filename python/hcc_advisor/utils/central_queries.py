@@ -1322,7 +1322,9 @@ class CentralQueries:
         try:
             # Clear existing default
             clear_query = "UPDATE t_compression_strategies SET is_default = NULL WHERE is_default = 'Y'"
-            CentralConnector.execute_dml(clear_query)
+            # Strict mode: 0 rows is normal here, so only an exception can tell
+            # a failed clear apart (and stop us from reporting success)
+            CentralConnector.execute_dml(clear_query, raise_on_error=True)
 
             # Set new default
             set_query = """
@@ -2063,7 +2065,8 @@ class CentralQueries:
         try:
             existing = CentralConnector.execute_query(
                 "SELECT database_id, is_active FROM t_target_databases WHERE database_name = :database_name",
-                {'database_name': db_name}
+                {'database_name': db_name},
+                raise_on_error=True
             )
             if not existing.empty:
                 existing_id = int(existing.iloc[0]['DATABASE_ID'])
@@ -2090,7 +2093,9 @@ class CentralQueries:
             log_debug(f"add_target_database: duplicate pre-check skipped: {e}")
 
         try:
-            rows_affected = CentralConnector.execute_dml(insert_query, db_data)
+            # Strict mode so a failed INSERT reaches the except below (e.g. the
+            # friendly duplicate-name message) instead of returning 0
+            rows_affected = CentralConnector.execute_dml(insert_query, db_data, raise_on_error=True)
             if rows_affected:
                 # Retrieve the new database_id
                 id_query = """
@@ -2179,10 +2184,12 @@ class CentralQueries:
                 WHERE database_id = :database_id
             """
             try:
+                # Strict mode: otherwise a failed password UPDATE returns 0 and
+                # the edit below still reports success
                 CentralConnector.execute_dml(password_query, {
                     'password_encrypted': db_data['password_encrypted'],
                     'database_id': database_id
-                })
+                }, raise_on_error=True)
             except Exception as e:
                 log_error(e, "update_target_database (password)", {'database_id': database_id})
                 return False, f"Failed to update password: {e}"

@@ -161,7 +161,8 @@ class TargetConnector:
         database_id: int,
         query: str,
         params: Optional[Dict[str, Any]] = None,
-        conn_config: Optional[Dict[str, Any]] = None
+        conn_config: Optional[Dict[str, Any]] = None,
+        raise_on_error: bool = False
     ) -> pd.DataFrame:
         """
         Execute SELECT query on a target database and return results as DataFrame
@@ -171,6 +172,8 @@ class TargetConnector:
             query: SQL SELECT statement
             params: Query parameters
             conn_config: Optional connection configuration dict
+            raise_on_error: Re-raise database errors to the caller instead of
+                showing st.error and returning an empty DataFrame
 
         Returns:
             pd.DataFrame: Query results
@@ -202,6 +205,8 @@ class TargetConnector:
                 capture_sql(f'target(id={database_id})', 'SELECT', query, params,
                             status='ERROR', error=str(e), duration_ms=(time.perf_counter() - _t0) * 1000)
             log_db_error(e, query, params)
+            if raise_on_error:
+                raise
             st.error(f"Target database (id={database_id}) query error: {e}")
             return pd.DataFrame()
 
@@ -212,7 +217,8 @@ class TargetConnector:
         statement: str,
         params: Optional[Dict[str, Any]] = None,
         commit: bool = True,
-        conn_config: Optional[Dict[str, Any]] = None
+        conn_config: Optional[Dict[str, Any]] = None,
+        raise_on_error: bool = False
     ) -> int:
         """
         Execute DML statement (INSERT, UPDATE, DELETE) on a target database
@@ -223,6 +229,8 @@ class TargetConnector:
             params: Statement parameters
             commit: Whether to commit transaction
             conn_config: Optional connection configuration dict
+            raise_on_error: Re-raise database errors to the caller instead of
+                showing st.error and returning 0
 
         Returns:
             int: Number of rows affected
@@ -255,6 +263,8 @@ class TargetConnector:
                 capture_sql(f'target(id={database_id})', 'DML', statement, params,
                             status='ERROR', error=str(e), duration_ms=(time.perf_counter() - _t0) * 1000)
             log_db_error(e, statement, params)
+            if raise_on_error:
+                raise
             st.error(f"Target database (id={database_id}) DML error: {e}")
             return 0
 
@@ -265,7 +275,8 @@ class TargetConnector:
         plsql_block: str,
         params: Optional[Dict[str, Any]] = None,
         commit: bool = True,
-        conn_config: Optional[Dict[str, Any]] = None
+        conn_config: Optional[Dict[str, Any]] = None,
+        raise_on_error: bool = False
     ) -> bool:
         """
         Execute a PL/SQL anonymous block on a target database
@@ -276,6 +287,8 @@ class TargetConnector:
             params: Optional bind parameters
             commit: Whether to commit after execution
             conn_config: Optional connection configuration dict
+            raise_on_error: Re-raise database errors to the caller instead of
+                showing st.error and returning False
 
         Returns:
             bool: True if successful
@@ -306,6 +319,8 @@ class TargetConnector:
                 capture_sql(f'target(id={database_id})', 'PLSQL', plsql_block, params,
                             status='ERROR', error=str(e), duration_ms=(time.perf_counter() - _t0) * 1000)
             log_db_error(e, plsql_block, params)
+            if raise_on_error:
+                raise
             st.error(f"Target database (id={database_id}) PL/SQL execution error: {e}")
             return False
 

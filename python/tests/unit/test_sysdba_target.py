@@ -196,7 +196,7 @@ def central(monkeypatch):
     state = {'has_column': True, 'can_add_column': True, 'existing': None}
     calls = {'query': [], 'dml': [], 'plsql': []}
 
-    def execute_query(sql, params=None):
+    def execute_query(sql, params=None, raise_on_error=False):
         calls['query'].append((sql, params))
         if 'user_tab_columns' in sql:
             return pd.DataFrame([{'COLUMN_COUNT': 1 if state['has_column'] else 0}])
@@ -208,13 +208,13 @@ def central(monkeypatch):
             return pd.DataFrame([{'DATABASE_ID': 42}])
         return pd.DataFrame()
 
-    def execute_plsql(sql, params=None, commit=True):
+    def execute_plsql(sql, params=None, commit=True, raise_on_error=False):
         calls['plsql'].append(sql)
         if state['can_add_column']:
             state['has_column'] = True
         return state['can_add_column']
 
-    def execute_dml(sql, params=None, commit=True):
+    def execute_dml(sql, params=None, commit=True, raise_on_error=False):
         # Mirror python-oracledb: every bind must match a placeholder (DPY-4008/4010)
         assert set(params) == _binds(sql), (set(params), _binds(sql))
         calls['dml'].append((sql, params))

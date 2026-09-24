@@ -3,11 +3,26 @@ Tablespace Manager - HCC Compression Advisor
 Analyze tablespace usage and shrink allocated space after compression
 """
 
+import numbers
+from typing import Any, Collection, Dict, Tuple
+
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from hcc_advisor.utils.target_queries import TargetQueries
 from hcc_advisor.utils.target_connector import TargetConnector
+
+
+# Resize one datafile. The file name and size are binds concatenated inside the
+# PL/SQL block, not text interpolated into the DDL: the name becomes a normal
+# quoted literal (embedded quotes doubled), the size a plain number.
+_RESIZE_DATAFILE_PLSQL = """
+    BEGIN
+        EXECUTE IMMEDIATE 'ALTER DATABASE DATAFILE '''
+            || REPLACE(:file_name, '''', '''''')
+            || ''' RESIZE ' || TO_CHAR(:target_mb) || 'M';
+    END;
+"""
 
 
 def show_tablespaces_page():
@@ -115,6 +130,11 @@ def show_tablespaces_page():
             # Store selection in session_state so it survives the confirm checkbox rerun
             st.session_state['ts_shrink_targets'] = ts_names
 
+    # Results of the last Execute Shrink, stashed because the handler reruns the
+    # page (to refresh the usage figures), which would otherwise wipe them.
+    for ts_name, result in st.session_state.pop('ts_shrink_results', None) or []:
+        _show_shrink_result(ts_name, result)
+
     targets = st.session_state.get('ts_shrink_targets', [])
     if targets:
         col1, col2, col3 = st.columns([1, 1, 1])
@@ -123,13 +143,11 @@ def show_tablespaces_page():
         with col2:
             if st.button("Execute Shrink", disabled=not confirm, type="primary",
                          key="ts_execute", use_container_width=True):
+                results = []
                 for ts_name in targets:
                     with st.spinner(f"Shrinking {ts_name}..."):
-                        result = _shrink_tablespace(db_id, ts_name)
-                        if result.get('success'):
-                            st.success(f"{ts_name}: {result['message']}")
-                        else:
-                            st.error(f"{ts_name}: {result.get('error', 'Failed')}")
+                        results.append((ts_name, _shrink_tablespace(db_id, ts_name)))
+                st.session_state['ts_shrink_results'] = results
                 st.session_state.pop('ts_shrink_targets', None)
                 st.rerun()
 
@@ -139,6 +157,20 @@ def show_tablespaces_page():
         df_files = _get_datafile_details(db_id)
         if not df_files.empty:
             st.dataframe(df_files, use_container_width=True, hide_index=True)
+
+
+def _show_shrink_result(ts_name: str, result: dict):
+    """Render one tablespace's shrink outcome with its per-file results."""
+    text = f"{ts_name}: {result['message']}"
+    if result['level'] == 'success':
+        st.success(text)
+    elif result['level'] == 'warning':
+        st.warning(text)
+    else:
+        st.error(text)
+    if result.get('files'):
+        with st.expander(f"{ts_name}: per-file results", expanded=result['level'] != 'success'):
+            st.dataframe(pd.DataFrame(result['files']), use_container_width=True, hide_index=True)
 
 
 def _get_tablespace_usage(db_id: int) -> pd.DataFrame:
@@ -174,7 +206,9 @@ def _get_tablespace_usage(db_id: int) -> pd.DataFrame:
         ORDER BY t.allocated_mb DESC
     """
     try:
-        df = TargetConnector.execute_query(db_id, query)
+        # Strict mode so a failure here reaches the fallback below instead of
+        # returning an empty DataFrame
+        df = TargetConnector.execute_query(db_id, query, raise_on_error=True)
         if not df.empty:
             df.columns = [c.lower() for c in df.columns]
         return df
@@ -227,12 +261,36 @@ def _get_datafile_details(db_id: int) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _build_datafile_resize(file_name: Any, target_mb: Any,
+                           known_files: Collection[str]) -> Tuple[str, Dict[str, Any]]:
+    """
+    Validate one datafile resize and return (plsql_block, binds) for execute_plsql.
+
+    Args:
+        file_name: Datafile to resize; must be one of known_files
+        target_mb: New size in MB; must be a positive whole number
+        known_files: FILE_NAME values just read from DBA_DATA_FILES
+
+    Raises:
+        ValueError: if file_name or target_mb is not acceptable
+    """
+    if not isinstance(file_name, str) or file_name not in known_files:
+        raise ValueError(f"{file_name!r} is not a datafile of this tablespace")
+    if isinstance(target_mb, bool) or not isinstance(target_mb, numbers.Integral) or target_mb <= 0:
+        raise ValueError(f"invalid resize target {target_mb!r} MB")
+    return _RESIZE_DATAFILE_PLSQL, {'file_name': file_name, 'target_mb': int(target_mb)}
+
+
 def _shrink_tablespace(db_id: int, tablespace_name: str) -> dict:
     """Shrink datafiles in a permanent tablespace by resizing each file
     down to its high-water mark + a small buffer.
 
     For permanent tablespaces ALTER TABLESPACE SHRINK SPACE is not supported
     (ORA-12916). The correct approach is per-datafile ALTER DATABASE DATAFILE RESIZE.
+
+    Returns:
+        dict: {'level': 'success' | 'warning' | 'error', 'message': str,
+               'files': [{'File', 'Result', 'Detail'}, ...]}
     """
 
     # Get datafiles with their HWM
@@ -252,16 +310,18 @@ def _shrink_tablespace(db_id: int, tablespace_name: str) -> dict:
         WHERE f.tablespace_name = :ts
     """
     try:
-        df = TargetConnector.execute_query(db_id, query, {'ts': tablespace_name})
+        df = TargetConnector.execute_query(db_id, query, {'ts': tablespace_name}, raise_on_error=True)
     except Exception as e:
-        return {'success': False, 'error': f'Failed to query datafiles: {e}'}
+        return {'level': 'error', 'message': f'Failed to query datafiles: {e}', 'files': []}
 
     if df.empty:
-        return {'success': False, 'error': 'No datafiles found'}
+        return {'level': 'error', 'message': 'No datafiles found', 'files': []}
 
-    shrunk = 0
+    # Only files this query just read from DBA_DATA_FILES may be resized
+    known_files = set(df['FILE_NAME'])
+    files = []
+    resized = skipped = failed = 0
     total_saved = 0
-    errors = []
 
     for _, row in df.iterrows():
         current = int(row['CURRENT_BYTES'])
@@ -275,25 +335,43 @@ def _shrink_tablespace(db_id: int, tablespace_name: str) -> dict:
         target_mb = (target // 1048576) + 1
 
         try:
-            TargetConnector.execute_plsql(
-                db_id,
-                f"BEGIN EXECUTE IMMEDIATE q'[ALTER DATABASE DATAFILE ''{file_name}'' RESIZE {target_mb}M]'; END;"
-            )
-            saved = (current - target_mb * 1048576) // 1048576
-            total_saved += max(saved, 0)
-            shrunk += 1
+            plsql, binds = _build_datafile_resize(file_name, target_mb, known_files)
+        except ValueError as e:
+            failed += 1
+            files.append({'File': str(file_name), 'Result': 'Failed', 'Detail': f'Rejected: {e}'})
+            continue
+
+        try:
+            # Strict mode: a failed RESIZE raises instead of returning False,
+            # so it is never counted as shrunk.
+            TargetConnector.execute_plsql(db_id, plsql, binds, raise_on_error=True)
         except Exception as e:
             err_str = str(e)
             if 'ORA-03297' in err_str:
-                errors.append(f'{file_name}: cannot resize below HWM')
+                # Expected when used extents sit above the computed target size
+                skipped += 1
+                files.append({'File': file_name, 'Result': 'Skipped',
+                              'Detail': f'Used data beyond {target_mb} MB (ORA-03297)'})
             else:
-                errors.append(f'{file_name}: {err_str[:100]}')
+                failed += 1
+                files.append({'File': file_name, 'Result': 'Failed', 'Detail': err_str[:300]})
+            continue
 
-    if shrunk > 0:
-        msg = f'{shrunk} file(s) resized, ~{total_saved} MB reclaimed'
-        if errors:
-            msg += f' ({len(errors)} file(s) skipped)'
-        return {'success': True, 'message': msg}
-    elif errors:
-        return {'success': False, 'error': '; '.join(errors[:3])}
-    return {'success': True, 'message': 'No files needed resizing'}
+        saved = max((current - target_mb * 1048576) // 1048576, 0)
+        total_saved += saved
+        resized += 1
+        files.append({'File': file_name, 'Result': 'Resized',
+                      'Detail': f'{current // 1048576} MB -> {target_mb} MB (~{saved} MB reclaimed)'})
+
+    if not files:
+        return {'level': 'success', 'message': 'No files needed resizing', 'files': []}
+
+    parts = [f'{resized} file(s) resized, ~{total_saved} MB reclaimed']
+    if skipped:
+        parts.append(f'{skipped} skipped (used data beyond the target size)')
+    if failed:
+        parts.append(f'{failed} failed')
+        level = 'warning' if resized else 'error'
+    else:
+        level = 'success' if resized else 'warning'
+    return {'level': level, 'message': '; '.join(parts), 'files': files}
