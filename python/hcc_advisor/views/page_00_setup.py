@@ -11,8 +11,10 @@ from typing import Optional, Dict, List, Tuple
 from cryptography.fernet import Fernet
 
 from hcc_advisor import __version__
-from hcc_advisor.auth import AuthManager, ROLE_ADMIN, render_logout_button
-from hcc_advisor.config import Config, config
+from hcc_advisor.auth import (
+    AuthManager, MIN_PASSWORD_LENGTH, ROLE_ADMIN, render_logout_button, validate_new_password,
+)
+from hcc_advisor.config import Config, config, env_value_problem
 from hcc_advisor.utils import sql_patches
 from hcc_advisor.utils.schema_version import (
     DEPLOYED_CHECK_SQL, STATUS_CURRENT, STATUS_MISSING, STATUS_NEWER, STATUS_OUTDATED,
@@ -303,15 +305,17 @@ def show_deployment_page(mode: str = 'setup'):
     # DASHBOARD_PASSWORD (the admin credential) and ENCRYPTION_KEY to .env, which
     # overrides the environment on reload, and it can re-install or drop the
     # central schema. The first-run bootstrap still works: before .env exists the
-    # only logins are the environment's passwords, and DASHBOARD_PASSWORD always
-    # maps to the admin role.
+    # only logins are the environment's passwords (DASHBOARD_PASSWORD always maps
+    # to the admin role) or, when no DASHBOARD_PASSWORD is set at all, the
+    # one-time setup token printed to the server console (auth.py).
     existing_install = mode == 'upgrade' and config.CENTRAL_DB_PASSWORD
     if not AuthManager.require_role(
         ROLE_ADMIN,
         "Upgrading, re-installing or removing the central schema requires the admin role."
         if existing_install else
         "Initial setup requires the admin role: it sets the dashboard admin password "
-        "and the encryption key. Sign in with DASHBOARD_PASSWORD to run it."
+        "and the encryption key. Sign in with DASHBOARD_PASSWORD (or, on a fresh "
+        "install without one, the setup token printed in the server console) to run it."
     ):
         if existing_install:
             st.info("Ask an administrator to upgrade the schema. You can continue to the "
@@ -608,6 +612,13 @@ def _wizard_connection():
         if not all([host, service, username, password]):
             st.error("All fields are required.")
             return
+        # These are saved to .env at the end; catch what it can't store now.
+        for label, value in (("Host", host), ("Service Name", service),
+                             ("Username", username), ("Password", password)):
+            problem = env_value_problem(value)
+            if problem:
+                st.error(f"{label} {problem}.")
+                return
 
         st.session_state.setup_conn = {
             'host': host, 'port': int(port), 'service': service,
@@ -749,7 +760,8 @@ def _wizard_security():
 
     with st.form("security_form"):
         dash_pwd = st.text_input("Dashboard Password", type="password",
-                                  help="Password to access the web dashboard")
+                                  help="Admin password for the web dashboard "
+                                       f"(at least {MIN_PASSWORD_LENGTH} characters)")
         dash_pwd_confirm = st.text_input("Confirm Password", type="password")
 
         st.markdown("**Encryption Key** (for storing target database passwords)")
@@ -773,8 +785,9 @@ def _wizard_security():
         st.rerun()
 
     if submit:
-        if not dash_pwd:
-            st.error("Dashboard password is required.")
+        problem = validate_new_password(dash_pwd)
+        if problem:
+            st.error(problem)
             return
         if dash_pwd != dash_pwd_confirm:
             st.error("Passwords do not match.")
@@ -792,13 +805,23 @@ def _wizard_finish():
 
     conn = st.session_state.setup_conn
 
+    # SECURITY: no fallback password. The Security step sets it; if it is
+    # missing or unusable, send the admin back there instead of saving.
+    problem = validate_new_password(conn.get('dashboard_password') or '')
+    if problem:
+        st.error(f"{problem} Go back to the Security step to set the dashboard password.")
+        if st.button("Back to Security", key="setup_finish_back_security"):
+            st.session_state.setup_step = 4
+            st.rerun()
+        return
+
     settings = {
         'CENTRAL_DB_HOST': conn['host'],
         'CENTRAL_DB_PORT': str(conn['port']),
         'CENTRAL_DB_SERVICE': conn['service'],
         'CENTRAL_DB_USER': conn['username'],
         'CENTRAL_DB_PASSWORD': conn['password'],
-        'DASHBOARD_PASSWORD': conn.get('dashboard_password', 'admin123'),
+        'DASHBOARD_PASSWORD': conn['dashboard_password'],
         'ENCRYPTION_KEY': conn.get('encryption_key', ''),
     }
 
@@ -808,8 +831,13 @@ def _wizard_finish():
         st.markdown(f"- `{k}` = `{display_val}`")
 
     if st.button("Save & Launch Dashboard", type="primary"):
-        with st.spinner("Writing configuration..."):
-            env_path = Config.write_env_file(settings)
+        try:
+            with st.spinner("Writing configuration..."):
+                env_path = Config.write_env_file(settings)
+        except (ValueError, OSError) as e:
+            # ValueError names the offending key, never its value.
+            st.error(f"Could not save the configuration: {e}")
+            return
         st.success(f"Configuration saved to `{env_path}`")
         st.session_state.setup_complete = True
         st.balloons()

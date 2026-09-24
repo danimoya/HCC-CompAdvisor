@@ -133,8 +133,8 @@ streamlit run app.py \
 - **HTTP:** http://localhost:8501
 - **HTTPS:** https://localhost:8501
 
-**Default Login:**
-- Password: `admin123` (change in `.env`)
+**Login:**
+- Password: the `DASHBOARD_PASSWORD` set in `.env`. There is no default password. On a first run without a `.env`, use the one-time setup token printed in the server console. See [QUICKSTART.md](QUICKSTART.md).
 
 ## Application Structure
 

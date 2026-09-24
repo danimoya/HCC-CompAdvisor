@@ -4,10 +4,13 @@ Loads environment variables and provides centralized configuration.
 Supports multi-location .env discovery for pip-installed deployments.
 """
 
+import io
 import os
+import re
+import tempfile
 from pathlib import Path
 from typing import Optional, List
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 
 def _get_config_dir() -> Path:
@@ -44,6 +47,86 @@ def _load_env_multi():
 _active_env_path = _load_env_multi()
 
 
+# ----- .env writing -----
+
+_ENV_KEY_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
+
+
+def _encode_env_value(text: str) -> Optional[str]:
+    """How to spell `text` in .env so python-dotenv reads it back exactly, or None.
+
+    Values are single-quoted, where python-dotenv unescapes only \\\\ and \\'.
+    Its quoted-value regex, however, reads a backslash right before the closing
+    quote as an escaped quote (and then runs into the next lines), so a value
+    ending in a backslash is written unquoted, which python-dotenv takes
+    literally. The chosen spelling is verified with the installed parser (and
+    the same ${VAR} expansion load_dotenv applies), followed by another quoted
+    line so a spelling that would swallow the next line is caught too.
+    """
+    if text.endswith('\\'):
+        form = text
+    else:
+        form = "'" + text.replace('\\', '\\\\').replace("'", "\\'") + "'"
+    parsed = dotenv_values(stream=io.StringIO(f"V={form}\nW='w'\n"))
+    if parsed.get('V') == text and parsed.get('W') == 'w':
+        return form
+    return None
+
+
+def env_value_problem(value) -> Optional[str]:
+    """Why `value` can't be written to .env and read back exactly, or None."""
+    text = '' if value is None else str(value)
+    if '\n' in text or '\r' in text:
+        return "contains a line break, which .env cannot store"
+    if '\x00' in text:
+        return "contains a NUL character, which environment variables cannot hold"
+    if _encode_env_value(text) is None:
+        if '${' in text:
+            return "contains '${...}', which python-dotenv would expand when reading .env"
+        if text.endswith('\\'):
+            return ("ends with a backslash, which .env can only store in a value "
+                    "without leading quotes or spaces and without ' #'")
+        return "cannot be stored in .env exactly"
+    return None
+
+
+def format_env_line(key: str, value) -> str:
+    """`KEY='value'` line for .env (see _encode_env_value). Raises ValueError
+    (naming the key, never the value) when either can't be stored exactly."""
+    if not isinstance(key, str) or not _ENV_KEY_RE.fullmatch(key):
+        raise ValueError(f"Invalid .env key {key!r}: use letters, digits and underscores.")
+    text = '' if value is None else str(value)
+    problem = env_value_problem(text)
+    if problem:
+        raise ValueError(f"{key} {problem}. Choose a different value.")
+    return f"{key}={_encode_env_value(text)}"
+
+
+def _write_private_file(path: Path, text: str) -> None:
+    """Atomically create or replace `path` with owner-only (0600) permissions.
+
+    The text goes to a temp file in the same directory, created 0600 with
+    O_CREAT|O_EXCL (mkstemp) so it is never readable by others whatever the
+    umask, then fsynced and renamed over `path` (os.replace): readers see the
+    old file or the complete new one, never a partial or world-readable one.
+    """
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f'.{path.name}.', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            if hasattr(os, 'fchmod'):
+                os.fchmod(fh.fileno(), 0o600)
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 class Config:
     """Configuration class for application settings"""
 
@@ -64,9 +147,19 @@ class Config:
     # credentials or patch SQL; a viewer is read-only. Roles are only active when
     # the corresponding password env var is set, so existing single-password
     # deployments keep working unchanged (admin-only).
+    #
+    # On a first run (no .env, no DASHBOARD_PASSWORD) a one-time token printed to
+    # the server console opens the setup wizard instead (auth.ensure_bootstrap_token).
     DASHBOARD_PASSWORD: str = os.getenv('DASHBOARD_PASSWORD', '')
     OPERATOR_PASSWORD: str = os.getenv('OPERATOR_PASSWORD', '')
     VIEWER_PASSWORD: str = os.getenv('VIEWER_PASSWORD', '')
+
+    # Reverse proxies in front of Streamlit whose X-Forwarded-For hops are
+    # trusted when keying the login lockout by client IP. The docker deployment
+    # has exactly one (Nginx Proxy Manager). Set 0 when browsers reach Streamlit
+    # directly: forwarding headers are then client-supplied and the TCP peer
+    # address is used instead.
+    TRUSTED_PROXY_COUNT: int = int(os.getenv('TRUSTED_PROXY_COUNT', '1'))
 
     # Database Configuration
     DB_HOST: str = os.getenv('DB_HOST', 'localhost')
@@ -296,18 +389,32 @@ class Config:
         """
         Write settings to .env file in the config directory. Reloads config after writing.
 
+        SECURITY: the file holds DASHBOARD_PASSWORD, CENTRAL_DB_PASSWORD and
+        ENCRYPTION_KEY, so it is (re)created owner-only (0600) and atomically.
+        Values are single-quoted so python-dotenv reads back exactly what was
+        written (spaces, '#', quotes, backslashes, '$').
+
         Args:
             settings: dict of KEY=VALUE pairs to write
 
         Returns:
             Path to the written .env file
-        """
-        config_dir = _get_config_dir()
-        config_dir.mkdir(parents=True, exist_ok=True)
-        env_file = config_dir / '.env'
 
-        lines = [f"{k}={v}" for k, v in settings.items()]
-        env_file.write_text('\n'.join(lines) + '\n')
+        Raises:
+            ValueError: a key or value .env can't hold exactly (e.g. a password
+                with a line break or '${VAR}'); nothing is written in that case.
+        """
+        # Validate everything before touching the existing file.
+        lines = [format_env_line(k, v) for k, v in settings.items()]
+        content = '\n'.join(lines) + '\n'
+        expected = {k: '' if v is None else str(v) for k, v in settings.items()}
+        if dict(dotenv_values(stream=io.StringIO(content))) != expected:
+            raise ValueError("The settings cannot be written to .env exactly.")
+
+        config_dir = _get_config_dir()
+        config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        env_file = config_dir / '.env'
+        _write_private_file(env_file, content)
 
         cls._reload_from_env()
         return env_file
