@@ -94,7 +94,10 @@ def _ensure_patch_history_table():
 def _check_patch_applied(check_sql: str) -> bool:
     """Run a check.sql query — returns True if result > 0."""
     try:
-        df = CentralConnector.execute_query(check_sql.strip())
+        # Strict mode: a failing check (e.g. ORA-00904 for a column a pending
+        # patch adds) is logged below and reads as "not applied", instead of a
+        # bare st.error per patch on every page load.
+        df = CentralConnector.execute_query(check_sql.strip(), raise_on_error=True)
         if not df.empty:
             return int(df.iloc[0]['RESULT'] or 0) > 0
     except Exception as e:
@@ -102,23 +105,74 @@ def _check_patch_applied(check_sql: str) -> bool:
     return False
 
 
-def _record_patch(patch_name: str, status: str = 'SUCCESS', error: str = None):
-    """Insert a record into T_PATCH_HISTORY."""
+def _record_patch(patch_name: str, status: str = 'SUCCESS', error: str = None) -> bool:
+    """Insert a record into T_PATCH_HISTORY. Returns True if the row was written."""
     try:
+        # Strict mode: the connector would otherwise swallow the error (st.error
+        # + return 0) and this except block could never run.
         if error:
             CentralConnector.execute_dml(
                 "INSERT INTO t_patch_history (patch_name, status, error_message) VALUES (:n, :s, :e)",
-                {'n': patch_name, 's': status, 'e': str(error)[:4000]}
+                {'n': patch_name, 's': status, 'e': str(error)[:4000]},
+                raise_on_error=True
             )
         else:
             CentralConnector.execute_dml(
                 "INSERT INTO t_patch_history (patch_name, status) VALUES (:n, :s)",
-                {'n': patch_name, 's': status}
+                {'n': patch_name, 's': status},
+                raise_on_error=True
             )
+        return True
     except Exception as e:
         # A failed insert here means the audit row (esp. a FAILED patch) is lost —
         # surface it rather than swallowing silently.
         log_error(e, "_record_patch", {'patch_name': patch_name, 'status': status})
+        return False
+
+
+def _apply_patch(patch_name: str, sql_text: str) -> dict:
+    """
+    Run a patch.sql statement by statement and record the outcome in T_PATCH_HISTORY.
+
+    Statements run in strict mode, so the first database error stops the patch
+    and is recorded as FAILED; SUCCESS is recorded only when every statement ran.
+
+    Returns:
+        dict: {'level': 'success' | 'warning' | 'error', 'message': str} for display
+    """
+    # Use the SQL*Plus-aware parser instead of naive split('\n/\n')/split(';'),
+    # which mis-splits statements containing string literals or PL/SQL with
+    # embedded semicolons (silent schema corruption / injection).
+    from hcc_advisor.utils.sql_executor import parse_sql_text
+
+    statements = []
+    done = 0
+    try:
+        statements = parse_sql_text(sql_text)
+        if not statements:
+            raise ValueError("patch.sql contains no executable statements")
+        for stmt_type, stmt_text in statements:
+            if stmt_type == 'PLSQL':
+                CentralConnector.execute_plsql(stmt_text, raise_on_error=True)
+            else:
+                CentralConnector.execute_dml(stmt_text, raise_on_error=True)
+            done += 1
+    except Exception as e:
+        log_error(e, "_apply_patch", {'patch_name': patch_name, 'statement': done + 1})
+        where = f"Statement {done + 1} of {len(statements)}: " if statements else ""
+        message = f"Patch **{patch_name}** failed. {where}{e}"
+        if done:
+            message += (f"\n\nThe {done} statement(s) before it already ran (DDL is not "
+                        f"rolled back); check the schema before applying the patch again.")
+        if not _record_patch(patch_name, 'FAILED', f"{where}{e}"):
+            message += "\n\nThe failure could not be recorded in T_PATCH_HISTORY (see the application log)."
+        return {'level': 'error', 'message': message}
+
+    if not _record_patch(patch_name, 'SUCCESS'):
+        return {'level': 'warning',
+                'message': f"Patch **{patch_name}** applied, but recording it in T_PATCH_HISTORY "
+                           f"failed (see the application log)."}
+    return {'level': 'success', 'message': f"Patch **{patch_name}** applied!"}
 
 
 def show_sql_patches():
@@ -126,6 +180,17 @@ def show_sql_patches():
 
     st.subheader("SQL Patch Management")
     st.markdown("Apply versioned SQL patches to the central database without redeploying.")
+
+    # Result of the last Apply click, stashed because the apply handler reruns
+    # the page (which would otherwise wipe the message).
+    last = st.session_state.pop('admin_patch_result', None)
+    if last:
+        if last['level'] == 'success':
+            st.success(last['message'])
+        elif last['level'] == 'warning':
+            st.warning(last['message'])
+        else:
+            st.error(last['message'])
 
     # Find patches directory. Order: package layout (bundled/mounted into the
     # container at hcc_advisor/sql/patches), dev layout (repo_root/sql/patches),
@@ -277,27 +342,11 @@ def show_sql_patches():
                 if not is_applied:
                     if st.button(f"Apply Patch", key=f"apply_{patch_name}", type="primary"):
                         with st.spinner(f"Applying {patch_name}..."):
-                            try:
-                                # Use the SQL*Plus-aware parser instead of naive
-                                # split('\n/\n')/split(';'), which mis-splits
-                                # statements containing string literals or PL/SQL
-                                # with embedded semicolons (silent schema
-                                # corruption / injection).
-                                from hcc_advisor.utils.sql_executor import parse_sql_text
-
-                                for stmt_type, stmt_text in parse_sql_text(sql_text):
-                                    if stmt_type == 'PLSQL':
-                                        CentralConnector.execute_plsql(stmt_text)
-                                    else:
-                                        CentralConnector.execute_dml(stmt_text)
-
-                                _record_patch(patch_name, 'SUCCESS')
-                                st.success(f"Patch **{patch_name}** applied!")
-                                st.rerun()
-
-                            except Exception as e:
-                                _record_patch(patch_name, 'FAILED', str(e))
-                                st.error(f"Patch failed: {e}")
+                            st.session_state['admin_patch_result'] = _apply_patch(patch_name, sql_text)
+                        # Rerun either way so the patch status reflects the
+                        # recorded SUCCESS/FAILED row; the result is shown at
+                        # the top of this section.
+                        st.rerun()
             else:
                 st.warning("No `patch.sql` found.")
 
@@ -361,7 +410,7 @@ def show_ollama_config():
                         USING (SELECT :k as key FROM DUAL) src ON (tgt.key = src.key)
                         WHEN MATCHED THEN UPDATE SET value = :v
                         WHEN NOT MATCHED THEN INSERT (key, value) VALUES (:k, :v)
-                    """, {'k': k, 'v': v})
+                    """, {'k': k, 'v': v}, raise_on_error=True)
                 st.session_state['ollama_url'] = url
                 st.session_state['ollama_model'] = model
                 st.success("Ollama configuration saved!")
@@ -400,15 +449,16 @@ def show_ollama_config():
         if st.button("Clear", key="ollama_clear", use_container_width=True):
             try:
                 CentralConnector.execute_dml(
-                    "DELETE FROM t_schema_metadata WHERE key IN ('ollama_url', 'ollama_model')"
+                    "DELETE FROM t_schema_metadata WHERE key IN ('ollama_url', 'ollama_model')",
+                    raise_on_error=True
                 )
                 st.session_state.pop('ollama_url', None)
                 st.session_state.pop('ollama_model', None)
                 st.session_state.pop('admin_ollama_models_list', None)
                 st.success("Ollama configuration cleared")
                 st.rerun()
-            except Exception:
-                pass
+            except Exception as e:
+                st.error(f"Failed to clear: {e}")
 
     st.markdown("---")
     st.markdown("### Setup Guide")
@@ -516,7 +566,7 @@ def show_webhooks():
                     USING (SELECT 'webhook_url' as key FROM DUAL) src ON (tgt.key = src.key)
                     WHEN MATCHED THEN UPDATE SET value = :url
                     WHEN NOT MATCHED THEN INSERT (key, value) VALUES ('webhook_url', :url)
-                """, {'url': url})
+                """, {'url': url}, raise_on_error=True)
                 st.session_state['webhook_url'] = url
                 st.success("Webhook URL saved!")
             except Exception as e:
@@ -531,13 +581,14 @@ def show_webhooks():
         if st.button("Clear", key="webhook_clear", use_container_width=True):
             try:
                 CentralConnector.execute_dml(
-                    "DELETE FROM t_schema_metadata WHERE key = 'webhook_url'"
+                    "DELETE FROM t_schema_metadata WHERE key = 'webhook_url'",
+                    raise_on_error=True
                 )
                 st.session_state.pop('webhook_url', None)
                 st.success("Webhook cleared")
                 st.rerun()
-            except Exception:
-                pass
+            except Exception as e:
+                st.error(f"Failed to clear: {e}")
 
     st.markdown("---")
     st.caption("**Events that trigger notifications:**")
@@ -599,12 +650,13 @@ def show_awr_disclaimer():
         if st.button("Revoke Acknowledgement", key="awr_revoke"):
             try:
                 CentralConnector.execute_dml(
-                    "DELETE FROM t_schema_metadata WHERE key = 'awr_acknowledged'"
+                    "DELETE FROM t_schema_metadata WHERE key = 'awr_acknowledged'",
+                    raise_on_error=True
                 )
                 st.session_state['awr_acknowledged'] = False
                 st.rerun()
-            except Exception:
-                pass
+            except Exception as e:
+                st.error(f"Failed: {e}")
     else:
         st.info("AWR-enhanced hotness scoring is **disabled**.")
         if st.checkbox("I confirm that the target database has a valid Oracle Diagnostics Pack license",
@@ -616,7 +668,7 @@ def show_awr_disclaimer():
                         USING (SELECT 'awr_acknowledged' as key FROM DUAL) src ON (tgt.key = src.key)
                         WHEN MATCHED THEN UPDATE SET value = 'Y'
                         WHEN NOT MATCHED THEN INSERT (key, value) VALUES ('awr_acknowledged', 'Y')
-                    """)
+                    """, raise_on_error=True)
                     st.session_state['awr_acknowledged'] = True
                     st.success("AWR features enabled!")
                     st.rerun()

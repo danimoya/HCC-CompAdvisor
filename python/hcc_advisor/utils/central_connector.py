@@ -66,20 +66,27 @@ class CentralConnector:
             yield connection
         except oracledb.Error as e:
             log_error(e, "CentralConnector.get_connection")
-            st.error(f"Central database connection error: {e}")
+            # Only a failed acquire is a connection error. Errors raised by the
+            # caller's statements are the caller's to report (execute_* show
+            # their own st.error unless raise_on_error=True).
+            if connection is None:
+                st.error(f"Central database connection error: {e}")
             raise
         finally:
             if connection:
                 cls._pool.release(connection)
 
     @classmethod
-    def execute_query(cls, query: str, params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+    def execute_query(cls, query: str, params: Optional[Dict[str, Any]] = None,
+                      raise_on_error: bool = False) -> pd.DataFrame:
         """
         Execute SELECT query on central database and return results as DataFrame
 
         Args:
             query: SQL SELECT statement
             params: Query parameters
+            raise_on_error: Re-raise database errors to the caller instead of
+                showing st.error and returning an empty DataFrame
 
         Returns:
             pd.DataFrame: Query results
@@ -111,11 +118,14 @@ class CentralConnector:
                 capture_sql('central', 'SELECT', query, params,
                             status='ERROR', error=str(e), duration_ms=(time.perf_counter() - _t0) * 1000)
             log_db_error(e, query, params)
+            if raise_on_error:
+                raise
             st.error(f"Central database query error: {e}")
             return pd.DataFrame()
 
     @classmethod
-    def execute_dml(cls, statement: str, params: Optional[Dict[str, Any]] = None, commit: bool = True) -> int:
+    def execute_dml(cls, statement: str, params: Optional[Dict[str, Any]] = None, commit: bool = True,
+                    raise_on_error: bool = False) -> int:
         """
         Execute DML statement (INSERT, UPDATE, DELETE) on central database
 
@@ -123,6 +133,8 @@ class CentralConnector:
             statement: SQL DML statement
             params: Statement parameters
             commit: Whether to commit transaction
+            raise_on_error: Re-raise database errors to the caller instead of
+                showing st.error and returning 0
 
         Returns:
             int: Number of rows affected
@@ -155,11 +167,14 @@ class CentralConnector:
                 capture_sql('central', 'DML', statement, params,
                             status='ERROR', error=str(e), duration_ms=(time.perf_counter() - _t0) * 1000)
             log_db_error(e, statement, params)
+            if raise_on_error:
+                raise
             st.error(f"Central database DML error: {e}")
             return 0
 
     @classmethod
-    def execute_plsql(cls, plsql_block: str, params: Optional[Dict[str, Any]] = None, commit: bool = True) -> bool:
+    def execute_plsql(cls, plsql_block: str, params: Optional[Dict[str, Any]] = None, commit: bool = True,
+                      raise_on_error: bool = False) -> bool:
         """
         Execute a PL/SQL anonymous block on central database
 
@@ -167,6 +182,8 @@ class CentralConnector:
             plsql_block: PL/SQL code to execute
             params: Optional bind parameters
             commit: Whether to commit after execution
+            raise_on_error: Re-raise database errors to the caller instead of
+                showing st.error and returning False
 
         Returns:
             bool: True if successful
@@ -197,6 +214,8 @@ class CentralConnector:
                 capture_sql('central', 'PLSQL', plsql_block, params,
                             status='ERROR', error=str(e), duration_ms=(time.perf_counter() - _t0) * 1000)
             log_db_error(e, plsql_block, params)
+            if raise_on_error:
+                raise
             st.error(f"Central database PL/SQL execution error: {e}")
             return False
 
