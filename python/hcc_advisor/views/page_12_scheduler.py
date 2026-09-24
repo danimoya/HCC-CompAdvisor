@@ -10,6 +10,7 @@ from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.target_queries import (
     TargetQueries,
     is_supported_compression_type,
+    is_protected_schema,
     canonical_compression,
 )
 from hcc_advisor.utils.sql_builder import (
@@ -349,6 +350,10 @@ def _render_import_section(current_db_id):
             level = chk['object_level']
             if not chk['exists']:
                 state = 'MISSING'
+            elif is_protected_schema(obj['owner']):
+                # Oracle-maintained schema (SYS, AUDSYS, ...): visible and alterable
+                # when the target is registered AS SYSDBA — never queue it.
+                state = 'PROTECTED SCHEMA'
             elif not is_supported_compression_type(planned):
                 # Unsupported clause would raise in generate_ddl during drain and
                 # crash the page — never queue it.

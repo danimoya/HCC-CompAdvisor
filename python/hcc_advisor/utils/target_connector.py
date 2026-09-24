@@ -4,15 +4,75 @@ Manages connection pools to remote Oracle target databases.
 Supports multiple simultaneous connections keyed by database_id.
 """
 
+import re
 import oracledb
 import pandas as pd
 import time
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from contextlib import contextmanager
 import streamlit as st
 from hcc_advisor.config import config
 from hcc_advisor.utils.logger import log_db_error, log_info, log_debug, log_error
 from hcc_advisor.utils.sql_debug import capture_sql, is_debug_enabled
+
+
+# Values of T_TARGET_DATABASES.CONNECTION_MODE. SYSOPER is deliberately not
+# supported: a SYSOPER session runs as PUBLIC and cannot read the DBA_*/V$ views
+# the advisor depends on.
+CONNECTION_MODES = ('NORMAL', 'SYSDBA')
+
+# SQL*Plus-style privilege suffix typed into a username field ("sys as sysdba").
+_AS_PRIVILEGE_RE = re.compile(r'^(?P<user>.+?)\s+as\s+(?P<mode>sysdba|sysoper)$', re.IGNORECASE)
+
+
+def parse_target_login(username: Optional[str], mode: Optional[str] = None) -> Tuple[str, str]:
+    """
+    Normalize a target login into (username, connection_mode).
+
+    - Splits a SQL*Plus-style suffix off the username ("SYS AS SYSDBA" ->
+      ("SYS", "SYSDBA")). python-oracledb does not parse it, so the whole string
+      would be sent as the user name and the logon fails with ORA-01017.
+    - SYS can only log on with a privileged mode, so SYS + NORMAL is promoted to
+      SYSDBA instead of failing with ORA-28009.
+
+    Raises:
+        ValueError: for a connection mode the advisor does not support (SYSOPER)
+    """
+    user = username.strip() if isinstance(username, str) else ''
+    mode = mode.strip().upper() if isinstance(mode, str) and mode.strip() else 'NORMAL'
+    match = _AS_PRIVILEGE_RE.match(user)
+    if match:
+        user, mode = match.group('user').strip(), match.group('mode').upper()
+    if mode not in CONNECTION_MODES:
+        raise ValueError(
+            f"Connection mode {mode} is not supported (it cannot read the data "
+            f"dictionary). Use SYSDBA for SYS, or a dedicated advisor account."
+        )
+    if user.upper() == 'SYS' and mode == 'NORMAL':
+        mode = 'SYSDBA'
+    return user, mode
+
+
+def build_connect_kwargs(conn_config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build the credential kwargs for oracledb.connect() / oracledb.create_pool().
+
+    Accepts the registry's 'connection_mode' key or the UI's 'mode' key. 'mode'
+    is only passed for SYSDBA (supported for pools as well in thin mode), so
+    NORMAL logons keep the driver default.
+    """
+    user, mode = parse_target_login(
+        conn_config.get('username'),
+        conn_config.get('connection_mode') or conn_config.get('mode'),
+    )
+    connect_kwargs = {
+        'user': user,
+        'password': conn_config['password'],
+        'dsn': f"{conn_config['host']}:{conn_config['port']}/{conn_config['service']}",
+    }
+    if mode == 'SYSDBA':
+        connect_kwargs['mode'] = oracledb.AUTH_MODE_SYSDBA
+    return connect_kwargs
 
 
 class TargetConnector:
@@ -29,28 +89,31 @@ class TargetConnector:
         Args:
             database_id: Unique identifier for the target database
             conn_config: Connection configuration dict with keys:
-                         username, password, host, port, service
+                         username, password, host, port, service,
+                         connection_mode (optional, NORMAL or SYSDBA)
 
         Returns:
             oracledb.ConnectionPool: Connection pool for the target database
         """
+        connect_kwargs = build_connect_kwargs(conn_config)
         if database_id in cls._pools:
-            return cls._pools[database_id]
+            # Reuse the pool only while it was built from the same login. A target
+            # re-registered with another user/password/mode (e.g. switched to
+            # SYS AS SYSDBA) must not keep using a pool authenticated the old way.
+            if cls._pool_configs.get(database_id) == connect_kwargs:
+                return cls._pools[database_id]
+            log_info(f"Target pool for database_id={database_id} has a stale login; recreating")
+            cls.close_pool(database_id)
 
         try:
-            pool_kwargs = {
-                'user': conn_config['username'],
-                'password': conn_config['password'],
-                'dsn': f"{conn_config['host']}:{conn_config['port']}/{conn_config['service']}",
-                'min': config.TARGET_POOL_MIN,
-                'max': config.TARGET_POOL_MAX,
-                'increment': 1,
-            }
-            if conn_config.get('connection_mode', 'NORMAL') == 'SYSDBA':
-                pool_kwargs['mode'] = oracledb.AUTH_MODE_SYSDBA
-            pool = oracledb.create_pool(**pool_kwargs)
+            pool = oracledb.create_pool(
+                **connect_kwargs,
+                min=config.TARGET_POOL_MIN,
+                max=config.TARGET_POOL_MAX,
+                increment=1,
+            )
             cls._pools[database_id] = pool
-            cls._pool_configs[database_id] = conn_config
+            cls._pool_configs[database_id] = connect_kwargs
             log_info(f"Target pool created for database_id={database_id}")
             return pool
         except oracledb.Error as e:
@@ -497,29 +560,22 @@ class TargetConnector:
 
         Args:
             conn_config: Connection configuration dict with keys:
-                         username, password, host, port, service
+                         username, password, host, port, service,
+                         connection_mode (optional, NORMAL or SYSDBA)
 
         Returns:
             bool: True if connection successful
         """
         connection = None
         try:
-            dsn = f"{conn_config['host']}:{conn_config['port']}/{conn_config['service']}"
-            connect_kwargs = {
-                'user': conn_config['username'],
-                'password': conn_config['password'],
-                'dsn': dsn,
-            }
-            if conn_config.get('connection_mode', 'NORMAL') == 'SYSDBA':
-                connect_kwargs['mode'] = oracledb.AUTH_MODE_SYSDBA
-            connection = oracledb.connect(**connect_kwargs)
+            connection = oracledb.connect(**build_connect_kwargs(conn_config))
             cursor = connection.cursor()
             cursor.execute("SELECT 1 FROM DUAL")
             cursor.fetchone()
             cursor.close()
             log_info(f"[Target direct] Connection test successful to {conn_config['host']}:{conn_config['port']}/{conn_config['service']}")
             return True
-        except oracledb.Error as e:
+        except (oracledb.Error, ValueError) as e:
             log_error(e, f"TargetConnector.test_connection_direct(host={conn_config.get('host', '?')})")
             st.error(f"Target database connection test failed: {e}")
             return False

@@ -10,7 +10,7 @@ import oracledb
 from typing import Dict, Optional, Tuple
 from datetime import datetime
 from hcc_advisor.utils.central_queries import CentralQueries
-from hcc_advisor.utils.target_connector import TargetConnector
+from hcc_advisor.utils.target_connector import TargetConnector, build_connect_kwargs, parse_target_login
 from hcc_advisor.utils.logger import log_error, log_info
 from hcc_advisor.config import config
 from hcc_advisor.auth import AuthManager, ROLE_ADMIN
@@ -79,16 +79,13 @@ def decrypt_password(encrypted: str) -> str:
 
 
 def test_target_connection(conn_details: Dict) -> Tuple[bool, str, Optional[str]]:
-    """Test a target database connection directly. Supports SYSDBA mode."""
+    """Test a target database connection directly. Supports SYSDBA mode, also
+    when typed as a "SYS AS SYSDBA" username (see parse_target_login)."""
     try:
-        dsn = f"{conn_details['host']}:{conn_details['port']}/{conn_details['service']}"
-        connect_kwargs = {
-            'user': conn_details['username'],
-            'password': conn_details['password'],
-            'dsn': dsn,
-        }
-        if conn_details.get('mode', 'NORMAL') == 'SYSDBA':
-            connect_kwargs['mode'] = oracledb.AUTH_MODE_SYSDBA
+        connect_kwargs = build_connect_kwargs(conn_details)
+    except ValueError as e:
+        return False, f"Connection failed: {e}", None
+    try:
         connection = oracledb.connect(**connect_kwargs)
         cursor = connection.cursor()
         cursor.execute("SELECT 1 FROM DUAL")
@@ -180,6 +177,7 @@ def show_connections_page():
                         | **Port** | `{db.get('port', 'N/A')}` |
                         | **Service** | `{db.get('service_name', 'N/A')}` |
                         | **Username** | `{db.get('username', 'N/A')}` |
+                        | **Connection Mode** | {db.get('connection_mode') or 'NORMAL'} |
                         | **Environment** | {env} |
                         | **Platform** | {db.get('platform_type', 'STANDARD')} |
                         | **Oracle Version** | {db.get('oracle_version', 'Unknown')} |
@@ -273,7 +271,8 @@ def show_connections_page():
                 environment = st.selectbox("Environment", options=['PRODUCTION', 'DEV', 'TEST', 'UAT', 'STAGING'])
                 platform_type = st.selectbox("Platform", options=['STANDARD', 'EXADATA'])
                 port = st.number_input("Port *", min_value=1, max_value=65535, value=1521)
-                username = st.text_input("Username *", placeholder="e.g., COMPRESSION_MGR")
+                username = st.text_input("Username *", placeholder="e.g., COMPRESSION_MGR",
+                                         help="For SYS use Connection Mode SYSDBA ('SYS AS SYSDBA' is also accepted)")
                 conn_mode = st.selectbox("Connection Mode", ["NORMAL", "SYSDBA"],
                                           help="Use SYSDBA for SYS user connections")
                 description = st.text_input("Description", placeholder="Optional description")
@@ -285,6 +284,13 @@ def show_connections_page():
                 if not all([db_name, display_name, host, service, username, password]):
                     st.error("Please fill in all required fields")
                 else:
+                    # Accept "SYS AS SYSDBA" typed as the username and save the clean
+                    # username + mode (SYS always logs on AS SYSDBA).
+                    try:
+                        username, conn_mode = parse_target_login(username, conn_mode)
+                    except ValueError as exc:
+                        st.error(str(exc))
+                        st.stop()
                     # Test first
                     test_conn = {'host': host, 'port': port, 'service': service,
                                  'username': username, 'password': password, 'mode': conn_mode}

@@ -34,6 +34,27 @@ def _validate_identifier(value: str, kind: str = "identifier") -> str:
     return value
 
 
+# Oracle-maintained schemas whose tables the advisor must never MOVE/compress
+# (superset of the exclusion list in _discover_analysis_tables). A NORMAL advisor
+# account is kept away from SYS objects by Oracle itself (ANY privileges don't
+# reach the SYS schema), but a target registered AS SYSDBA has no such guard.
+_PROTECTED_SCHEMAS = frozenset({
+    'SYS', 'SYSTEM', 'AUDSYS', 'OUTLN', 'DBSNMP', 'GSMADMIN_INTERNAL',
+    'XDB', 'WMSYS', 'CTXSYS', 'MDSYS', 'ORDSYS', 'ORDDATA', 'ORDPLUGINS', 'OLAPSYS',
+    'APPQOSSYS', 'DBSFWUSER', 'GGSYS', 'SPATIAL_CSW_ADMIN_USR',
+    'SPATIAL_WFS_ADMIN_USR', 'ANONYMOUS', 'APEX_PUBLIC_USER',
+    'DIP', 'FLOWS_FILES', 'MDDATA', 'ORACLE_OCM', 'XS$NULL',
+    'REMOTE_SCHEDULER_AGENT', 'APEX_INSTANCE_ADMIN_USER',
+    'SYSBACKUP', 'SYSDG', 'SYSKM', 'SYSRAC', 'SYS$UMF', 'LBACSYS', 'DVSYS', 'DVF',
+    'OJVMSYS', 'EXFSYS', 'SI_INFORMTN_SCHEMA',
+})
+
+
+def is_protected_schema(owner) -> bool:
+    """True if owner is an Oracle-maintained schema the advisor must not compress."""
+    return bool(owner) and str(owner).strip().upper() in _PROTECTED_SCHEMAS
+
+
 def _acting_user() -> str:
     """Return the authenticated session role/user for audit trails (executed_by).
 
@@ -729,6 +750,8 @@ class TargetQueries:
 
         Only used when DBMS_COMPRESSION is unavailable (e.g., Oracle Free).
         Creates small temp tables from a row sample, compares segment sizes.
+        Skipped (ratios 1) when connected AS SYSDBA: the temp tables would be
+        created in the SYS schema, i.e. copies of user data in SYSTEM.
 
         Args:
             database_id: Target database identifier
@@ -744,6 +767,13 @@ class TargetQueries:
             v_fqn VARCHAR2(261) := :owner || '.' || :table_name;
             v_sample NUMBER := :sample_rows;
         BEGIN
+            -- Never create scratch tables in SYS (the session schema AS SYSDBA)
+            IF SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') = 'SYS' THEN
+                :basic_ratio := -1;
+                :oltp_ratio := -1;
+                RETURN;
+            END IF;
+
             BEGIN EXECUTE IMMEDIATE 'DROP TABLE TMP_CMP_UNC PURGE'; EXCEPTION WHEN OTHERS THEN NULL; END;
             BEGIN EXECUTE IMMEDIATE 'DROP TABLE TMP_CMP_BAS PURGE'; EXCEPTION WHEN OTHERS THEN NULL; END;
             BEGIN EXECUTE IMMEDIATE 'DROP TABLE TMP_CMP_OLT PURGE'; EXCEPTION WHEN OTHERS THEN NULL; END;
@@ -778,6 +808,11 @@ class TargetQueries:
                 in_params={'owner': owner, 'table_name': table_name, 'sample_rows': sample_rows},
                 out_params={'basic_ratio': float, 'oltp_ratio': float}
             )
+            if (result.get('basic_ratio') or 0) < 0:
+                log_warning(f"CTAS compression ratio fallback skipped for {owner}.{table_name}: "
+                            f"connected as SYS. Register the target with a dedicated "
+                            f"advisor account to measure ratios without DBMS_COMPRESSION.")
+                return {'basic': 1, 'oltp': 1}
             return {
                 'basic': result.get('basic_ratio') or 1,
                 'oltp': result.get('oltp_ratio') or 1,
@@ -1670,6 +1705,9 @@ class TargetQueries:
         # degree to a bounded integer before building the DDL.
         owner = _validate_identifier(owner, "owner")
         table_name = _validate_identifier(table_name, "table name")
+        if is_protected_schema(owner):
+            raise ValueError(f"Refusing to compress {owner}.{table_name}: "
+                             f"{owner} is an Oracle-maintained schema")
         if partition_name is not None:
             partition_name = _validate_identifier(partition_name, "partition name")
         if subpartition_name is not None:
@@ -1786,6 +1824,8 @@ ONLINE PARALLEL {parallel_degree};"""
                 'SI_INFORMTN_SCHEMA', 'OLAPSYS', 'MDDATA', 'SPATIAL_WFS_ADMIN_USR',
                 'SPATIAL_CSW_ADMIN_USR', 'ORDSYS', 'LBACSYS', 'XS$NULL'
             )
+            -- As SYS, ALL_TABLES exposes every internal schema (AUDSYS, DVSYS, ...)
+            AND owner NOT IN (SELECT username FROM all_users WHERE oracle_maintained = 'Y')
             ORDER BY owner
         """
 

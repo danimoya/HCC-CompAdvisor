@@ -18,6 +18,7 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 
 from hcc_advisor.config import config
+from hcc_advisor.utils.target_connector import build_connect_kwargs, parse_target_login
 from cryptography.fernet import Fernet
 
 BATCH_SIZE = 500
@@ -142,9 +143,11 @@ def get_central_connection() -> oracledb.Connection:
 
 
 def get_target_connection(args: argparse.Namespace) -> oracledb.Connection:
-    """Open a standalone connection to the target database."""
-    dsn = f"{args.host}:{args.port}/{args.service}"
-    return oracledb.connect(user=args.username, password=args.password, dsn=dsn)
+    """Open a standalone connection to the target database (SYSDBA-aware)."""
+    return oracledb.connect(**build_connect_kwargs({
+        "username": args.username, "password": args.password, "connection_mode": args.mode,
+        "host": args.host, "port": args.port, "service": args.service,
+    }))
 
 
 def test_connection(conn: oracledb.Connection, label: str) -> bool:
@@ -173,6 +176,18 @@ def table_exists(conn: oracledb.Connection, table_name: str) -> bool:
     return cnt > 0
 
 
+def column_exists(conn: oracledb.Connection, table_name: str, column_name: str) -> bool:
+    """Check whether a column exists on a table in the connected schema."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COUNT(*) FROM user_tab_columns WHERE table_name = :t AND column_name = :c",
+        {"t": table_name.upper(), "c": column_name.upper()},
+    )
+    cnt = cur.fetchone()[0]
+    cur.close()
+    return cnt > 0
+
+
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
@@ -182,30 +197,42 @@ def register_target_database(
 ) -> Optional[int]:
     """Insert a row into T_TARGET_DATABASES and return the new DATABASE_ID."""
     db_name = args.name.replace(" ", "_").upper()
+    username, mode = parse_target_login(args.username, args.mode)
     enc_pwd = encrypt_password(args.password)
 
     if dry_run:
         print(f"  [DRY-RUN] Would register '{db_name}' -> {args.host}:{args.port}/{args.service}")
         return -1
 
-    insert_sql = """
+    # CONNECTION_MODE only exists once patch 20260331-connection-mode-column ran.
+    has_mode_col = column_exists(central, "T_TARGET_DATABASES", "CONNECTION_MODE")
+    if not has_mode_col and mode != "NORMAL":
+        raise RuntimeError(
+            "T_TARGET_DATABASES.CONNECTION_MODE is missing; apply SQL patch "
+            "20260331-connection-mode-column (Admin -> SQL Patches) to register a "
+            f"{mode} target"
+        )
+    mode_col, mode_bind = (", connection_mode", ", :connection_mode") if has_mode_col else ("", "")
+    insert_sql = f"""
         INSERT INTO t_target_databases (
             database_name, display_name, db_host, port, service_name,
             username, password_encrypted, description, environment,
-            platform_type, is_active, created_date, created_by
+            platform_type{mode_col}, is_active, created_date, created_by
         ) VALUES (
             :database_name, :display_name, :db_host, :port, :service_name,
             :username, :password_encrypted, :description, :environment,
-            :platform_type, 'Y', SYSDATE, USER
+            :platform_type{mode_bind}, 'Y', SYSDATE, USER
         )
     """
     params = {
         "database_name": db_name, "display_name": args.name,
         "db_host": args.host, "port": args.port, "service_name": args.service,
-        "username": args.username, "password_encrypted": enc_pwd,
+        "username": username, "password_encrypted": enc_pwd,
         "description": args.description or f"Migrated from {args.host}:{args.port}/{args.service}",
         "environment": args.environment, "platform_type": args.platform,
     }
+    if has_mode_col:
+        params["connection_mode"] = mode
     cur = central.cursor()
     cur.execute(insert_sql, params)
     cur.execute(
@@ -287,8 +314,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", required=True, help="Target DB host")
     p.add_argument("--port", type=int, default=1521, help="Target DB port")
     p.add_argument("--service", required=True, help="Target DB service name")
-    p.add_argument("--username", required=True, help="Target DB username")
+    p.add_argument("--username", required=True,
+                   help="Target DB username ('SYS AS SYSDBA' is accepted)")
     p.add_argument("--password", required=True, help="Target DB password")
+    p.add_argument("--mode", default="NORMAL", choices=["NORMAL", "SYSDBA"],
+                   help="Target DB connection mode (default: NORMAL; SYS always uses SYSDBA)")
     p.add_argument("--name", required=True, help="Display name for the target database")
     p.add_argument("--description", default=None, help="Optional description")
     p.add_argument("--environment", default="PRODUCTION",
@@ -318,10 +348,13 @@ def main() -> int:
         return 1
     try:
         target = get_target_connection(args)
-    except oracledb.Error as exc:
+    except (oracledb.Error, ValueError) as exc:
         central.close()
         print(f"  [FATAL] Cannot connect to target DB: {exc}")
         return 1
+    if parse_target_login(args.username, args.mode)[0].upper() == "SYS":
+        print("  [WARN] Connected as SYS: legacy analysis tables are looked up in the "
+              "SYS schema; connect as their owner to migrate them")
     if not test_connection(central, "Central DB") or not test_connection(target, "Target DB"):
         central.close()
         target.close()
