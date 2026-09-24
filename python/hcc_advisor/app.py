@@ -56,7 +56,7 @@ if (_needs_setup or _needs_upgrade) and not st.session_state.get('setup_complete
 # --- Normal dashboard ---
 from streamlit_option_menu import option_menu
 from hcc_advisor.utils.central_connector import CentralConnector
-from hcc_advisor.utils.central_queries import CentralQueries
+from hcc_advisor.utils.central_queries import CentralQueries, target_selector_labels
 from hcc_advisor.utils.logger import get_recent_logs, get_error_logs, clear_logs
 from hcc_advisor.utils.sql_debug import get_sql_log, clear_sql_log, is_debug_enabled
 
@@ -334,24 +334,26 @@ def main():
         target_dbs = CentralQueries.get_target_databases()
 
         if not target_dbs.empty:
-            target_dbs.columns = [c.lower() for c in target_dbs.columns]
-            db_options = {"All Databases": None}
-            for _, db in target_dbs.iterrows():
-                db_options[db.get('display_name', db.get('database_name', 'Unknown'))] = db.get('database_id')
+            # Keyed on database_id: two targets may share a display name
+            # (registered before names were checked), and a label-keyed
+            # selector collapsed them into one option.
+            db_labels = target_selector_labels(target_dbs)
+            db_options = [None] + list(db_labels)   # None = All Databases
 
-            current_label = "All Databases"
-            for label, db_id in db_options.items():
-                if db_id == st.session_state.active_database_id:
-                    current_label = label
-                    break
+            active_id = st.session_state.active_database_id
+            try:
+                active_id = int(active_id) if active_id is not None else None
+            except (TypeError, ValueError):
+                active_id = None
 
             selected_db = st.selectbox(
                 "Active Database",
-                options=list(db_options.keys()),
-                index=list(db_options.keys()).index(current_label),
+                options=db_options,
+                index=db_options.index(active_id) if active_id in db_labels else 0,
+                format_func=lambda db_id: "All Databases" if db_id is None else db_labels[db_id],
                 key="db_selector"
             )
-            st.session_state.active_database_id = db_options[selected_db]
+            st.session_state.active_database_id = selected_db
         else:
             st.info("No target databases registered")
             st.session_state.active_database_id = None

@@ -85,6 +85,51 @@ def _cached_target_databases() -> pd.DataFrame:
     return CentralConnector.execute_query(query)
 
 
+def _cell_text(value: Any) -> str:
+    """A registry cell as stripped text; '' for None / NaN."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ''
+    return str(value).strip()
+
+
+def target_selector_labels(targets: Optional[pd.DataFrame]) -> Dict[int, str]:
+    """{database_id: label} for a target selector, in registry order.
+
+    Selectors key on DATABASE_ID and show this label (format_func). The label
+    is the display name (else the database name). Registries from before
+    display names were checked for uniqueness can hold the same name on
+    several targets: such labels get the host/service appended, and "ID n"
+    if even that is shared, so no two options look alike.
+    """
+    if targets is None or targets.empty:
+        return {}
+    entries = []
+    for rec in targets.to_dict('records'):
+        rec = {str(k).lower(): v for k, v in rec.items()}
+        try:
+            did = int(rec.get('database_id'))
+        except (TypeError, ValueError):
+            continue
+        name = (_cell_text(rec.get('display_name')) or _cell_text(rec.get('database_name'))
+                or f"DB {did}")
+        where = '/'.join(p for p in (_cell_text(rec.get('db_host')),
+                                     _cell_text(rec.get('service_name'))) if p)
+        entries.append((did, name, where))
+
+    def _counts(values):
+        counts: Dict[str, int] = {}
+        for v in values:
+            counts[v.casefold()] = counts.get(v.casefold(), 0) + 1
+        return counts
+
+    names = _counts(name for _, name, _ in entries)
+    labels = {did: (f"{name} ({where})" if names[name.casefold()] > 1 and where else name)
+              for did, name, where in entries}
+    shown = _counts(labels.values())
+    return {did: (f"{label} [ID {did}]" if shown[label.casefold()] > 1 else label)
+            for did, label in labels.items()}
+
+
 def _close_target_pool(database_id: int) -> None:
     """Drop the cached connection pool of a target whose registration changed, so
     the next connection re-reads its login (user/password/connection mode)."""
@@ -2022,6 +2067,48 @@ class CentralQueries:
             return False
 
     @staticmethod
+    def display_name_conflict(display_name: Optional[str],
+                              exclude_database_id: Optional[int] = None) -> Optional[str]:
+        """
+        Why display_name can't be used for a new or edited target, or None.
+
+        Display names are compared case-insensitively, ignoring surrounding
+        blanks, with every other ACTIVE target (the one being edited,
+        exclude_database_id, is skipped; removed targets don't count). The
+        registry has no constraint on the column, so a failed lookup is
+        logged and not treated as a conflict: the target selectors key on
+        DATABASE_ID and cope with duplicates.
+        """
+        name = _cell_text(display_name)
+        if not name:
+            return None
+        try:
+            df = CentralConnector.execute_query("""
+                SELECT database_id, database_name, display_name
+                FROM t_target_databases
+                WHERE is_active = 'Y' AND display_name IS NOT NULL
+            """, raise_on_error=True)
+        except Exception as e:
+            log_warning(f"Display-name check for '{name}' skipped: {e}")
+            return None
+        for rec in df.to_dict('records'):
+            rec = {str(k).lower(): v for k, v in rec.items()}
+            other = _cell_text(rec.get('display_name'))
+            if not other or other.casefold() != name.casefold():
+                continue
+            try:
+                other_id = int(rec.get('database_id'))
+            except (TypeError, ValueError):
+                other_id = None
+            if exclude_database_id is not None and other_id == int(exclude_database_id):
+                continue
+            db_name = _cell_text(rec.get('database_name'))
+            return (f"The display name '{name}' is already used by target '{other}' "
+                    f"({db_name + ', ' if db_name else ''}ID {other_id}). "
+                    f"Choose a different display name.")
+        return None
+
+    @staticmethod
     def get_target_database(database_id: int) -> Dict[str, Any]:
         """
         Get a single target database by ID
@@ -2079,7 +2166,8 @@ class CentralQueries:
                   platform_type, connection_mode, oracle_version
 
         Returns:
-            Tuple of (success, message, new_database_id)
+            Tuple of (success, message, new_database_id). A display name
+            another active target already uses (case-insensitively) is refused.
         """
         # Store the clean login: "SYS AS SYSDBA" typed as the username is saved
         # as username=SYS, connection_mode=SYSDBA (see parse_target_login).
@@ -2141,6 +2229,10 @@ class CentralQueries:
             # pre-check is traceable without alarming on the expected race path.
             log_debug(f"add_target_database: duplicate pre-check skipped: {e}")
 
+        conflict = CentralQueries.display_name_conflict(db_data.get('display_name'))
+        if conflict:
+            return False, conflict, None
+
         try:
             # Strict mode so a failed INSERT reaches the except below (e.g. the
             # friendly duplicate-name message) instead of returning 0
@@ -2182,7 +2274,8 @@ class CentralQueries:
             reactivate: Also set is_active='Y' (re-registering a removed target)
 
         Returns:
-            Tuple of (success, message)
+            Tuple of (success, message). A display name another active target
+            already uses (case-insensitively) is refused.
         """
         # Bind exactly the placeholders of the UPDATE below: python-oracledb
         # rejects unused named binds (DPY-4008), so passing db_data through
@@ -2227,6 +2320,11 @@ class CentralQueries:
                 modified_by = USER
             WHERE database_id = :database_id
         """
+
+        conflict = CentralQueries.display_name_conflict(params['display_name'],
+                                                        exclude_database_id=database_id)
+        if conflict:
+            return False, conflict
 
         if not CentralQueries.ensure_connection_mode_column():
             return False, _CONNECTION_MODE_PATCH_MSG
@@ -2617,7 +2715,10 @@ class CentralQueries:
                 original_ddl unless the record supplies one.
 
         Returns:
-            Optional[int]: history_id of the new row, or None on failure.
+            Optional[int]: history_id of the new row, or None on failure (logged;
+            an insert UNQ_HISTORY_OPEN_SEGMENT rejects, i.e. the segment already
+            has a QUEUED / IN_PROGRESS row, shows no error banner either: the
+            caller reports it).
             Later updates of the row should match on this id rather than on
             owner/object_name, so concurrent runs don't touch each other's rows.
         """
@@ -2684,7 +2785,10 @@ class CentralQueries:
             params['error_message'] = str(params['error_message'])[:4000]
 
         try:
-            new_id = CentralConnector.execute_dml_returning(insert_query, params, out_bind='new_id')
+            # Strict mode: a rejected insert comes back here instead of as the
+            # connector's raw "DML error" banner (see the except below).
+            new_id = CentralConnector.execute_dml_returning(insert_query, params, out_bind='new_id',
+                                                            raise_on_error=True)
             if new_id is not None:
                 new_id = int(new_id)
                 log_info(f"Compression history stored: database_id={database_id}, "
@@ -2693,11 +2797,19 @@ class CentralQueries:
                 return new_id
             return None
         except Exception as e:
-            log_error(e, "store_compression_history", {
-                'database_id': database_id,
-                'object': f"{params.get('owner')}.{params.get('object_name')}"
-            })
-            st.error(f"Failed to store compression history: {e}")
+            from hcc_advisor.utils.target_queries import _is_open_segment_conflict
+
+            context = {'database_id': database_id,
+                       'object': f"{params.get('owner')}.{params.get('object_name')}"}
+            if _is_open_segment_conflict(e):
+                # UNQ_HISTORY_OPEN_SEGMENT: another session queued or started
+                # this segment an instant ago. Expected in that race; the caller
+                # (execute_compression) reports "already queued or running".
+                log_warning(f"Compression history not stored, the segment already has an "
+                            f"open row: {context} ({e})")
+            else:
+                log_error(e, "store_compression_history", context)
+                st.error(f"Failed to store compression history: {e}")
             return None
 
     # ============================================================================

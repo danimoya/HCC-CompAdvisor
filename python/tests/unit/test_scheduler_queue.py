@@ -114,7 +114,7 @@ class FakeCentral:
             original_size_bytes=None, compressed_size_bytes=None,
             compression_ratio_achieved=None, duration_seconds=None,
             error_message=None, error_code=None, executed_by=None, original_ddl=None,
-            age_minutes=0.0,
+            execution_mode=None, age_minutes=0.0,
         )
         row.update(kw)
         row['history_id'] = hid
@@ -153,6 +153,14 @@ class FakeCentral:
                    and r['operation_status'] in ('QUEUED', 'IN_PROGRESS')]
             return _df([[r['owner'], r['object_name'], r['partition_name'], r['subpartition_name']]
                         for r in sel], ['OWNER', 'OBJECT_NAME', 'PARTITION_NAME', 'SUBPARTITION_NAME'])
+        if s.startswith('SELECT history_id, operation_status, partition_name, subpartition_name'):
+            sel = sorted((r for r in rows if r['database_id'] == p['db'] and r['owner'] == p['o']
+                          and r['object_name'] == p['t']
+                          and r['operation_status'] in ('QUEUED', 'IN_PROGRESS')),
+                         key=lambda r: r['history_id'])                 # _overlapping_open_row
+            return _df([[r['history_id'], r['operation_status'], r['partition_name'],
+                         r['subpartition_name']] for r in sel],
+                       ['HISTORY_ID', 'OPERATION_STATUS', 'PARTITION_NAME', 'SUBPARTITION_NAME'])
         if s.startswith('SELECT history_id, operation_status FROM t_compression_history'):
             assert 'ROWNUM = 1' in s                                    # _open_segment_row
             key = self._open_key(p['db'], p['o'], p['t'], p['p'], p['sp'])
@@ -204,7 +212,7 @@ class FakeCentral:
                         object_type=p['otype'], partition_name=p['part'],
                         subpartition_name=p['sub'], compression_type_applied=p['comp'],
                         parallel_degree=p['dop'], executed_by=p['executed_by'],
-                        operation_status='QUEUED')
+                        execution_mode=p.get('mode'), operation_status='QUEUED')
 
     def dml(self, sql, params=None, commit=True, raise_on_error=False):
         s, p = _norm(sql), dict(params or {})
@@ -235,7 +243,7 @@ class FakeCentral:
                 self._check_row_stays_unique(row)
                 row.update(operation_status='IN_PROGRESS', compression_clause=p['job'],
                            original_ddl=p['ddl'], start_time=self._tick(), age_minutes=0.0,
-                           error_message=None)
+                           error_message=None, execution_mode=p.get('mode'))
                 return 1
             if "SET operation_status = 'QUEUED'" in s:                 # requeue
                 if row['operation_status'] != 'IN_PROGRESS':
@@ -279,7 +287,8 @@ class FakeCentral:
             return n
         raise AssertionError(f"unexpected central DML: {s}")
 
-    def dml_returning(self, sql, params=None, out_bind='new_id', commit=True):
+    def dml_returning(self, sql, params=None, out_bind='new_id', commit=True,
+                      raise_on_error=False):
         s, p = _norm(sql), dict(params or {})
         _check_binds(s, p, extra=(out_bind,))
         self.statements.append(('dml', s, p))
@@ -297,10 +306,13 @@ class FakeCentral:
                     compression_type_applied=p['compression_type_applied'],
                     compression_clause=p['compression_clause'], parallel_degree=p['parallel_degree'],
                     operation_status=p['operation_status'], executed_by=p['executed_by'],
-                    original_size_bytes=p['original_size_bytes'], original_ddl=p['original_ddl'])
+                    original_size_bytes=p['original_size_bytes'], original_ddl=p['original_ddl'],
+                    execution_mode=p['execution_mode'])
             assert "'QUEUED', SYSTIMESTAMP" in s
             return self._insert(p)
         except oracledb.Error:
+            if raise_on_error:
+                raise
             return None   # CentralConnector.execute_dml_returning logs it and returns None
 
     @contextmanager
@@ -1255,7 +1267,7 @@ class TestLongDdl:
     def test_store_keeps_full_ddl_in_original_ddl(self):
         captured = {}
 
-        def returning(sql, params, out_bind='new_id', commit=True):
+        def returning(sql, params, out_bind='new_id', commit=True, raise_on_error=False):
             _check_binds(_norm(sql), params, extra=(out_bind,))
             captured.update(params)
             return 9
@@ -1322,9 +1334,13 @@ class TestIndexRebuildCount:
 
     def test_only_successful_rebuilds_are_counted(self):
         def query(database_id, sql, params=None):
-            if 'all_indexes' in sql:
-                return pd.DataFrame([{'OWNER': 'APP', 'INDEX_NAME': 'IX1'},
-                                     {'OWNER': 'APP', 'INDEX_NAME': 'IX2'}])
+            if 'all_indexes' in sql:   # the moved segment's unusable index structures
+                assert params == {'o': 'APP', 't': 'ORDERS', 'p': None, 'sp': None}
+                return pd.DataFrame([
+                    {'INDEX_OWNER': 'APP', 'INDEX_NAME': 'IX1', 'REBUILD_LEVEL': 'INDEX',
+                     'SEGMENT_NAME': None},
+                    {'INDEX_OWNER': 'APP', 'INDEX_NAME': 'IX2', 'REBUILD_LEVEL': 'INDEX',
+                     'SEGMENT_NAME': None}])
             if 'dba_segments' in sql:
                 return pd.DataFrame([{'SIZE_BYTES': 100}])
             return pd.DataFrame()

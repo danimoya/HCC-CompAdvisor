@@ -21,6 +21,7 @@ from hcc_advisor.views import page_04_history, page_11_indexes
 CENTRAL_SCHEMA = Path(__file__).resolve().parents[3] / 'sql' / 'central' / '01_central_schema.sql'
 
 INDEX_COLS = ['INDEX_OWNER', 'INDEX_NAME', 'REBUILD_LEVEL', 'SEGMENT_NAME']
+OPEN_ROW_COLS = ['HISTORY_ID', 'OPERATION_STATUS', 'PARTITION_NAME', 'SUBPARTITION_NAME']
 
 
 def _binds(sql: str) -> set:
@@ -39,7 +40,7 @@ def _history_row(status='SUCCESS', rollback_status=None, object_type='TABLE',
 class _Recorder:
     """Patches the connectors and records every statement sent to them."""
 
-    def __init__(self, index_rows=None, history=None, plsql_ok=True):
+    def __init__(self, index_rows=None, history=None, plsql_ok=True, open_rows=None):
         self.plsql = []            # PL/SQL blocks sent to the target
         self.target_queries = []   # (sql, params) sent to the target
         self.central_dml = []      # (sql, params) sent to central
@@ -47,6 +48,8 @@ class _Recorder:
         self._index_df = pd.DataFrame(index_rows or [], columns=INDEX_COLS)
         self._history = history if history is not None else _history_row()
         self._plsql_ok = plsql_ok
+        # QUEUED / IN_PROGRESS rows of the table (TargetQueries._overlapping_open_row)
+        self._open_rows = pd.DataFrame(open_rows or [], columns=OPEN_ROW_COLS)
 
     def _execute_plsql(self, database_id, block, *a, **k):
         self.plsql.append(block)
@@ -63,7 +66,13 @@ class _Recorder:
 
     def _central_query(self, sql, params=None, *a, **k):
         self.central_queries.append((sql, params))
+        if "operation_status IN ('QUEUED', 'IN_PROGRESS')" in sql:
+            return self._open_rows
         return self._history
+
+    @property
+    def history_checks(self):
+        return [(s, p) for s, p in self.central_queries if 'hid' in (p or {})]
 
     def __enter__(self):
         self._patches = [
@@ -266,7 +275,11 @@ class TestRollbackHistory:
     def test_no_history_id_writes_no_history(self):
         with _Recorder() as rec:
             TargetQueries.rollback_compression(7, 'SCOTT', 'SALES')
-        assert rec.history_updates == [] and rec.central_queries == []
+        assert rec.history_updates == [] and rec.history_checks == []
+        # the only central read: the queue check every rollback makes
+        (sql, params), = rec.central_queries
+        assert "operation_status IN ('QUEUED', 'IN_PROGRESS')" in sql
+        assert params == {'db': 7, 'o': 'SCOTT', 't': 'SALES'}
 
     @pytest.mark.parametrize('history', [
         _history_row(status='ROLLED_BACK'),

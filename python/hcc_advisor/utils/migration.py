@@ -247,6 +247,90 @@ def register_target_database(
 
 
 # ---------------------------------------------------------------------------
+# Open history rows (UNQ_HISTORY_OPEN_SEGMENT)
+# ---------------------------------------------------------------------------
+
+OPEN_STATUSES = ("QUEUED", "IN_PROGRESS")
+DUPLICATE_OPEN_ROW_MSG = (
+    "Duplicate open row closed by the migration: history_id {keeper} is already "
+    "{keeper_status} for this segment, and the central schema allows one open "
+    "(QUEUED / IN_PROGRESS) row per segment. Imported as FAILED; the original "
+    "status was {status}."
+)
+
+
+def _fit_error_message(text: str, limit: int = 4000) -> str:
+    """Cut text to ERROR_MESSAGE's VARCHAR2(4000) (bytes) on a character boundary."""
+    data = text.encode("utf-8")
+    if len(data) <= limit:
+        return text
+    return data[:limit].decode("utf-8", errors="ignore")
+
+
+def close_duplicate_open_rows(
+    columns: List[str], rows: List[tuple], closed_at: Optional[datetime] = None,
+) -> Tuple[List[tuple], List[str]]:
+    """Make legacy T_COMPRESSION_HISTORY rows fit UNQ_HISTORY_OPEN_SEGMENT.
+
+    The central index allows one open (QUEUED / IN_PROGRESS) row per segment
+    (owner, object, partition, subpartition); legacy tables had no such rule,
+    so importing several open rows of one segment failed the whole migration
+    with ORA-00001. The row kept open is chosen like the index's patch does it
+    (an IN_PROGRESS row before a QUEUED one, then the oldest START_TIME, then
+    the lowest HISTORY_ID); every other open row of that segment is imported
+    as FAILED with the reason in ERROR_MESSAGE (and END_TIME set if it had
+    none). No row is dropped.
+
+    Returns:
+        (rows to import, one report line per row imported as FAILED)
+    """
+    idx = {c: i for i, c in enumerate(columns)}
+    groups: Dict[tuple, List[int]] = {}
+    for n, row in enumerate(rows):
+        if row[idx["OPERATION_STATUS"]] in OPEN_STATUSES:
+            key = (row[idx["OWNER"]], row[idx["OBJECT_NAME"]],
+                   row[idx["PARTITION_NAME"]] or "~", row[idx["SUBPARTITION_NAME"]] or "~")
+            groups.setdefault(key, []).append(n)
+
+    def _keeper_order(n):
+        row = rows[n]
+        start = row[idx["START_TIME"]]
+        return (0 if row[idx["OPERATION_STATUS"]] == "IN_PROGRESS" else 1,
+                start is None, start or datetime.min, row[idx["HISTORY_ID"]] or 0)
+
+    out = list(rows)
+    report: List[str] = []
+    closed_at = closed_at or datetime.now()
+    for (owner, obj, part, sub), members in groups.items():
+        if len(members) < 2:
+            continue
+        keeper, *extras = sorted(members, key=_keeper_order)
+        keeper_id = rows[keeper][idx["HISTORY_ID"]]
+        keeper_status = rows[keeper][idx["OPERATION_STATUS"]]
+        segment = f"{owner}.{obj}"
+        if sub != "~":
+            segment += f" subpartition {sub}"
+        elif part != "~":
+            segment += f" partition {part}"
+        for n in extras:
+            row = list(rows[n])
+            status = row[idx["OPERATION_STATUS"]]
+            reason = DUPLICATE_OPEN_ROW_MSG.format(
+                keeper=keeper_id, status=status,
+                keeper_status="running" if keeper_status == "IN_PROGRESS" else "queued")
+            old_error = row[idx["ERROR_MESSAGE"]]
+            row[idx["ERROR_MESSAGE"]] = _fit_error_message(
+                f"{reason} Previous error: {old_error}" if old_error else reason)
+            row[idx["OPERATION_STATUS"]] = "FAILED"
+            if row[idx["END_TIME"]] is None:
+                row[idx["END_TIME"]] = closed_at
+            out[n] = tuple(row)
+            report.append(f"history_id {row[idx['HISTORY_ID']]} ({segment}, {status}) imported as "
+                          f"FAILED; history_id {keeper_id} stays {keeper_status}")
+    return out, report
+
+
+# ---------------------------------------------------------------------------
 # Table migration
 # ---------------------------------------------------------------------------
 
@@ -273,6 +357,17 @@ def migrate_table(
     if row_count == 0:
         print(f"  [SKIP] {table_name}: 0 rows in source")
         return 0
+
+    if table_name == "T_COMPRESSION_HISTORY":
+        # One open row per segment in the central schema (UNQ_HISTORY_OPEN_SEGMENT)
+        rows, closed = close_duplicate_open_rows(columns, rows)
+        if closed:
+            verb = "would be imported" if dry_run else "imported"
+            print(f"  [WARN] {table_name}: {len(closed)} duplicate open (QUEUED/IN_PROGRESS) "
+                  f"row(s) {verb} as FAILED, the reason in ERROR_MESSAGE:")
+            for line in closed:
+                print(f"         {line}")
+
     if dry_run:
         print(f"  [DRY-RUN] {table_name}: would migrate {row_count} rows")
         return row_count

@@ -14,8 +14,15 @@ from hcc_advisor.utils.leaf_segments import leaf_segments
 from hcc_advisor.config import config
 from hcc_advisor.auth import AuthManager, ROLE_OPERATOR
 from hcc_advisor.views.page_03_execution import (
-    BACKGROUND_HELP, BACKGROUND_LABEL, submit_background_compression,
+    BACKGROUND_HELP, BACKGROUND_LABEL, _segment_names, submit_background_compression,
 )
+
+
+def _row_segment(table_row):
+    """(partition, subpartition) of a selected Detailed-tab row (its
+    'Partition' / 'Subpartition' columns), None for NULL / NaN / blank."""
+    return _segment_names({'partition_name': table_row.get('Partition'),
+                           'subpartition_name': table_row.get('Subpartition')})
 
 
 def show_recommendations_page():
@@ -963,12 +970,13 @@ def execute_batch_compression(selected_df: pd.DataFrame, original_df: pd.DataFra
         items = []
         for rec_id in selected_ids:
             table_row = selected_df[selected_df['ID'] == rec_id].iloc[0]
-            partition = table_row.get('Partition')
+            partition, subpartition = _row_segment(table_row)
             items.append({
                 'owner': table_row.get('Owner', 'UNKNOWN'),
                 'table_name': table_row.get('Table', f'ID-{rec_id}'),
                 'compression_type': table_row.get('Advised', table_row.get('Strategy', 'QUERY HIGH')),
-                'partition_name': str(partition) if pd.notna(partition) and partition else None,
+                'partition_name': partition,
+                'subpartition_name': subpartition,
             })
         st.markdown("---")
         submit_background_compression(items, db_id, parallel_degree)
@@ -1004,17 +1012,14 @@ def execute_batch_compression(selected_df: pd.DataFrame, original_df: pd.DataFra
 
         try:
             strategy = table_row.get('Advised', table_row.get('Strategy', 'QUERY HIGH'))
-            partition = table_row.get('Partition')
-            if pd.notna(partition) and partition:
-                partition = str(partition)
-            else:
-                partition = None
+            partition, subpartition = _row_segment(table_row)
             result = TargetQueries.execute_compression(
                 db_id,
                 owner=owner,
                 table_name=table_name,
                 compression_type=strategy,
                 partition_name=partition,
+                subpartition_name=subpartition,
                 dry_run=dry_run,
                 parallel_degree=parallel_degree
             )
