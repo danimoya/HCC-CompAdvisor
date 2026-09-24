@@ -375,7 +375,9 @@ def show_detailed_tab(df: pd.DataFrame):
             "Q.LOW": st.column_config.NumberColumn("Q.LOW", format="%.2fx", help="HCC Query Low ratio (Exadata)"),
             "Q.HIGH": st.column_config.NumberColumn("Q.HIGH", format="%.2fx", help="HCC Query High ratio (Exadata)"),
             "Best Ratio": st.column_config.NumberColumn("Best Ratio", format="%.2fx"),
-            "Hotness": st.column_config.NumberColumn("Hotness", format="%.1f", help="DML activity score 0-100"),
+            "Hotness": st.column_config.NumberColumn(
+                "Hotness", format="%.1f",
+                help="Activity score 0-100 (writes/day + block reads/day, absolute scale)"),
             "Heat": st.column_config.TextColumn("Heat", width="small", help="HOT/WARM/COOL/COLD"),
             "Rows": st.column_config.NumberColumn("Rows", format="%d"),
             "Reason": st.column_config.TextColumn("Reason", width="large"),
@@ -668,10 +670,10 @@ def show_analysis_details(analysis_id: int):
             write_ratio = activity.get('write_ratio') or 0
             st.metric("Write Ratio", f"{write_ratio:.1%}")
 
-        # Hotness explanation
-        if hotness >= 70:
+        # Hotness explanation (bands match HOTNESS_CATEGORY: HOT >= 75, WARM >= 50)
+        if hotness >= 75:
             st.warning("⚠️ **High Activity Table**: Frequent DML operations may cause row migration with aggressive compression. Consider OLTP compression.")
-        elif hotness >= 30:
+        elif hotness >= 50:
             st.info("ℹ️ **Moderate Activity**: Table has balanced read/write activity. Most compression methods suitable.")
         else:
             st.success("✅ **Low Activity Table**: Ideal candidate for aggressive compression (QUERY HIGH or ARCHIVE).")
