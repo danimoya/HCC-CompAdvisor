@@ -19,6 +19,7 @@ from hcc_advisor.utils.sql_builder import (
     gather_dependent_indexes,
 )
 from hcc_advisor.utils.logger import log_warning
+from hcc_advisor.auth import AuthManager, ROLE_OPERATOR
 
 
 def show_scheduler_page():
@@ -31,9 +32,7 @@ def show_scheduler_page():
     # Initialize session state — auto-refresh OFF on startup, user must start it
     if 'scheduler_auto_refresh' not in st.session_state:
         st.session_state.scheduler_auto_refresh = False
-    if 'scheduler_pending_queue' not in st.session_state:
-        # Reload queued items from central DB (survives app restart)
-        st.session_state.scheduler_pending_queue = _load_persistent_queue(db_id)
+    # The job queue lives in T_COMPRESSION_HISTORY (QUEUED rows); nothing to load.
 
     # Controls row
     col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
@@ -83,7 +82,7 @@ def show_scheduler_page():
     # Status filter
     status_filter = st.selectbox(
         "Filter by Status",
-        ["All", "IN_PROGRESS", "SUCCESS", "FAILED"],
+        ["All", "QUEUED", "IN_PROGRESS", "SUCCESS", "FAILED"],
         key="sched_status_filter"
     )
 
@@ -105,6 +104,11 @@ def show_scheduler_page():
             st.info(f"No jobs with status '{status_filter}' in the last 24 hours.")
     else:
         st.info("No compression jobs recorded in the last 24 hours.")
+
+    # Close operations that no job or thread will ever finish
+    st.markdown("---")
+    with st.expander("Reconcile stale operations"):
+        _render_reconcile_section(db_id)
 
     # Export to SQL / CSV section
     st.markdown("---")
@@ -362,9 +366,6 @@ def _render_import_section(current_db_id):
                 # Oracle reports OLTP as compress_for='ADVANCED'; normalize both
                 # sides so an already-compressed object isn't needlessly re-moved.
                 state = 'ALREADY AT TARGET'
-            elif level == 'SUBPARTITION':
-                # Job submission operates at table/partition granularity only.
-                state = 'EXISTS (subpartition — queue manually)'
             else:
                 state = 'READY'
             rows.append({
@@ -384,6 +385,7 @@ def _render_import_section(current_db_id):
                     'table_name': obj['object_name'],
                     'compression_type': planned,
                     'partition_name': obj['partition_name'],
+                    'subpartition_name': obj['subpartition_name'],
                     'dop': obj['dop'],
                 })
         st.session_state['import_verify_rows'] = rows
@@ -408,33 +410,25 @@ def _render_import_section(current_db_id):
             if st.button(f"Add {len(verified)} verified object(s) to scheduler queue",
                          key="import_add_queue_btn", type="primary",
                          use_container_width=True):
-                # Merge with the full persistent queue across ALL databases so
-                # saving doesn't drop QUEUED rows for databases not loaded into
-                # this session (the persist step deletes-then-reinserts).
-                full_queue = _load_persistent_queue(None)
-                seen = {(q['database_id'], q['owner'], q['table_name'], q.get('partition_name'))
-                        for q in full_queue}
-                added = 0
-                for v in verified:
-                    k = (v['database_id'], v['owner'], v['table_name'], v.get('partition_name'))
-                    if k not in seen:
-                        full_queue.append(v)
-                        seen.add(k)
-                        added += 1
-                st.session_state.scheduler_pending_queue = full_queue
-                _save_persistent_queue(full_queue)
+                # New QUEUED rows only; rows already in the queue are untouched.
+                res = TargetQueries.enqueue_compression_jobs(verified)
                 st.session_state.pop('import_verify_rows', None)
                 st.session_state.pop('import_verified_objects', None)
-                st.success(
-                    f"Queued {added} verified object(s) for {label}"
-                    + (f" ({len(verified) - added} already queued)" if added < len(verified) else "")
-                    + ". They appear above as QUEUED and submit as capacity frees up."
-                )
-                st.rerun()
+                msg = f"Queued {res['added']} verified object(s) for {label}"
+                if res['duplicates']:
+                    msg += f" ({res['duplicates']} already queued or running)"
+                msg += ". They appear above as QUEUED and submit as capacity frees up."
+                if res['errors']:
+                    st.warning(msg)
+                    st.error(f"{res['rejected']} object(s) not queued:\n\n- "
+                             + "\n- ".join(res['errors'][:20]))
+                else:
+                    st.success(msg)
+                    st.rerun()
         else:
             st.info("No objects are in a READY state to queue (all are missing, "
-                    "already at the target compression, subpartition-level, or "
-                    "carry an unsupported compression type).")
+                    "already at the target compression, or carry an "
+                    "unsupported compression type).")
 
 
 def _render_recurring_jobs(db_id):
@@ -470,9 +464,12 @@ def _render_recurring_jobs(db_id):
 
 
 def _do_refresh(db_id):
-    """Poll completed jobs and drain pending queue."""
+    """Reconcile open operations (finished / lost jobs, stale rows) and drain
+    the pending queue."""
     if db_id:
-        TargetQueries.check_completed_jobs(db_id)
+        res = TargetQueries.reconcile_operations(db_id)
+        if res['errors']:
+            st.toast(f"Status poll of db_id={db_id} incomplete: {res['errors'][0]}", icon="⚠️")
     else:
         # Cross-database: poll all registered databases
         poll_failures = []
@@ -484,7 +481,11 @@ def _do_refresh(db_id):
                     did = db.get('database_id')
                     if did:
                         try:
-                            TargetQueries.check_completed_jobs(int(did))
+                            res = TargetQueries.reconcile_operations(int(did))
+                            if res['errors']:
+                                log_warning(f"Scheduler: polling db_id={did} incomplete: "
+                                            f"{res['errors']}")
+                                poll_failures.append(int(did))
                         except Exception as e:
                             log_warning(f"Scheduler: polling db_id={did} failed: {e}")
                             poll_failures.append(int(did))
@@ -498,173 +499,97 @@ def _do_refresh(db_id):
                 icon="⚠️",
             )
     # Drain pending queue (handles per-database grouping internally)
-    _drain_pending_queue(db_id)
+    if AuthManager.has_role(ROLE_OPERATOR):
+        _drain_pending_queue(db_id)
 
 
 def _drain_pending_queue(db_id):
-    """Submit pending items respecting per-database DOP budget (CPU_COUNT/2).
-    Total DOP of running jobs + new job DOP must not exceed the budget.
+    """Submit QUEUED items respecting each database's DOP budget (CPU_COUNT/2).
 
-    Operates on the FULL cross-database queue (reloaded from the central DB)
-    rather than the per-session subset. _save_persistent_queue rewrites ALL
-    QUEUED rows, so draining a partial (single-DB) view here would silently
-    delete other databases' queued work. Reloading the complete set keeps the
-    delete-then-reinsert persistence faithful regardless of the active DB.
+    Drains every database's queue, as before. Each item is claimed atomically
+    (QUEUED -> IN_PROGRESS on its own row), so two tabs or admins draining at
+    once can't submit the same item. Items that don't fit, or overlap a running
+    job on the same segment, stay QUEUED in FIFO order; an item that can't be
+    submitted ends FAILED with the reason on its row — nothing is dropped.
     """
-    queue = _load_persistent_queue(None)
-    if not queue:
-        st.session_state.scheduler_pending_queue = []
-        return
+    stats = TargetQueries.drain_compression_queue(None)
+    for did in dict.fromkeys(stats['skipped_databases']):
+        st.toast(f"Queue drain skipped db_id={did} (target unreachable or "
+                 f"budget lookup failed); its items stay queued", icon="⚠️")
+    if stats['failed']:
+        st.toast(f"{stats['failed']} queued item(s) could not be submitted and were "
+                 f"marked FAILED (see error_message)", icon="⚠️")
+    if stats['submitted'] > 0:
+        st.toast(f"Drained {stats['submitted']} from queue ({stats['waiting']} remaining)")
+    for err in stats['errors']:
+        log_warning(f"Scheduler drain: {err}")
 
-    from collections import defaultdict
-    by_db = defaultdict(list)
-    for item in queue:
-        did = item.get('database_id', db_id)
-        if did:
-            by_db[int(did)].append(item)
 
-    submitted = 0
-    remaining = []
-    db_dop_remaining = {}
-
-    for did, items in by_db.items():
-        if did not in db_dop_remaining:
-            try:
-                cpu = TargetQueries.get_cpu_count(did)
-                budget = max(1, cpu // 2)
-                used = TargetQueries.get_running_total_dop(did)
-                db_dop_remaining[did] = max(0, budget - used)
-            except Exception as e:
-                log_warning(
-                    f"Scheduler: DOP-budget lookup for db_id={did} failed, "
-                    f"queue drain will skip this database: {e}"
-                )
-                st.toast(
-                    f"Queue drain skipped db_id={did} (budget lookup failed)",
-                    icon="⚠️",
-                )
-                db_dop_remaining[did] = 0
-
-        for item in items:
-            item_dop = int(item.get('dop', 4) or 4)
-            if db_dop_remaining.get(did, 0) >= item_dop:
-                # Guard against a single bad queue item (e.g. an unsupported
-                # compression_type raising in generate_ddl) crashing the whole
-                # page render and aborting the save below.
+def _render_reconcile_section(db_id):
+    """Operator action: close IN_PROGRESS / RUNNING operations that no job or
+    thread will ever finish (see TargetQueries.reconcile_operations)."""
+    st.markdown(
+        "Closes operations stuck in **IN_PROGRESS** / **RUNNING** that nothing "
+        "will ever finish:\n"
+        "- **Scheduler jobs** are looked up on the target: a finished job gets its "
+        "real outcome (SUCCEEDED → SUCCESS, FAILED / STOPPED → FAILED, however old); "
+        "a job the target no longer knows (dropped, or its log purged) is marked "
+        f"FAILED once it is {TargetQueries.JOB_NOT_FOUND_GRACE_MINUTES} min old.\n"
+        "- **Direct compressions** still open after "
+        f"{TargetQueries.SYNC_STALE_HOURS} h, with no target session running the "
+        "MOVE, are marked FAILED with *outcome unknown* (the app was restarted "
+        "mid-MOVE) — check the segment before retrying.\n"
+        "- **Analysis runs** still RUNNING after "
+        f"{TargetQueries.ADVISOR_RUN_STALE_HOURS} h are marked FAILED.\n\n"
+        "Operations this app is still running are never touched, and nothing is "
+        "changed for a target that can't be reached. The same checks run on every "
+        "refresh; this button runs them now and shows what changed."
+    )
+    allowed = AuthManager.has_role(ROLE_OPERATOR)
+    scope = f"database ID={db_id}" if db_id else "all registered databases"
+    clicked = st.button(f"Reconcile stale operations ({scope})", key="sched_reconcile_btn",
+                        disabled=not allowed,
+                        help=None if allowed else "Requires the operator role.")
+    if clicked and AuthManager.require_role(ROLE_OPERATOR):
+        if db_id:
+            targets = [int(db_id)]
+        else:
+            dbs = CentralQueries.get_target_databases()
+            targets = []
+            if not dbs.empty:
+                dbs.columns = [c.lower() for c in dbs.columns]
+                targets = [int(d) for d in dbs['database_id'].dropna()]
+        results = []
+        with st.spinner(f"Reconciling {len(targets)} database(s)..."):
+            for did in targets:
                 try:
-                    result = TargetQueries.submit_compression_job(
-                        did, item['owner'], item['table_name'],
-                        item['compression_type'],
-                        partition_name=item.get('partition_name'),
-                        parallel_degree=item_dop
-                    )
+                    results.append(TargetQueries.reconcile_operations(did))
                 except Exception as e:
-                    log_warning(
-                        f"Scheduler: submit failed for "
-                        f"{item.get('owner')}.{item.get('table_name')}: {e}"
-                    )
-                    st.toast(
-                        f"Skipped {item.get('owner')}.{item.get('table_name')}: {e}",
-                        icon="⚠️",
-                    )
-                    result = {'success': False, 'error': str(e)}
-                if result.get('success'):
-                    submitted += 1
-                    db_dop_remaining[did] -= item_dop
-                elif 'already has a running job' not in result.get('error', ''):
-                    remaining.append(item)
-            else:
-                remaining.append(item)
+                    log_warning(f"Scheduler: reconcile of db_id={did} failed: {e}")
+                    results.append({'database_id': did, 'updated': [], 'running': 0,
+                                    'pending': 0, 'advisor_runs_failed': 0,
+                                    'errors': [str(e)]})
+        st.session_state['sched_reconcile_result'] = {
+            'at': datetime.now(), 'results': results,
+        }
+        st.rerun()  # refresh the metrics and job table above
 
-    st.session_state.scheduler_pending_queue = remaining
-    _save_persistent_queue(remaining)
-    if submitted > 0:
-        st.toast(f"Drained {submitted} from queue ({len(remaining)} remaining)")
-
-
-def _load_persistent_queue(db_id) -> list:
-    """Load QUEUED items from t_compression_history that haven't been submitted yet.
-
-    Called at page init; stays silent on failure because the table may not
-    yet exist on a fresh deployment (schema not deployed). Errors here are
-    expected in that case, not drain-time bugs.
-    """
-    from hcc_advisor.utils.central_connector import CentralConnector
-    try:
-        db_filter = "AND database_id = :db" if db_id else ""
-        params = {'db': db_id} if db_id else {}
-        df = CentralConnector.execute_query(f"""
-            SELECT database_id, owner, object_name, partition_name,
-                   compression_type_applied as compression_type,
-                   parallel_degree as dop
-            FROM t_compression_history
-            WHERE operation_status = 'QUEUED' {db_filter}
-            ORDER BY start_time
-        """, params if params else None)
-        if not df.empty:
-            df.columns = [c.lower() for c in df.columns]
-            items = []
-            for _, r in df.iterrows():
-                pn = r.get('partition_name')
-                items.append({
-                    'database_id': int(r['database_id']),
-                    'owner': r['owner'],
-                    'table_name': r['object_name'],
-                    'compression_type': r['compression_type'],
-                    'partition_name': pn if pn and str(pn) != 'None' else None,
-                    'dop': int(r.get('dop') or 4),
-                })
-            return items
-    except Exception:
-        pass
-    return []
-
-
-def _save_persistent_queue(queue: list):
-    """Persist the pending queue to t_compression_history with status QUEUED.
-
-    Replaces all existing QUEUED rows atomically: the DELETE and every INSERT
-    run on a single connection inside one transaction, committed once at the
-    end (rolled back on error). The previous per-statement auto-commit could
-    durably delete the queue and then fail mid-reinsert, losing it entirely.
-    Callers must pass the COMPLETE cross-database queue (the DELETE is global).
-    """
-    from hcc_advisor.utils.central_connector import CentralConnector
-    rows = [{
-        'db': item['database_id'], 'owner': item['owner'],
-        'tbl': item['table_name'],
-        'otype': 'PARTITION' if item.get('partition_name') else 'TABLE',
-        'part': item.get('partition_name'),
-        'comp': item['compression_type'],
-        'dop': item.get('dop', 4),
-    } for item in queue]
-    try:
-        with CentralConnector.get_connection() as conn:
-            cur = conn.cursor()
-            try:
-                cur.execute(
-                    "DELETE FROM t_compression_history WHERE operation_status = 'QUEUED'"
-                )
-                if rows:
-                    cur.executemany("""
-                        INSERT INTO t_compression_history (
-                            database_id, owner, object_name, object_type,
-                            partition_name, compression_type_applied,
-                            parallel_degree, operation_status, start_time, executed_by
-                        ) VALUES (
-                            :db, :owner, :tbl, :otype, :part, :comp,
-                            :dop, 'QUEUED', SYSTIMESTAMP, 'HCC_ADVISOR'
-                        )
-                    """, rows)
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-            finally:
-                cur.close()
-    except Exception as e:
-        log_warning(f"Scheduler: persisting pending queue failed, items may be lost on restart: {e}")
-        st.toast(
-            "Queue persistence failed — items may be lost on restart. Check logs.",
-            icon="⚠️",
-        )
+    last = st.session_state.get('sched_reconcile_result')
+    if not last:
+        return
+    results = last['results']
+    updated = [dict(u, database_id=r['database_id']) for r in results for u in r['updated']]
+    st.caption(f"Last reconcile: {last['at'].strftime('%H:%M:%S')} — "
+               f"{len(results)} database(s)")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Rows closed", len(updated))
+    c2.metric("Still running", sum(r['running'] for r in results))
+    c3.metric("Pending / waiting", sum(r['pending'] for r in results))
+    c4.metric("Analysis runs failed", sum(r['advisor_runs_failed'] for r in results))
+    if updated:
+        st.dataframe(pd.DataFrame(updated)[
+            ['database_id', 'history_id', 'object', 'job_name', 'status', 'reason']],
+            use_container_width=True, hide_index=True)
+    for r in results:
+        for err in r['errors']:
+            st.warning(f"db_id={r['database_id']}: {err}")
