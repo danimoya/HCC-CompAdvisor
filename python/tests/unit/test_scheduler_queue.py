@@ -6,6 +6,10 @@ Unit tests for the scheduler job queue and the stale-operation reconciler:
   second claimer gets 0 rows and skips; blocked / retryable items go back to
   QUEUED at their FIFO position, failures end FAILED - nothing is dropped;
 - the duplicate/concurrency key includes partition and subpartition;
+- one open row per segment (UNQ_HISTORY_OPEN_SEGMENT, patch 20260924): the
+  patch/schema SQL, a racing add counted as a duplicate (ORA-00001), no MOVE
+  or CREATE_JOB when the history insert is rejected or fails, claims and
+  closes that never collide;
 - reconcile_operations maps scheduler outcomes (running / succeeded / failed /
   stopped / missing) and stale synchronous rows / advisor runs, updating by
   history_id + database_id and counting only rows actually updated;
@@ -22,6 +26,7 @@ the statement's placeholders, like python-oracledb.
 import re
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import oracledb
@@ -31,6 +36,7 @@ import pytest
 from hcc_advisor.utils import target_queries as tq
 from hcc_advisor.utils.central_connector import CentralConnector
 from hcc_advisor.utils.central_queries import CentralQueries, history_clause
+from hcc_advisor.utils.sql_executor import parse_sql_file, parse_sql_text
 from hcc_advisor.utils.target_connector import TargetConnector
 from hcc_advisor.utils.target_queries import TargetQueries, segments_overlap
 
@@ -67,6 +73,29 @@ class FakeCentral:
         self.analysis_updates = []
         self.fail_on = {}          # needle -> exception, for any statement
         self.lost_updates = set()  # history_ids whose next close/success UPDATE hits 0 rows
+        self.unique_open = False   # enforce UNQ_HISTORY_OPEN_SEGMENT (patch applied)
+        self.after_query = None    # hook(sql, binds) after a query: another session commits
+        self.insert_errors = {}    # (object_name, partition_name) -> error of that row's INSERT
+
+    @staticmethod
+    def _open_key(db, owner, obj, part, sub):
+        return (db, owner, obj, part or '~', sub or '~')
+
+    def _check_unique_open(self, key, exclude=None):
+        """UNQ_HISTORY_OPEN_SEGMENT: no other open row may have this key."""
+        if not self.unique_open:
+            return
+        for r in self.rows.values():
+            if (r['history_id'] != exclude and r['operation_status'] in ('QUEUED', 'IN_PROGRESS')
+                    and self._open_key(r['database_id'], r['owner'], r['object_name'],
+                                       r['partition_name'], r['subpartition_name']) == key):
+                raise oracledb.IntegrityError(
+                    'ORA-00001: unique constraint (HCC.UNQ_HISTORY_OPEN_SEGMENT) violated')
+
+    def _check_row_stays_unique(self, row):
+        self._check_unique_open(self._open_key(row['database_id'], row['owner'], row['object_name'],
+                                               row['partition_name'], row['subpartition_name']),
+                                exclude=row['history_id'])
 
     def _tick(self):
         self.clock += 1
@@ -109,6 +138,12 @@ class FakeCentral:
         _check_binds(s, p)
         self.statements.append(('query', s, p))
         self._maybe_fail(s)
+        result = self._select(s, p)
+        if self.after_query:
+            self.after_query(s, p)
+        return result
+
+    def _select(self, s, p):
         rows = list(self.rows.values())
         if 'FROM t_compression_history' not in s:
             raise AssertionError(f"unexpected central query: {s}")
@@ -118,12 +153,14 @@ class FakeCentral:
                    and r['operation_status'] in ('QUEUED', 'IN_PROGRESS')]
             return _df([[r['owner'], r['object_name'], r['partition_name'], r['subpartition_name']]
                         for r in sel], ['OWNER', 'OBJECT_NAME', 'PARTITION_NAME', 'SUBPARTITION_NAME'])
-        if s.startswith('SELECT 1 FROM t_compression_history'):
-            sel = [r for r in rows if r['database_id'] == p['db'] and r['owner'] == p['o']
-                   and r['object_name'] == p['t'] and r['partition_name'] == p['p']
-                   and r['subpartition_name'] == p['sp']
-                   and r['operation_status'] in ('QUEUED', 'IN_PROGRESS')]
-            return _df([[1]] if sel else [], ['1'])
+        if s.startswith('SELECT history_id, operation_status FROM t_compression_history'):
+            assert 'ROWNUM = 1' in s                                    # _open_segment_row
+            key = self._open_key(p['db'], p['o'], p['t'], p['p'], p['sp'])
+            sel = [r for r in rows if r['operation_status'] in ('QUEUED', 'IN_PROGRESS')
+                   and self._open_key(r['database_id'], r['owner'], r['object_name'],
+                                      r['partition_name'], r['subpartition_name']) == key]
+            return _df([[r['history_id'], r['operation_status']] for r in sel[:1]],
+                       ['HISTORY_ID', 'OPERATION_STATUS'])
         if "WHERE operation_status = 'QUEUED'" in s:
             sel = [r for r in rows if r['operation_status'] == 'QUEUED'
                    and ('db' not in p or r['database_id'] == p['db'])]
@@ -160,6 +197,9 @@ class FakeCentral:
     # -- INSERT / UPDATE -----------------------------------------------------
     def _insert(self, p):
         assert set(p) >= {'db', 'owner', 'tbl', 'otype', 'part', 'sub', 'comp', 'dop', 'executed_by'}
+        if (p['tbl'], p['part']) in self.insert_errors:
+            raise oracledb.DatabaseError(self.insert_errors[(p['tbl'], p['part'])])
+        self._check_unique_open(self._open_key(p['db'], p['owner'], p['tbl'], p['part'], p['sub']))
         return self.add(database_id=p['db'], owner=p['owner'], object_name=p['tbl'],
                         object_type=p['otype'], partition_name=p['part'],
                         subpartition_name=p['sub'], compression_type_applied=p['comp'],
@@ -171,6 +211,18 @@ class FakeCentral:
         _check_binds(s, p)
         self.statements.append(('dml', s, p))
         self._maybe_fail(s)
+        if s.startswith('UPDATE t_compression_history') and 'hist_id' in p:
+            # execute_compression's outcome, on its own IN_PROGRESS row
+            assert s.endswith('WHERE history_id = :hist_id')
+            row = self.rows.get(p['hist_id'])
+            if row is None:
+                return 0
+            if "SET operation_status = 'SUCCESS'" in s:
+                row.update(operation_status='SUCCESS', compressed_size_bytes=p['comp_size'])
+            else:
+                assert "SET operation_status = 'FAILED'" in s
+                row.update(operation_status='FAILED', error_message=p.get('err'))
+            return 1
         if s.startswith('UPDATE t_compression_history'):
             row = self.rows.get(p.get('hid'))
             if row is None or ('db' in p and row['database_id'] != p['db']):
@@ -180,6 +232,7 @@ class FakeCentral:
                 assert "AND operation_status = 'QUEUED'" in s
                 if row['operation_status'] != 'QUEUED':
                     return 0
+                self._check_row_stays_unique(row)
                 row.update(operation_status='IN_PROGRESS', compression_clause=p['job'],
                            original_ddl=p['ddl'], start_time=self._tick(), age_minutes=0.0,
                            error_message=None)
@@ -187,6 +240,7 @@ class FakeCentral:
             if "SET operation_status = 'QUEUED'" in s:                 # requeue
                 if row['operation_status'] != 'IN_PROGRESS':
                     return 0
+                self._check_row_stays_unique(row)
                 row.update(operation_status='QUEUED', compression_clause=None,
                            error_message=p['msg'])
                 if 'orig_start' in p:
@@ -230,15 +284,43 @@ class FakeCentral:
         _check_binds(s, p, extra=(out_bind,))
         self.statements.append(('dml', s, p))
         assert s.startswith('INSERT INTO t_compression_history') and 'RETURNING history_id' in s
-        assert "'QUEUED', SYSTIMESTAMP" in s
-        return self._insert(p)
+        try:
+            self._maybe_fail(s)
+            if 'SEQ_EXECUTION_ID.NEXTVAL' in s:                  # store_compression_history
+                self._check_unique_open(self._open_key(
+                    p['database_id'], p['owner'], p['object_name'],
+                    p['partition_name'], p['subpartition_name']))
+                return self.add(
+                    database_id=p['database_id'], owner=p['owner'], object_name=p['object_name'],
+                    object_type=p['object_type'], partition_name=p['partition_name'],
+                    subpartition_name=p['subpartition_name'],
+                    compression_type_applied=p['compression_type_applied'],
+                    compression_clause=p['compression_clause'], parallel_degree=p['parallel_degree'],
+                    operation_status=p['operation_status'], executed_by=p['executed_by'],
+                    original_size_bytes=p['original_size_bytes'], original_ddl=p['original_ddl'])
+            assert "'QUEUED', SYSTIMESTAMP" in s
+            return self._insert(p)
+        except oracledb.Error:
+            return None   # CentralConnector.execute_dml_returning logs it and returns None
 
     @contextmanager
     def connection(self):
         central = self
 
+        class _BatchError:
+            """An executemany(batcherrors=True) row error, like oracledb's."""
+            def __init__(self, offset, message):
+                self.offset, self.message = offset, message
+
+            def __str__(self):
+                return self.message
+
         class _Cursor:
-            def executemany(self, sql, rows):
+            def __init__(self, conn):
+                self.conn = conn
+                self.batch_errors = []
+
+            def executemany(self, sql, rows, batcherrors=False):
                 s = _norm(sql)
                 central.statements.append(('executemany', s, rows))
                 central._maybe_fail(s)
@@ -246,8 +328,17 @@ class FakeCentral:
                 assert 'DELETE' not in s.upper()
                 for r in rows:
                     _check_binds(s, r)
-                for r in rows:
-                    central._insert(r)
+                self.batch_errors = []
+                for i, r in enumerate(rows):
+                    try:
+                        self.conn.pending.append(central._insert(r))
+                    except oracledb.Error as e:
+                        if not batcherrors:
+                            raise
+                        self.batch_errors.append(_BatchError(i, str(e)))
+
+            def getbatcherrors(self):
+                return list(self.batch_errors)
 
             def execute(self, sql, params=None):
                 raise AssertionError(f"unexpected cursor.execute: {sql}")
@@ -256,16 +347,24 @@ class FakeCentral:
                 pass
 
         class _Conn:
+            """Rows inserted through this connection vanish on rollback."""
             commits = rollbacks = 0
 
+            def __init__(self):
+                self.pending = []
+
             def cursor(self):
-                return _Cursor()
+                return _Cursor(self)
 
             def commit(self):
                 _Conn.commits += 1
+                self.pending.clear()
 
             def rollback(self):
                 _Conn.rollbacks += 1
+                for hid in self.pending:
+                    central.rows.pop(hid, None)
+                self.pending.clear()
 
         yield _Conn()
 
@@ -300,6 +399,10 @@ class FakeTarget:
             return _df([[v]], ['SIZE_BYTES'])
         if 'v$parameter' in s:
             return _df([['8']], ['VALUE'])
+        if 'FROM all_tab_columns' in s:                              # execute_compression LOB check
+            return _df([[0]], ['LOB_COUNT'])
+        if 'FROM all_indexes' in s:                                  # unusable indexes after a MOVE
+            return _df([], ['OWNER', 'INDEX_NAME'])
         names = [v for k, v in sorted(p.items()) if re.fullmatch(r'j\d+', k)]
         if 'FROM dba_scheduler_running_jobs' in s:
             return _df([[n] for n in names if n in self.running], ['JOB_NAME'])
@@ -695,6 +798,236 @@ class TestDirectSubmit:
 
 
 # ============================================================================
+# One open row per segment (UNQ_HISTORY_OPEN_SEGMENT)
+# ============================================================================
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_OPEN_INDEX_PATCH = _REPO_ROOT / 'sql' / 'patches' / '20260924-history-unique-open-segment'
+_CENTRAL_SCHEMA = _REPO_ROOT / 'sql' / 'central' / '01_central_schema.sql'
+_OPEN_ONLY = "CASE WHEN OPERATION_STATUS IN ('QUEUED', 'IN_PROGRESS') THEN"
+
+
+def _open_index_keys(statement):
+    """Normalized key list of the CREATE UNIQUE INDEX UNQ_HISTORY_OPEN_SEGMENT in `statement`."""
+    m = re.search(r"CREATE UNIQUE INDEX UNQ_HISTORY_OPEN_SEGMENT ON T_COMPRESSION_HISTORY\s*\((.*)\)",
+                  statement, re.S)
+    assert m, statement
+    return _norm(m.group(1))
+
+
+def _patch_block():
+    (kind, block), = parse_sql_text((_OPEN_INDEX_PATCH / 'patch.sql').read_text())
+    assert kind == 'PLSQL'
+    return block
+
+
+@pytest.mark.unit
+class TestOpenSegmentIndexSql:
+
+    def test_check_sql_reports_the_index(self):
+        (kind, sql), = parse_sql_text((_OPEN_INDEX_PATCH / 'check.sql').read_text())
+        assert kind == 'SELECT' and re.search(r'\bas result\b', sql, re.I)
+        assert "FROM user_indexes WHERE index_name = 'UNQ_HISTORY_OPEN_SEGMENT'" in sql
+
+    def test_patch_is_one_idempotent_block_that_never_deletes_history(self):
+        block = _patch_block()
+        assert block.startswith('DECLARE') and block.endswith('END;')
+        # Nothing to do once the index exists (re-run safe).
+        assert "index_name = 'UNQ_HISTORY_OPEN_SEGMENT'" in block and 'RETURN;' in block
+        # Duplicate IN_PROGRESS rows: fail with the list, before any change.
+        assert block.index('RAISE_APPLICATION_ERROR') < block.index('UPDATE t_compression_history')
+        # Extra QUEUED copies: closed as FAILED with the reason (the SET line
+        # must survive the SQL*Plus-aware split, which drops lines starting SET).
+        assert ("UPDATE t_compression_history SET operation_status = 'FAILED', "
+                "end_time = SYSTIMESTAMP,") in block
+        assert "AND operation_status = 'QUEUED'" in block
+        assert 'Duplicate open row closed by patch 20260924-history-unique-open-segment' in block
+        assert 'DELETE' not in block.upper() and 'TRUNCATE' not in block.upper()
+
+    def test_schema_creates_the_same_index_as_the_patch(self):
+        stmts = [(k, s) for k, s in parse_sql_file(_CENTRAL_SCHEMA) if 'UNQ_HISTORY_OPEN_SEGMENT' in s]
+        (kind, ddl), = stmts
+        assert kind == 'DDL' and ddl.startswith('CREATE UNIQUE INDEX UNQ_HISTORY_OPEN_SEGMENT')
+        keys = _open_index_keys(ddl)
+        assert keys == _open_index_keys(_patch_block())
+        # Five keys, each NULL unless the row is open: closed rows are not indexed.
+        assert keys.count(_OPEN_ONLY) == 5 and 'ELSE' not in keys
+        for column in ('DATABASE_ID END', 'OWNER END', 'OBJECT_NAME END',
+                       "NVL(PARTITION_NAME, '~') END", "NVL(SUBPARTITION_NAME, '~') END"):
+            assert f"{_OPEN_ONLY} {column}" in keys
+
+    def test_readme_recommends_the_patch(self):
+        assert 'recommended' in (_OPEN_INDEX_PATCH / 'readme.md').read_text().lower()
+
+    def test_only_this_index_means_already_queued_or_running(self):
+        from oracledb.errors import _Error        # what cursor.getbatcherrors() returns
+        dup = 'ORA-00001: unique constraint (HCC.UNQ_HISTORY_OPEN_SEGMENT) violated'
+        assert tq._is_open_segment_conflict(oracledb.IntegrityError(dup))
+        assert tq._is_open_segment_conflict(_Error(dup, code=1, offset=3))
+        assert not tq._is_open_segment_conflict(oracledb.IntegrityError(
+            'ORA-00001: unique constraint (HCC.UNQ_HISTORY_EXECUTION) violated'))
+        assert not tq._is_open_segment_conflict(oracledb.DatabaseError(
+            'ORA-02290: check constraint (HCC.UNQ_HISTORY_OPEN_SEGMENT_X) violated'))
+
+
+def _other_session_adds(central, after_query, **row):
+    """Right after the first central query starting with `after_query`, another
+    session commits an open row for a segment: it passed its own "already
+    queued?" check at the same instant. Returns [its history_id]."""
+    added = []
+
+    def hook(sql, binds):
+        if not added and sql.startswith(after_query):
+            added.append(central.add(**row))
+    central.after_query = hook
+    return added
+
+
+_ENQUEUE_CHECK = 'SELECT owner, object_name, partition_name'
+_SEGMENT_CHECK = 'SELECT history_id, operation_status'
+
+
+@pytest.mark.unit
+class TestOneOpenRowPerSegment:
+
+    def test_racing_enqueue_is_a_duplicate_not_an_error(self, dbs):
+        central, _ = dbs
+        central.unique_open = True
+        other = _other_session_adds(central, _ENQUEUE_CHECK, partition_name='P1', executed_by='bob')
+
+        out = TargetQueries.enqueue_compression_jobs([_item(partition_name='P1'),
+                                                      _item(partition_name='P2')])
+
+        assert out == {'added': 1, 'duplicates': 1, 'rejected': 0, 'errors': []}
+        p1 = [h for h, r in central.rows.items() if r['partition_name'] == 'P1']
+        assert p1 == other                                        # the other user's row only
+        assert [r['operation_status'] for r in central.rows.values()
+                if r['partition_name'] == 'P2'] == ['QUEUED']      # the rest of the call is kept
+
+    def test_without_the_patch_the_race_is_not_caught(self, dbs):
+        """Why the patch is recommended: the query check alone lets both in."""
+        central, _ = dbs
+        _other_session_adds(central, _ENQUEUE_CHECK, partition_name='P1')
+        out = TargetQueries.enqueue_compression_jobs([_item(partition_name='P1')])
+        assert out['added'] == 1
+        assert len([r for r in central.rows.values() if r['partition_name'] == 'P1']) == 2
+
+    def test_any_other_row_error_still_rejects_the_whole_call(self, dbs):
+        central, _ = dbs
+        central.unique_open = True
+        other = _other_session_adds(central, _ENQUEUE_CHECK, partition_name='P1')
+        central.insert_errors[('ORDERS', 'P2')] = 'ORA-12899: value too large for column'
+
+        out = TargetQueries.enqueue_compression_jobs([
+            _item(partition_name='P1'), _item(partition_name='P2'), _item(partition_name='P3')])
+
+        assert out['added'] == 0 and out['duplicates'] == 0 and out['rejected'] == 3
+        assert 'ORA-12899' in out['errors'][0]
+        assert list(central.rows) == other                        # P3 was rolled back
+
+    def test_racing_direct_submit_is_a_duplicate_and_creates_no_job(self, dbs):
+        central, target = dbs
+        central.unique_open = True
+        other = _other_session_adds(central, _SEGMENT_CHECK, partition_name='P1',
+                                    operation_status='IN_PROGRESS', compression_clause='HCC_ORDERS_1')
+
+        res = TargetQueries.submit_compression_job(1, 'APP', 'ORDERS', 'QUERY HIGH',
+                                                   partition_name='P1')
+
+        assert res['success'] is False and res['duplicate'] is True
+        assert f"history_id {other[0]}, IN_PROGRESS" in res['error']
+        assert list(central.rows) == other and target.plsql == []
+
+    def _execute(self, partition_name='P1'):
+        return TargetQueries.execute_compression(1, 'APP', 'ORDERS', 'QUERY HIGH',
+                                                 partition_name=partition_name, dry_run=False)
+
+    def test_direct_run_of_a_queued_segment_is_refused_without_the_patch(self, dbs):
+        central, target = dbs                                     # unique_open off
+        hid = central.add(partition_name='P1')                    # QUEUED
+
+        res = self._execute()
+
+        assert res['success'] is False and res['duplicate'] is True
+        assert (f"APP.ORDERS partition P1 is already queued or running (history_id {hid}, QUEUED)"
+                in res['error'])
+        assert central.dml_statements('SEQ_EXECUTION_ID') == []   # no IN_PROGRESS insert
+        assert target.plsql == []                                 # no MOVE
+        assert list(central.rows) == [hid]
+
+    def test_direct_run_rejected_by_the_index_runs_no_move(self, dbs):
+        central, target = dbs
+        central.unique_open = True
+        other = _other_session_adds(central, _SEGMENT_CHECK, partition_name='P1', executed_by='bob')
+
+        res = self._execute()
+
+        assert res['success'] is False and res['duplicate'] is True
+        assert f"history_id {other[0]}, QUEUED" in res['error']
+        assert len(central.dml_statements('SEQ_EXECUTION_ID')) == 1   # the insert was tried,
+        assert target.plsql == []                                      # rejected: no MOVE
+        assert list(central.rows) == other
+        assert central.dml_statements('UPDATE t_compression_history') == []
+
+    def test_direct_run_is_not_run_untracked_when_the_insert_fails(self, dbs):
+        central, target = dbs
+        central.fail_on['SEQ_EXECUTION_ID'] = oracledb.DatabaseError(
+            'ORA-01653: unable to extend table HCC.T_COMPRESSION_HISTORY')
+
+        res = self._execute()
+
+        assert res['success'] is False and 'duplicate' not in res
+        assert ('Could not record APP.ORDERS partition P1 in the compression history'
+                in res['error'])
+        assert target.plsql == [] and central.rows == {}
+
+    def test_direct_run_is_not_run_when_the_history_cannot_be_checked(self, dbs):
+        central, target = dbs
+        central.fail_on[_SEGMENT_CHECK] = oracledb.DatabaseError('ORA-03113: end-of-file')
+
+        res = self._execute()
+
+        assert res['success'] is False and 'ORA-03113' in res['error']
+        assert central.dml_statements('SEQ_EXECUTION_ID') == []
+        assert target.plsql == [] and central.rows == {}
+
+    def test_direct_run_closes_its_row_which_frees_the_segment(self, dbs):
+        central, target = dbs
+        central.unique_open = True
+        target.sizes = {'P1': [1000, 400]}
+
+        res = self._execute()
+
+        assert res['success'] is True
+        (hid, row), = central.rows.items()
+        assert row['operation_status'] == 'SUCCESS' and row['compressed_size_bytes'] == 400
+        assert len(target.plsql) == 1 and 'MOVE PARTITION P1' in target.plsql[0]
+        assert TargetQueries.enqueue_compression_jobs([_item(partition_name='P1')])['added'] == 1
+
+    def test_claims_and_requeues_keep_the_key_and_closing_frees_it(self, dbs):
+        """Claim (QUEUED -> IN_PROGRESS) and requeue update the row's status
+        in place, so they never hit the index; SUCCESS takes the row out."""
+        central, target = dbs
+        central.unique_open = True
+        table_job = central.add(operation_status='IN_PROGRESS', compression_clause='HCC_ORDERS_1',
+                                parallel_degree=1, age_minutes=120.0)
+        assert TargetQueries.enqueue_compression_jobs([_item(partition_name='P1')])['added'] == 1
+        # Blocked by the running table-level job: claimed, then put back.
+        stats = TargetQueries.drain_compression_queue(1)
+        assert stats['blocked'] == 1 and stats['errors'] == []
+        # The same segment is still queued exactly once.
+        assert TargetQueries.enqueue_compression_jobs([_item(partition_name='P1')])['duplicates'] == 1
+
+        target.runs = {'HCC_ORDERS_1': [{'status': 'SUCCEEDED', 'seconds': 60}]}
+        TargetQueries.reconcile_operations(1)
+        assert central.status(table_job) == 'SUCCESS'
+        assert TargetQueries.drain_compression_queue(1)['submitted'] == 1        # P1 claimed
+        # SUCCESS freed the table-level key; P1 is still open (IN_PROGRESS).
+        out = TargetQueries.enqueue_compression_jobs([_item(), _item(partition_name='P1')])
+        assert (out['added'], out['duplicates'], out['errors']) == (1, 1, [])
+
+
+# ============================================================================
 # Reconcile
 # ============================================================================
 
@@ -935,9 +1268,10 @@ class TestLongDdl:
         assert captured['original_ddl'] == long
 
     def test_execute_compression_with_long_names_is_tracked(self):
-        store = MagicMock(return_value=None)          # force the fallback WHERE too
+        store = MagicMock(return_value=9)
         dml = MagicMock(return_value=1)
         with patch.object(CentralQueries, 'store_compression_history', store), \
+                patch.object(CentralConnector, 'execute_query', return_value=pd.DataFrame()), \
                 patch.object(CentralConnector, 'execute_dml', dml), \
                 patch.object(TargetConnector, 'execute_query', return_value=pd.DataFrame()), \
                 patch.object(TargetConnector, 'execute_plsql', return_value=True):
@@ -948,7 +1282,7 @@ class TestLongDdl:
         assert len(record['compression_clause'].encode()) <= 200
         assert record['original_ddl'].startswith('ALTER TABLE') and len(record['original_ddl']) > 300
         binds = dml.call_args_list[0].args[1]
-        assert binds['hist_clause'] == record['compression_clause']
+        assert binds['hist_id'] == 9
 
 
 @pytest.mark.unit
@@ -999,6 +1333,7 @@ class TestIndexRebuildCount:
             return 'IX2' not in block          # the MOVE and IX1 succeed, IX2 fails
         dml = MagicMock(return_value=1)
         with patch.object(CentralQueries, 'store_compression_history', return_value=5), \
+                patch.object(CentralConnector, 'execute_query', return_value=pd.DataFrame()), \
                 patch.object(CentralConnector, 'execute_dml', dml), \
                 patch.object(TargetConnector, 'execute_query', side_effect=query), \
                 patch.object(TargetConnector, 'execute_plsql', side_effect=plsql):

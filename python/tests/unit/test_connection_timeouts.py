@@ -329,6 +329,10 @@ class TestCallTimeout:
         monkeypatch.setattr(CentralQueries, 'store_compression_history', lambda db, rec: 101)
         monkeypatch.setattr(CentralConnector, 'execute_dml', MagicMock(return_value=1))
         monkeypatch.setattr(tq, '_acting_user', lambda: 'alice')
+        # No other open (QUEUED/IN_PROGRESS) row for the segment, so the run
+        # is allowed (see TargetQueries._open_segment_row).
+        monkeypatch.setattr(TargetQueries, '_open_segment_row',
+                            staticmethod(lambda *a, **k: None))
 
     def test_compression_runs_without_call_timeout(self, target_pool, monkeypatch):
         monkeypatch.setattr(config, 'DB_CALL_TIMEOUT', 45)

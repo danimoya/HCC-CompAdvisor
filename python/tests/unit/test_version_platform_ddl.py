@@ -259,6 +259,9 @@ class TestExecutionByVersion:
         monkeypatch.setattr(CentralQueries, 'store_compression_history', store)
         monkeypatch.setattr(CentralConnector, 'execute_dml', MagicMock(return_value=1))
         monkeypatch.setattr(TargetConnector, 'execute_query', MagicMock(return_value=pd.DataFrame()))
+        # No other open row for the segment (see TargetQueries._open_segment_row)
+        monkeypatch.setattr(TargetQueries, '_open_segment_row',
+                            staticmethod(lambda *a, **k: None))
         plsql = MagicMock(return_value=True)
         monkeypatch.setattr(TargetConnector, 'execute_plsql', plsql)
         res = TargetQueries.execute_compression(1, 'APP', 'ORDERS', 'OLTP', dry_run=False)
