@@ -13,6 +13,9 @@ from hcc_advisor.utils.target_queries import TargetQueries
 from hcc_advisor.utils.leaf_segments import leaf_segments
 from hcc_advisor.config import config
 from hcc_advisor.auth import AuthManager, ROLE_OPERATOR
+from hcc_advisor.views.page_03_execution import (
+    BACKGROUND_HELP, BACKGROUND_LABEL, submit_background_compression,
+)
 
 
 def show_recommendations_page():
@@ -479,7 +482,37 @@ def show_detailed_tab(df: pd.DataFrame):
             dry_run = st.checkbox("Dry Run (Preview)", value=True, key="batch_dry_run")
 
         with col4:
-            parallel_degree = st.slider("Parallel", min_value=1, max_value=16, value=4, key="batch_parallel")
+            # Same bound as Compress Tables and the scheduler's DOP budget
+            # (CPU_COUNT/2): a background job with a higher DOP never fits that
+            # budget and would wait in the queue indefinitely.
+            db_id = st.session_state.get('active_database_id')
+            max_parallel = max(1, TargetQueries.get_cpu_count(db_id) // 2) if db_id else 16
+            parallel_degree = st.slider(
+                "Parallel", min_value=1, max_value=max_parallel, value=min(4, max_parallel),
+                key="batch_parallel",
+                help=f"PARALLEL degree of each MOVE (max CPU_COUNT/2 = {max_parallel})"
+            )
+
+        # Live-execution options (ignored for a dry run)
+        col1, col2 = st.columns(2)
+
+        with col1:
+            background = st.checkbox(
+                BACKGROUND_LABEL,
+                value=True,
+                key="rec_background",
+                disabled=dry_run,
+                help=BACKGROUND_HELP
+            )
+
+        with col2:
+            confirm_live = st.checkbox(
+                "Confirm Execution",
+                value=False,
+                key="rec_confirm_execution",
+                disabled=dry_run,
+                help="Required to run the real DDL. Ignored in dry-run mode."
+            )
 
         # Execute button
         st.markdown("")
@@ -490,7 +523,8 @@ def show_detailed_tab(df: pd.DataFrame):
             # A dry run only generates DDL; live execution needs the operator role.
             can_execute, execute_help = AuthManager.role_gate(ROLE_OPERATOR)
             live_blocked = not dry_run and not can_execute
-            execute_disabled = selected_count == 0 or live_blocked
+            unconfirmed = not dry_run and not confirm_live
+            execute_disabled = selected_count == 0 or live_blocked or unconfirmed
             execute_label = f"Execute {selected_count} Selected Tables" if selected_count > 0 else "Select Tables First"
 
             if st.button(
@@ -500,9 +534,12 @@ def show_detailed_tab(df: pd.DataFrame):
                 disabled=execute_disabled,
                 help=execute_help if live_blocked else None
             ):
-                execute_batch_compression(selected_df, df, dry_run, parallel_degree)
+                execute_batch_compression(selected_df, df, dry_run, parallel_degree,
+                                          background=background, confirmed=confirm_live)
             if live_blocked:
                 st.caption("Live execution requires the operator role; Dry Run is available.")
+            elif unconfirmed:
+                st.caption("Check 'Confirm Execution' to enable live execution (or keep Dry Run).")
 
     else:
         st.info("Select one or more tables using the checkboxes to enable export and execution options.")
@@ -885,8 +922,17 @@ def show_analysis_details(analysis_id: int):
                 st.info("No LOB compression analysis available for this table.")
 
 
-def execute_batch_compression(selected_df: pd.DataFrame, original_df: pd.DataFrame, dry_run: bool, parallel_degree: int):
-    """Execute batch compression for selected tables"""
+def execute_batch_compression(selected_df: pd.DataFrame, original_df: pd.DataFrame, dry_run: bool,
+                              parallel_degree: int, background: bool = False, confirmed: bool = False):
+    """Execute batch compression for selected tables
+
+    Args:
+        dry_run: only generate the DDL
+        parallel_degree: PARALLEL degree of each MOVE (the page's Parallel slider)
+        background: live run as DBMS_SCHEDULER jobs (queue + drain) instead of
+            running each MOVE synchronously in this script thread
+        confirmed: the user ticked 'Confirm Execution' (required for a live run)
+    """
 
     db_id = st.session_state.get('active_database_id')
     if not db_id:
@@ -908,6 +954,24 @@ def execute_batch_compression(selected_df: pd.DataFrame, original_df: pd.DataFra
     if not dry_run and not AuthManager.require_role(
         ROLE_OPERATOR, "Executing compression requires the operator role."
     ):
+        return
+    if not dry_run and not confirmed:
+        st.error("Check 'Confirm Execution' to run compression on the target.")
+        return
+
+    if not dry_run and background:
+        items = []
+        for rec_id in selected_ids:
+            table_row = selected_df[selected_df['ID'] == rec_id].iloc[0]
+            partition = table_row.get('Partition')
+            items.append({
+                'owner': table_row.get('Owner', 'UNKNOWN'),
+                'table_name': table_row.get('Table', f'ID-{rec_id}'),
+                'compression_type': table_row.get('Advised', table_row.get('Strategy', 'QUERY HIGH')),
+                'partition_name': str(partition) if pd.notna(partition) and partition else None,
+            })
+        st.markdown("---")
+        submit_background_compression(items, db_id, parallel_degree)
         return
 
     # Show confirmation
@@ -951,7 +1015,8 @@ def execute_batch_compression(selected_df: pd.DataFrame, original_df: pd.DataFra
                 table_name=table_name,
                 compression_type=strategy,
                 partition_name=partition,
-                dry_run=dry_run
+                dry_run=dry_run,
+                parallel_degree=parallel_degree
             )
 
             if result.get('error'):

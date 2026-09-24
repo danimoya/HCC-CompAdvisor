@@ -11,7 +11,8 @@ import oracledb
 import pandas as pd
 import streamlit as st
 from typing import Optional, Dict, Any, List
-from hcc_advisor.utils.target_connector import TargetConnector
+from hcc_advisor.utils.target_connector import TargetConnector, max_batch_concurrency
+from hcc_advisor.utils.db_timeouts import long_operation
 from hcc_advisor.utils.logger import log_error, log_info, log_debug, log_warning
 from hcc_advisor.utils.hotness import (
     compute_hotness, index_dml_rows, index_segment_rows, lookup_dml, lookup_segment,
@@ -259,10 +260,11 @@ def _history_compression_type(value) -> str:
 
 
 # Errors after which a job submission is worth retrying later (target down,
-# connection lost, lock timeout): the queue item goes back to QUEUED instead of
-# FAILED. ORA-27477 (job already exists) is handled separately.
+# connection lost, every pooled connection busy, lock timeout): the queue item
+# goes back to QUEUED instead of FAILED. ORA-27477 (job already exists) is
+# handled separately.
 _RETRYABLE_ERROR_CODES = (
-    'DPY-4011', 'DPY-6005', 'ORA-00054', 'ORA-03113', 'ORA-03114', 'ORA-03135',
+    'DPY-4005', 'DPY-4011', 'DPY-6005', 'ORA-00054', 'ORA-03113', 'ORA-03114', 'ORA-03135',
     'ORA-12170', 'ORA-12514', 'ORA-12516', 'ORA-12520', 'ORA-12528', 'ORA-12537',
     'ORA-12541', 'ORA-12543',
 )
@@ -390,6 +392,7 @@ class TargetQueries:
     MAX_PARTITIONS_PER_TABLE = 50
 
     @staticmethod
+    @long_operation()  # no interactive read call_timeout (see db_timeouts)
     def start_analysis(
         database_id: int,
         owner: Optional[str] = None,
@@ -1735,6 +1738,7 @@ class TargetQueries:
     # ============================================================================
 
     @staticmethod
+    @long_operation()  # no interactive read call_timeout (see db_timeouts)
     def execute_compression(
         database_id: int,
         owner: str,
@@ -2045,7 +2049,8 @@ class TargetQueries:
                    and optional partition_name
             dry_run: If True, only generate DDL without executing
             parallel_degree: Parallel execution degree per table (PARALLEL N in DDL)
-            concurrency: Number of tables to compress simultaneously
+            concurrency: Number of tables to compress simultaneously (a live
+                run is capped at target_connector.max_batch_concurrency())
 
         Returns:
             dict with batch execution results
@@ -2085,6 +2090,10 @@ class TargetQueries:
         error_count = 0
 
         max_workers = max(1, min(concurrency, len(items)))
+        if not dry_run:
+            # Each live worker holds a pooled target connection for its whole
+            # MOVE: keep TARGET_POOL_UI_HEADROOM connections free for UI reads.
+            max_workers = min(max_workers, max_batch_concurrency())
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(_compress_one, item): item for item in items}
@@ -3006,6 +3015,7 @@ MOVE {compression_clause}
             log_error(e, "TargetQueries._record_rollback", {'history_id': history_id})
 
     @staticmethod
+    @long_operation()  # no interactive read call_timeout (see db_timeouts)
     def rollback_compression(
         database_id: int, owner: str, table_name: str,
         partition_name: Optional[str] = None, parallel_degree: int = 4,
@@ -3279,6 +3289,7 @@ MOVE {compression_clause}
     # ============================================================================
 
     @staticmethod
+    @long_operation()  # no interactive read call_timeout (see db_timeouts)
     def quick_scan(
         database_id: int,
         owner: Optional[str] = None,

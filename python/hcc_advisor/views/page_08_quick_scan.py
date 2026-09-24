@@ -519,15 +519,17 @@ def _bulk_submit(candidates, db_id, max_queue, default_dop):
     enq = TargetQueries.enqueue_compression_jobs(candidates)
 
     submitted = failed = waiting = 0
+    errors = list(enq['errors'])
     for did in dict.fromkeys(int(c['database_id']) for c in candidates):
         stats = TargetQueries.drain_compression_queue(did)
         submitted += stats['submitted']
         failed += stats['failed']
         waiting += stats['waiting']
+        errors.extend(stats.get('errors', []))
 
     return {'submitted': submitted, 'queued': waiting,
             'failed': failed + enq['rejected'], 'duplicates': enq['duplicates'],
-            'errors': enq['errors']}
+            'added': enq['added'], 'errors': errors}
 
 
 if __name__ == "__main__":

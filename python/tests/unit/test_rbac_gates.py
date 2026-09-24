@@ -166,7 +166,7 @@ def _batch_app():
     from hcc_advisor.views.page_02_recommendations import execute_batch_compression
     sel = pd.DataFrame({'ID': [7], 'Table': ['T1'], 'Owner': ['APP'],
                         'Advised': ['QUERY HIGH'], 'Partition': [None]})
-    execute_batch_compression(sel, sel, st.session_state['test_dry_run'], 4)
+    execute_batch_compression(sel, sel, st.session_state['test_dry_run'], 4, confirmed=True)
 
 
 @pytest.mark.unit
