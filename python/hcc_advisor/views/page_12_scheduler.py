@@ -19,6 +19,7 @@ from hcc_advisor.utils.sql_builder import (
     gather_dependent_indexes,
 )
 from hcc_advisor.utils.logger import log_warning
+from hcc_advisor.auth import AuthManager, ROLE_OPERATOR
 
 
 def show_scheduler_page():
@@ -405,9 +406,14 @@ def _render_import_section(current_db_id):
         verified = st.session_state.get('import_verified_objects', [])
         if verified:
             label = st.session_state.get('import_target_label', target_label)
+            # Queued objects are compressed by the drain: operator role or above.
+            can_queue, queue_help = AuthManager.role_gate(ROLE_OPERATOR)
+            if queue_help:
+                st.caption("View only: queueing objects requires the operator role.")
             if st.button(f"Add {len(verified)} verified object(s) to scheduler queue",
                          key="import_add_queue_btn", type="primary",
-                         use_container_width=True):
+                         use_container_width=True, disabled=not can_queue,
+                         help=queue_help) and AuthManager.require_role(ROLE_OPERATOR):
                 # Merge with the full persistent queue across ALL databases so
                 # saving doesn't drop QUEUED rows for databases not loaded into
                 # this session (the persist step deletes-then-reinserts).
@@ -439,13 +445,18 @@ def _render_import_section(current_db_id):
 
 def _render_recurring_jobs(db_id):
     """Show and manage recurring analysis jobs on the target."""
+    # Creating/dropping DBMS_SCHEDULER jobs on the target: operator role or above.
+    can_manage, manage_help = AuthManager.role_gate(ROLE_OPERATOR)
+    if manage_help:
+        st.caption("View only: managing recurring jobs requires the operator role.")
     existing = TargetQueries.get_recurring_scan_jobs(db_id)
     if not existing.empty:
         existing.columns = [c.lower() for c in existing.columns]
         st.dataframe(existing, use_container_width=True, hide_index=True)
 
         job_to_drop = st.selectbox("Drop job", existing['job_name'].tolist(), key="sched_drop_job")
-        if st.button("Drop Selected Job", key="sched_drop_btn"):
+        if st.button("Drop Selected Job", key="sched_drop_btn", disabled=not can_manage,
+                     help=manage_help) and AuthManager.require_role(ROLE_OPERATOR):
             ok = TargetQueries.drop_recurring_scan_job(db_id, job_to_drop)
             if ok:
                 st.success(f"Dropped {job_to_drop}")
@@ -460,7 +471,8 @@ def _render_recurring_jobs(db_id):
                              index=1, key="sched_freq")
     with col2:
         if st.button("Create Recurring Job", key="sched_create_recurring",
-                     type="primary", use_container_width=True):
+                     type="primary", use_container_width=True, disabled=not can_manage,
+                     help=manage_help) and AuthManager.require_role(ROLE_OPERATOR):
             result = TargetQueries.create_recurring_scan_job(db_id, freq)
             if result.get('success'):
                 st.success(f"Created {result['job_name']} ({freq})")
@@ -497,8 +509,11 @@ def _do_refresh(db_id):
                 f"{', '.join(str(d) for d in poll_failures)}",
                 icon="⚠️",
             )
-    # Drain pending queue (handles per-database grouping internally)
-    _drain_pending_queue(db_id)
+    # Drain pending queue (handles per-database grouping internally). Draining
+    # submits compression jobs, so only operator sessions drain; a viewer's
+    # refresh just polls job status.
+    if AuthManager.has_role(ROLE_OPERATOR):
+        _drain_pending_queue(db_id)
 
 
 def _drain_pending_queue(db_id):

@@ -12,6 +12,7 @@ from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.target_queries import TargetQueries
 from hcc_advisor.utils.leaf_segments import leaf_segments
 from hcc_advisor.config import config
+from hcc_advisor.auth import AuthManager, ROLE_OPERATOR
 
 
 def show_recommendations_page():
@@ -486,16 +487,22 @@ def show_detailed_tab(df: pd.DataFrame):
         col1, col2, col3 = st.columns([1, 2, 1])
 
         with col2:
-            execute_disabled = selected_count == 0
+            # A dry run only generates DDL; live execution needs the operator role.
+            can_execute, execute_help = AuthManager.role_gate(ROLE_OPERATOR)
+            live_blocked = not dry_run and not can_execute
+            execute_disabled = selected_count == 0 or live_blocked
             execute_label = f"Execute {selected_count} Selected Tables" if selected_count > 0 else "Select Tables First"
 
             if st.button(
                 execute_label,
                 use_container_width=True,
                 type="primary",
-                disabled=execute_disabled
+                disabled=execute_disabled,
+                help=execute_help if live_blocked else None
             ):
                 execute_batch_compression(selected_df, df, dry_run, parallel_degree)
+            if live_blocked:
+                st.caption("Live execution requires the operator role; Dry Run is available.")
 
     else:
         st.info("Select one or more tables using the checkboxes to enable export and execution options.")
@@ -895,6 +902,12 @@ def execute_batch_compression(selected_df: pd.DataFrame, original_df: pd.DataFra
 
     if not selected_ids:
         st.warning("No tables selected for execution")
+        return
+
+    # Re-checked here so a forced click on the disabled button runs nothing live.
+    if not dry_run and not AuthManager.require_role(
+        ROLE_OPERATOR, "Executing compression requires the operator role."
+    ):
         return
 
     # Show confirmation

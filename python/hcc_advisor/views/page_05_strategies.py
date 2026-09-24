@@ -11,6 +11,7 @@ from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.target_queries import TargetQueries
 from hcc_advisor.utils.logger import log_warning
 from hcc_advisor.config import config
+from hcc_advisor.auth import AuthManager, ROLE_ADMIN
 
 
 def show_strategies_page():
@@ -228,6 +229,11 @@ def show_strategy_editor():
 
     st.markdown("---")
 
+    # Strategies drive every recommendation: editing them is admin-only.
+    can_edit, edit_help = AuthManager.role_gate(ROLE_ADMIN)
+    if edit_help:
+        st.caption("View only: editing strategies requires the admin role.")
+
     # Strategy form
     with st.form("strategy_form"):
         st.markdown("### Strategy Details")
@@ -384,21 +390,27 @@ def show_strategy_editor():
         col1, col2, col3, col4 = st.columns(4)
 
         with col1:
-            save_button = st.form_submit_button("💾 Save Strategy", type="primary", use_container_width=True)
+            save_button = st.form_submit_button("💾 Save Strategy", type="primary", use_container_width=True,
+                                                disabled=not can_edit, help=edit_help)
 
         with col2:
             if not editing_new:
-                set_default_button = st.form_submit_button("🏷️ Set as Default", use_container_width=True)
+                set_default_button = st.form_submit_button("🏷️ Set as Default", use_container_width=True,
+                                                           disabled=not can_edit, help=edit_help)
             else:
                 set_default_button = False
 
         with col3:
             if not editing_new:
-                delete_button = st.form_submit_button("🗑️ Deactivate", use_container_width=True)
+                delete_button = st.form_submit_button("🗑️ Deactivate", use_container_width=True,
+                                                      disabled=not can_edit, help=edit_help)
             else:
                 delete_button = False
 
-    # Handle form submission
+    # Handle form submission (role re-checked so a forced submit does nothing)
+    if (save_button or set_default_button or delete_button) and not AuthManager.require_role(ROLE_ADMIN):
+        save_button = set_default_button = delete_button = False
+
     if save_button:
         if not strategy_name_input:
             st.error("Strategy name is required")
@@ -510,8 +522,11 @@ def show_strategy_rules_editor():
 
     st.markdown("---")
 
-    # Rule editor
+    # Rule editor (admin-only, like strategy editing)
     st.markdown("### Add/Edit Rule")
+    can_edit, edit_help = AuthManager.role_gate(ROLE_ADMIN)
+    if edit_help:
+        st.caption("View only: editing rules requires the admin role.")
 
     with st.form("rule_form"):
         col1, col2 = st.columns(2)
@@ -545,9 +560,10 @@ def show_strategy_rules_editor():
 
         col1, col2 = st.columns(2)
         with col1:
-            add_rule = st.form_submit_button("➕ Add Rule", use_container_width=True)
+            add_rule = st.form_submit_button("➕ Add Rule", use_container_width=True,
+                                             disabled=not can_edit, help=edit_help)
 
-    if add_rule:
+    if add_rule and AuthManager.require_role(ROLE_ADMIN):
         rule_data = {
             'rule_id': None,
             'strategy_id': strategy_options.get(rule_strategy),
@@ -581,7 +597,8 @@ def show_strategy_rules_editor():
                 format_func=lambda x: f"Rule {x}: {rules_df[rules_df['rule_id']==x].iloc[0].get('rule_description', 'No description')[:50]}"
             )
         with col2:
-            if st.button("🗑️ Delete Rule", use_container_width=True):
+            if st.button("🗑️ Delete Rule", use_container_width=True, disabled=not can_edit,
+                         help=edit_help) and AuthManager.require_role(ROLE_ADMIN):
                 success, message = CentralQueries.delete_strategy_rule(rule_to_delete)
                 if success:
                     st.success(message)

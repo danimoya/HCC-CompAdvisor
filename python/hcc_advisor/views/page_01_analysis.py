@@ -11,6 +11,7 @@ from datetime import datetime
 from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.target_queries import TargetQueries
 from hcc_advisor.config import config
+from hcc_advisor.auth import AuthManager, ROLE_OPERATOR
 
 
 def show_analysis_page():
@@ -95,11 +96,18 @@ def show_analysis_config():
 
             col_a, col_b = st.columns(2)
 
+            # Analysis runs DBMS_COMPRESSION on the target and writes central
+            # results: operator role or above.
+            can_analyze, analyze_help = AuthManager.role_gate(ROLE_OPERATOR)
             with col_a:
                 submit_button = st.form_submit_button(
                     "Start Analysis",
-                    use_container_width=True
+                    use_container_width=True,
+                    disabled=not can_analyze,
+                    help=analyze_help
                 )
+                if analyze_help:
+                    st.caption(analyze_help)
 
             with col_b:
                 refresh_button = st.form_submit_button(
@@ -107,7 +115,7 @@ def show_analysis_config():
                     use_container_width=True
                 )
 
-            if submit_button:
+            if submit_button and AuthManager.require_role(ROLE_OPERATOR):
                 if not db_id:
                     st.error("Select a target database from the sidebar first.")
                 else:

@@ -8,6 +8,7 @@ import pandas as pd
 from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.target_queries import TargetQueries
 from hcc_advisor.utils.leaf_segments import leaf_segments
+from hcc_advisor.auth import AuthManager, ROLE_OPERATOR
 
 STEPS = [
     "Select Database",
@@ -128,7 +129,13 @@ def _step_quick_scan():
     st.session_state.wizard_schema = None if schema == "All Schemas" else schema
     st.session_state.wizard_throttle = throttle
 
-    if st.button("Scan Now", type="primary", use_container_width=True, key="wiz_scan"):
+    # The scan writes central results: operator role. Viewers may skip ahead
+    # to review the existing candidates.
+    can_scan, scan_help = AuthManager.role_gate(ROLE_OPERATOR)
+    if scan_help:
+        st.caption("View only: scanning requires the operator role. Next shows the existing candidates.")
+    if st.button("Scan Now", type="primary", use_container_width=True, key="wiz_scan",
+                 disabled=not can_scan, help=scan_help) and AuthManager.require_role(ROLE_OPERATOR):
         with st.spinner("Running quick scan (hotness-only, no DBMS_COMPRESSION)..."):
             results = TargetQueries.quick_scan(db_id, owner=st.session_state.wizard_schema)
             st.session_state.wizard_scan_count = len(results)
@@ -141,7 +148,7 @@ def _step_quick_scan():
     if scan_count > 0:
         st.info(f"Last scan: {scan_count} objects analyzed")
 
-    _nav_buttons(next_disabled=scan_count == 0)
+    _nav_buttons(next_disabled=scan_count == 0 and can_scan)
 
 
 # =========================================================================
@@ -244,8 +251,12 @@ def _step_submit():
     confirm = st.checkbox("I confirm I want to submit all pending candidates for compression",
                            key="wiz_confirm_submit")
 
-    if st.button("Submit All to Scheduler", disabled=not confirm, type="primary",
-                 use_container_width=True, key="wiz_submit_btn"):
+    can_submit, submit_help = AuthManager.role_gate(ROLE_OPERATOR)
+    if submit_help:
+        st.caption("View only: submitting jobs requires the operator role.")
+    if st.button("Submit All to Scheduler", disabled=not (confirm and can_submit), type="primary",
+                 use_container_width=True, key="wiz_submit_btn",
+                 help=submit_help) and AuthManager.require_role(ROLE_OPERATOR):
         # Build candidate list
         candidates = []
         for _, r in recs.iterrows():

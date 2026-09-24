@@ -1,6 +1,6 @@
 """
 Deployment / Setup Page - HCC Compression Advisor
-Pre-login wizard shown when central DB is not configured or schema needs attention.
+Admin-only wizard shown after login when central DB is not configured or schema needs attention.
 Handles first-run setup, schema install, re-install, upgrade, and cleanup.
 """
 
@@ -11,6 +11,7 @@ from typing import Optional, Dict, List, Tuple
 from cryptography.fernet import Fernet
 
 from hcc_advisor import __version__
+from hcc_advisor.auth import AuthManager, ROLE_ADMIN, render_logout_button
 from hcc_advisor.config import Config, config
 from hcc_advisor.utils import sql_patches
 from hcc_advisor.utils.schema_version import (
@@ -297,6 +298,29 @@ def show_deployment_page(mode: str = 'setup'):
                 unsafe_allow_html=True)
     st.markdown(f"**Package Version:** `{__version__}`")
     st.markdown("---")
+
+    # SECURITY: the wizard is admin-only, first run included. It writes
+    # DASHBOARD_PASSWORD (the admin credential) and ENCRYPTION_KEY to .env, which
+    # overrides the environment on reload, and it can re-install or drop the
+    # central schema. The first-run bootstrap still works: before .env exists the
+    # only logins are the environment's passwords, and DASHBOARD_PASSWORD always
+    # maps to the admin role.
+    existing_install = mode == 'upgrade' and config.CENTRAL_DB_PASSWORD
+    if not AuthManager.require_role(
+        ROLE_ADMIN,
+        "Upgrading, re-installing or removing the central schema requires the admin role."
+        if existing_install else
+        "Initial setup requires the admin role: it sets the dashboard admin password "
+        "and the encryption key. Sign in with DASHBOARD_PASSWORD to run it."
+    ):
+        if existing_install:
+            st.info("Ask an administrator to upgrade the schema. You can continue to the "
+                    "dashboard meanwhile; some pages may fail until then.")
+            if st.button("Continue to Dashboard", key="setup_continue_non_admin", type="primary"):
+                st.session_state.setup_complete = True
+                st.rerun()
+        render_logout_button()
+        st.stop()
 
     # Initialize session state for wizard
     if 'setup_step' not in st.session_state:
