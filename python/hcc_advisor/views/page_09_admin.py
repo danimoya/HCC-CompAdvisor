@@ -8,6 +8,7 @@ import streamlit as st
 import pandas as pd
 from pathlib import Path
 from hcc_advisor.utils.central_connector import CentralConnector
+from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.logger import log_warning, log_error
 from hcc_advisor.config import config
 from hcc_advisor.auth import AuthManager, ROLE_ADMIN
@@ -33,8 +34,9 @@ def show_admin_page():
     ):
         return
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "SQL Patches", "AI / Ollama", "Webhooks", "AWR License", "System Info"
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "SQL Patches", "AI / Ollama", "Webhooks", "AWR License", "System Info",
+        "Data Reset"
     ])
 
     with tab1:
@@ -51,6 +53,9 @@ def show_admin_page():
 
     with tab5:
         show_system_info()
+
+    with tab6:
+        show_data_reset()
 
 
 def _ensure_patch_history_table():
@@ -646,6 +651,195 @@ def show_system_info():
                 st.metric(r['ITEM'], f"{int(r['CNT']):,}")
     except Exception:
         pass
+
+
+# ----------------------------------------------------------------------------
+# Data Reset: purge historical operations, keep connections and settings
+# ----------------------------------------------------------------------------
+
+_PURGE_CONFIRM_PHRASE = "DELETE HISTORY"
+
+_PURGE_TABLE_DESCRIPTIONS = {
+    'T_COMPRESSION_HISTORY': 'Compression execution history and the scheduler job queue '
+                             '(QUEUED / IN_PROGRESS rows)',
+    'T_LOB_COMPRESSION_ANALYSIS': 'LOB compression analysis results',
+    'T_INDEX_COMPRESSION_ANALYSIS': 'Index compression analysis results',
+    'T_COMPRESSION_ANALYSIS': 'Table / partition analysis results and recommendations',
+    'T_ADVISOR_RUN': 'Advisor analysis runs',
+}
+
+# Session-state keys holding data derived from the purged tables: the scheduler
+# queue view (QUEUED rows), the last quick-scan count, AI Advisor context built
+# from analysis/history. Wizard state (wizard_*/wiz_*) is reset as a whole since
+# its later steps refer to purged scan results.
+_PURGE_SESSION_KEYS = (
+    'scheduler_pending_queue',
+    'qs_last_count',
+    'ai_last_prompt', 'ai_last_response', 'ai_last_context',
+    'ai_chat_history', 'ai_last_followup_prompt',
+)
+
+
+def _clear_history_ui_state():
+    """Drop cached query results and session state that reference purged rows.
+    st.cache_data is process-wide, so cached reads are cleared for everyone;
+    session_state is per browser session, so other already-open sessions may
+    show a stale queue / AI context until they reload."""
+    try:
+        st.cache_data.clear()
+    except Exception as e:
+        log_warning(f"Data reset: st.cache_data.clear() failed: {e}")
+    for key in _PURGE_SESSION_KEYS:
+        st.session_state.pop(key, None)
+    for key in list(st.session_state.keys()):
+        if key.startswith('wizard_') or key.startswith('wiz_'):
+            st.session_state.pop(key, None)
+
+
+def show_data_reset():
+    """Purge all historical operations from the central DB while keeping the
+    registered database connections, strategies/rules and app settings."""
+    st.subheader("Data Reset: Purge Operation History")
+    st.markdown(
+        "Delete all historical operations (analysis runs and results, compression "
+        "execution history and the scheduler queue) from the central database, to "
+        "start from scratch. **Database connections, strategies, rules and settings "
+        "are kept.** This cannot be undone."
+    )
+
+    # The whole Admin page is admin-gated; guard this destructive section too so
+    # it stays protected if it is ever rendered from elsewhere.
+    if not AuthManager.require_role(
+        ROLE_ADMIN, "Purging operation history requires the admin role."
+    ):
+        return
+
+    # Result of a purge that just ran (shown once, after the rerun).
+    last = st.session_state.pop('admin_purge_result', None)
+    if last:
+        st.success(last['message'])
+        st.dataframe(
+            pd.DataFrame(
+                [{'Table': t, 'Rows affected': n} for t, n in last['deleted'].items()]
+            ),
+            use_container_width=True, hide_index=True,
+        )
+
+    # --- Scope -------------------------------------------------------------
+    scope_options = {"All target databases": None}
+    targets = CentralQueries.get_target_databases()
+    if not targets.empty:
+        targets.columns = [c.lower() for c in targets.columns]
+        for _, t in targets.iterrows():
+            did = int(t['database_id'])
+            name = t.get('display_name') or t.get('database_name') or f"DB {did}"
+            scope_options[f"{name} (ID {did})"] = did
+
+    scope_label = st.selectbox(
+        "Scope", list(scope_options.keys()), index=0, key="admin_purge_scope",
+        help="'All target databases' also removes history of deactivated targets. "
+             "Choosing one database deletes only rows with that DATABASE_ID."
+    )
+    database_id = scope_options[scope_label]
+    # Scope-specific widget keys: switching scope resets the confirmation.
+    scope_key = 'all' if database_id is None else str(database_id)
+
+    preview = CentralQueries.get_history_purge_preview(database_id)
+    if preview is None:
+        st.error("Could not read current row counts from the central database. "
+                 "Purge is unavailable until the central database is reachable.")
+        return
+
+    # --- What will be deleted / kept ----------------------------------------
+    counts = preview['counts']
+    total = sum(counts.values())
+
+    st.markdown("#### Will be deleted")
+    st.dataframe(
+        pd.DataFrame([
+            {'Table': t, 'Contents': _PURGE_TABLE_DESCRIPTIONS.get(t, ''), 'Rows': n}
+            for t, n in counts.items()
+        ]),
+        use_container_width=True, hide_index=True,
+    )
+    st.caption(
+        f"Total: **{total:,}** row(s). LAST_ANALYSIS_DATE will also be cleared on "
+        f"{preview['targets_to_reset']} target database(s)."
+    )
+
+    st.markdown("#### Preserved")
+    st.dataframe(
+        pd.DataFrame([
+            {'Table': t, 'Contents': desc}
+            for t, desc in CentralQueries.PURGE_PRESERVED_TABLES.items()
+        ]),
+        use_container_width=True, hide_index=True,
+    )
+    st.caption("Dashboard users and roles are configured through environment "
+               "variables, not the central database, and are not affected.")
+
+    # --- In-flight work ------------------------------------------------------
+    active = preview['active']
+    n_active = active['queued'] + active['in_progress'] + active['running_runs']
+    include_active = False
+    if n_active:
+        st.warning(
+            f"**Operations in flight for this scope:** {active['queued']} queued and "
+            f"{active['in_progress']} in-progress compression job(s), "
+            f"{active['running_runs']} running analysis run(s). The purge is refused "
+            "while these exist unless you explicitly include them below. Rows stuck "
+            "in these states after a crash also count."
+        )
+        include_active = st.checkbox(
+            "Also delete queued and in-progress operations",
+            key=f"admin_purge_include_active_{scope_key}",
+        )
+    st.info(
+        "Jobs already submitted to **target** databases through DBMS_SCHEDULER "
+        "(HCC_* compression jobs, IDXR_* index rebuilds, recurring scan jobs) are "
+        "**not** stopped or dropped by this purge. They keep running on the target, "
+        "but their results will no longer be recorded here, and the scheduler's "
+        "DOP budget will stop counting them. Stop them on the target first if needed."
+    )
+
+    if total == 0 and preview['targets_to_reset'] == 0:
+        st.success("Nothing to purge for this scope.")
+        return
+
+    # --- Confirmation --------------------------------------------------------
+    st.markdown("---")
+    phrase = st.text_input(
+        f"Type **{_PURGE_CONFIRM_PHRASE}** and press Enter to confirm",
+        key=f"admin_purge_confirm_{scope_key}",
+    )
+    confirmed = phrase.strip() == _PURGE_CONFIRM_PHRASE
+    blocked = n_active > 0 and not include_active
+    if blocked:
+        st.caption("Purge is disabled while queued or running operations exist "
+                   "(tick the checkbox above to include them).")
+
+    clicked = st.button(
+        f"Purge operation history ({scope_label})",
+        type="primary", key=f"admin_purge_btn_{scope_key}",
+        disabled=not confirmed or blocked,
+    )
+    # Act only on a click that is also confirmed and unblocked (the disabled
+    # flag is a UI hint, not the safety check).
+    if clicked and confirmed and not blocked:
+        with st.spinner("Purging operation history..."):
+            ok, msg, deleted = CentralQueries.purge_operation_history(
+                database_id=database_id,
+                include_active=include_active,
+                acting_user=AuthManager.get_current_user(),
+            )
+        if ok:
+            _clear_history_ui_state()
+            st.session_state.pop(f"admin_purge_confirm_{scope_key}", None)
+            st.session_state.pop(f"admin_purge_include_active_{scope_key}", None)
+            st.session_state['admin_purge_result'] = {'message': msg, 'deleted': deleted}
+            st.rerun()
+        else:
+            st.error(msg)
 
 
 if __name__ == "__main__":

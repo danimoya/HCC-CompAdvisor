@@ -512,6 +512,28 @@ WHERE execution_status = 'IN_PROGRESS'
 COMMIT;
 ```
 
+### Resetting Operation History (Admin > Data Reset)
+
+The Streamlit dashboard's **Admin > Data Reset** tab (admin role only) deletes
+all historical operations from the central database while keeping the
+registered database connections. Use it to start from scratch, for example
+before pointing the advisor at a new set of databases.
+
+| Deleted | Kept |
+|---------|------|
+| `T_COMPRESSION_HISTORY` (execution history and the scheduler queue: `QUEUED` / `IN_PROGRESS` rows) | `T_TARGET_DATABASES` (connections and credentials; only `LAST_ANALYSIS_DATE` is cleared) |
+| `T_LOB_COMPRESSION_ANALYSIS`, `T_INDEX_COMPRESSION_ANALYSIS`, `T_COMPRESSION_ANALYSIS` | `T_COMPRESSION_STRATEGIES`, `T_STRATEGY_RULES` |
+| `T_ADVISOR_RUN` | `T_SCHEMA_METADATA` (schema version, Ollama/webhook settings, AWR acknowledgement), `T_PATCH_HISTORY` |
+
+- **Scope:** all target databases (default, which also covers deactivated targets) or a single registered target (only rows with that `DATABASE_ID`).
+- **Preview:** the tab shows the rows to be deleted per table before anything runs.
+- **In-flight work:** if queued or in-progress jobs, or running analysis runs, exist, the purge is refused unless you tick the checkbox that includes them. The check runs again inside the purge transaction.
+- **Confirmation:** type `DELETE HISTORY` and click the primary button.
+- **Atomic:** all `DELETE`s (child tables first, then `T_ADVISOR_RUN`) and the `LAST_ANALYSIS_DATE` reset run in one transaction, with a single commit or a full rollback. `TRUNCATE` is not used.
+- **Not touched:** `DBMS_SCHEDULER` jobs already submitted on target databases (`HCC_*` compression jobs, `IDXR_*` index rebuilds, recurring scan jobs). They keep running, but their results are no longer recorded. Stop them on the target first if needed.
+- Identity/sequence values are not reset, so new IDs continue from the previous highest value.
+- The acting admin and per-table row counts are written to the application log.
+
 ## Monitoring Setup
 
 ### Create Monitoring Views
