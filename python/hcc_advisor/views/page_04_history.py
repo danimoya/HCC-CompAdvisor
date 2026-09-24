@@ -8,8 +8,32 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
+from typing import Optional
 from hcc_advisor.utils.central_queries import CentralQueries
+from hcc_advisor.utils.target_queries import TargetQueries, _blank_to_none, rollback_block_reason
 from hcc_advisor.config import config
+
+
+def _rollback_object_label(row) -> str:
+    """OWNER.TABLE plus the (sub)partition a history row compressed."""
+    label = f"{row.get('table_owner')}.{row.get('table_name')}"
+    sub = _blank_to_none(row.get('subpartition_name'))
+    part = _blank_to_none(row.get('partition_name'))
+    if sub:
+        label += f" subpartition {sub}"
+    elif part:
+        label += f" partition {part}"
+    return label
+
+
+def _rollback_block_reason(row) -> Optional[str]:
+    """Why this history row can't be rolled back from the page, or None if it can."""
+    if _blank_to_none(row.get('execution_id')) is None:
+        return "the history row has no history id"
+    if _blank_to_none(row.get('database_id')) is None:
+        return "the history row has no target database id"
+    return rollback_block_reason(row.get('status'), row.get('rollback_status'),
+                                 row.get('object_type'), row.get('strategy'))
 
 
 def show_history_page():
@@ -241,8 +265,10 @@ def show_history_page():
         'execution_id': 'ID',
         'table_owner': 'Owner',
         'table_name': 'Table',
+        'partition_name': 'Partition',
         'strategy': 'Strategy',
         'status': 'Status',
+        'rollback_status': 'Rollback',
         'savings_pct': 'Savings %',
         'error_message': 'Error',
         'executed_at': 'Executed At'
@@ -268,31 +294,44 @@ def show_history_page():
         hide_index=True
     )
 
-    # Rollback section for successful compressions
-    success_rows = df[df['status'] == 'SUCCESS'] if 'status' in df.columns else pd.DataFrame()
-    if not success_rows.empty:
+    # Rollback section: completed compressions (and ones already rolled back, so
+    # the user sees why the button is disabled rather than the row vanishing)
+    rollback_rows = df[df['status'].isin(['SUCCESS', 'ROLLED_BACK'])] if 'status' in df.columns else pd.DataFrame()
+    if not rollback_rows.empty:
         with st.expander("Rollback Compression"):
-            from hcc_advisor.utils.target_queries import TargetQueries
             rollback_target = st.selectbox(
-                "Select table to rollback",
-                options=success_rows.index.tolist(),
-                format_func=lambda i: f"{success_rows.loc[i, 'table_owner']}.{success_rows.loc[i, 'table_name']} ({success_rows.loc[i, 'strategy']})",
+                "Select object to rollback",
+                options=rollback_rows.index.tolist(),
+                format_func=lambda i: f"{_rollback_object_label(rollback_rows.loc[i])} "
+                                      f"({rollback_rows.loc[i, 'strategy']}, {rollback_rows.loc[i, 'status']})",
                 key="rollback_select"
             )
             if rollback_target is not None:
-                row = success_rows.loc[rollback_target]
-                st.warning(f"This will move **{row['table_owner']}.{row['table_name']}** to NOCOMPRESS and rebuild indexes.")
-                if st.button("Rollback to NOCOMPRESS", key="rollback_btn", type="primary"):
-                    db_id = st.session_state.get('active_database_id')
-                    if db_id:
-                        with st.spinner("Rolling back..."):
-                            result = TargetQueries.rollback_compression(
-                                db_id, row['table_owner'], row['table_name'])
-                            if result.get('success'):
-                                st.success(result['message'])
-                                st.rerun()
-                            else:
-                                st.error(result.get('error', 'Rollback failed'))
+                row = rollback_rows.loc[rollback_target]
+                label = _rollback_object_label(row)
+                block_reason = _rollback_block_reason(row)
+                if block_reason:
+                    st.info(f"Rollback is not available for **{label}**: {block_reason}.")
+                else:
+                    st.warning(f"This will move only **{label}** to NOCOMPRESS and rebuild the "
+                               f"indexes that move leaves unusable.")
+                if st.button("Rollback to NOCOMPRESS", key="rollback_btn", type="primary",
+                             disabled=block_reason is not None):
+                    # Use the row's own database (the sidebar may be "All Databases")
+                    # and its partition/subpartition so only that segment is moved.
+                    with st.spinner("Rolling back..."):
+                        result = TargetQueries.rollback_compression(
+                            int(row['database_id']), row['table_owner'], row['table_name'],
+                            partition_name=row.get('partition_name'),
+                            subpartition_name=row.get('subpartition_name'),
+                            history_id=int(row['execution_id']))
+                    if result.get('success') and result.get('index_failures'):
+                        st.warning(result['message'])
+                    elif result.get('success'):
+                        st.success(result['message'])
+                        st.rerun()
+                    else:
+                        st.error(result.get('error', 'Rollback failed'))
 
     # Failed job details from target scheduler
     failed_rows = df[df['status'] == 'FAILED'] if 'status' in df.columns else pd.DataFrame()
