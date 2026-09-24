@@ -10,6 +10,7 @@ import threading
 from datetime import datetime
 from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.target_queries import TargetQueries
+from hcc_advisor.utils.ui_refresh import schedule_rerun
 from hcc_advisor.config import config
 
 
@@ -31,6 +32,11 @@ def show_analysis_page():
 
     with tab3:
         show_schema_size()
+
+    # Auto-refresh (Monitor Progress tab): every tab is rendered by now, so
+    # wait the chosen interval and rerun in the same session.
+    schedule_rerun("analysis_auto_refresh",
+                   st.session_state.get("analysis_refresh_interval", 10))
 
 
 def show_analysis_config():
@@ -421,18 +427,15 @@ def show_analysis_monitor():
     # Auto-refresh controls
     col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
-        auto_refresh = st.checkbox("Auto-refresh", value=False, key="analysis_auto_refresh")
+        st.checkbox("Auto-refresh", value=False, key="analysis_auto_refresh")
     with col2:
         if st.button("Refresh Now", use_container_width=True, key="analysis_refresh"):
             st.rerun()
     with col3:
-        refresh_interval = st.slider("Refresh interval (seconds)", 5, 60, 10, key="analysis_refresh_interval")
+        st.slider("Refresh interval (seconds)", 5, 60, 10, key="analysis_refresh_interval")
 
-    # Auto-refresh logic
-    if auto_refresh:
-        import time
-        time.sleep(refresh_interval)
-        st.rerun()
+    # Auto-refresh ("analysis_auto_refresh"): the wait and rerun happen at the
+    # end of show_analysis_page(), once this monitor has been rendered.
 
     st.markdown("---")
 

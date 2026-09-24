@@ -8,6 +8,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime
 from hcc_advisor.utils.target_queries import TargetQueries
+from hcc_advisor.utils.ui_refresh import schedule_rerun
 from hcc_advisor.config import config
 
 
@@ -47,9 +48,6 @@ def show_sessions_page():
 
     if auto_refresh:
         st.caption(f"Auto-refreshing every {refresh_interval} seconds...")
-        import time
-        time.sleep(0.1)  # Small delay to ensure page renders
-        st.rerun()
 
     # Create tabs
     tab1, tab2, tab3 = st.tabs([
@@ -66,6 +64,11 @@ def show_sessions_page():
 
     with tab3:
         show_all_active_sessions()
+
+    # Auto-refresh: the tabs (and their target queries) have run by now, so
+    # wait the chosen interval and rerun in the same session. One refresh
+    # cycle costs exactly one normal render.
+    schedule_rerun("session_auto_refresh", refresh_interval)
 
 
 def show_long_operations():

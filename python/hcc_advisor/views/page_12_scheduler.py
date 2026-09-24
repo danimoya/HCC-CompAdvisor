@@ -19,6 +19,7 @@ from hcc_advisor.utils.sql_builder import (
     gather_dependent_indexes,
 )
 from hcc_advisor.utils.logger import log_warning
+from hcc_advisor.utils.ui_refresh import schedule_rerun
 
 
 def show_scheduler_page():
@@ -122,10 +123,10 @@ def show_scheduler_page():
         with st.expander("Recurring Stats Refresh Jobs"):
             _render_recurring_jobs(db_id)
 
-    # Auto-refresh logic: runs _do_refresh immediately on the current render
-    # and schedules the next page load via an HTML meta-refresh tag — this
-    # keeps every control on the page (Stop, interval selector, filters)
-    # responsive during the wait, unlike time.sleep which blocks the thread.
+    # Auto-refresh logic: runs _do_refresh on the current render, then (below)
+    # waits the chosen interval and reruns in the same session. No browser
+    # reload (meta http-equiv refresh): that starts a new Streamlit session,
+    # which logs the user out and resets this toggle and the selected page.
     if st.session_state.scheduler_auto_refresh:
         _do_refresh(db_id)
         st.session_state['scheduler_last_refresh'] = datetime.now()
@@ -138,11 +139,9 @@ def show_scheduler_page():
             f"click Stop to disable"
         )
 
-        # Browser-side auto-reload; never blocks Python rendering.
-        st.markdown(
-            f'<meta http-equiv="refresh" content="{int(interval * 60)}">',
-            unsafe_allow_html=True,
-        )
+    # Last statement of the render. Stop and the other controls still cut the
+    # wait short (see schedule_rerun).
+    schedule_rerun('scheduler_auto_refresh', interval * 60)
 
 
 def _render_export_section(current_db_id):
