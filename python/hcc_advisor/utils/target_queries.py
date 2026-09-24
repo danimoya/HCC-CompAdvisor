@@ -11,6 +11,10 @@ import streamlit as st
 from typing import Optional, Dict, Any, List
 from hcc_advisor.utils.target_connector import TargetConnector
 from hcc_advisor.utils.logger import log_error, log_info, log_debug, log_warning
+from hcc_advisor.utils.hotness import (
+    compute_hotness, index_dml_rows, index_segment_rows, lookup_dml, lookup_segment,
+    SOURCE_DML, SOURCE_SEGSTATS, SOURCE_AWR,
+)
 
 
 # SECURITY (CWE-89): Oracle DDL is built by interpolating identifiers into
@@ -204,8 +208,9 @@ class TargetQueries:
 
             log_info(f"Found {len(tables)} eligible tables on db_id={database_id}")
 
-            # 5. Batch-fetch DML stats for hotness scoring
-            dml_stats = TargetQueries._get_batch_dml_stats(database_id, owner)
+            # 5. Batch-fetch activity sources for hotness scoring (DML counters,
+            #    V$SEGMENT_STATISTICS, AWR if licensed) — scored per object below
+            hotness_inputs = TargetQueries._collect_hotness_inputs(database_id, owner)
 
             # 5b. Batch-fetch column-level statistics for smarter recommendations
             col_stats = TargetQueries._get_batch_table_stats(database_id, owner)
@@ -220,8 +225,13 @@ class TargetQueries:
                 tbl_name = table_info['table_name']
                 try:
                     hotness_key = f"{tbl_owner}.{tbl_name}"
-                    dml_info = dml_stats.get(hotness_key, {})
-                    hotness_score = dml_info.get('hotness_score', 0) if isinstance(dml_info, dict) else 0
+                    hot = TargetQueries._score_hotness(
+                        hotness_inputs, tbl_owner, tbl_name,
+                        num_rows=table_info.get('num_rows'),
+                        last_analyzed=table_info.get('last_analyzed'),
+                        stats_age_days=table_info.get('stats_age_days'),
+                    )
+                    hotness_score = hot['hotness_score']
 
                     current_size_mb = table_info['size_mb']
 
@@ -262,7 +272,7 @@ class TargetQueries:
                     savings_pct = round((savings_mb / current_size_mb) * 100, 2) if current_size_mb > 0 else 0
 
                     rationale = TargetQueries._generate_rationale(
-                        current_size_mb, hotness_score, ratios, recommended, table_stats
+                        current_size_mb, hotness_score, ratios, recommended, table_stats, hotness=hot
                     )
 
                     current_comp = table_info.get('compress_for') or table_info.get('compression', 'NONE')
@@ -292,17 +302,8 @@ class TargetQueries:
                         'BLKCNT_CMP_ADV_LOW': None,
                         'BLKCNT_UNCMP_ADV_HIGH': None,
                         'BLKCNT_CMP_ADV_HIGH': None,
-                        'INSERT_COUNT': dml_info.get('inserts', 0) if isinstance(dml_info, dict) else 0,
-                        'UPDATE_COUNT': dml_info.get('updates', 0) if isinstance(dml_info, dict) else 0,
-                        'DELETE_COUNT': dml_info.get('deletes', 0) if isinstance(dml_info, dict) else 0,
-                        'LOGICAL_READS': None,
-                        'PHYSICAL_READS': None,
-                        'ACCESS_FREQUENCY': None,
+                        **TargetQueries._hotness_columns(hot),
                         'LAST_ACCESS_DATE': None,
-                        'HOTNESS_SCORE': hotness_score,
-                        'READ_RATIO': None,
-                        'WRITE_RATIO': None,
-                        'DML_24H_RATE': None,
                         'LAST_ANALYZED': table_info.get('last_analyzed'),
                         'DATA_AGE_DAYS': None,
                         'CURRENT_COMPRESSION': current_comp,
@@ -331,9 +332,6 @@ class TargetQueries:
                                 )
                             else:
                                 log_info(f"Analyzing {len(partitions)} partitions for {tbl_owner}.{tbl_name}")
-                                part_dml = TargetQueries._get_batch_partition_dml_stats(
-                                    database_id, tbl_owner, tbl_name
-                                )
 
                                 for part_info in partitions:
                                     part_name = part_info['partition_name']
@@ -348,8 +346,14 @@ class TargetQueries:
                                             for subpart_info in subparts:
                                                 sub_name = subpart_info['subpartition_name']
                                                 try:
+                                                    sub_la, sub_age = TargetQueries._stats_window(subpart_info, table_info)
+                                                    sub_hot = TargetQueries._score_hotness(
+                                                        hotness_inputs, tbl_owner, tbl_name, part_name, sub_name,
+                                                        num_rows=subpart_info.get('num_rows'),
+                                                        last_analyzed=sub_la, stats_age_days=sub_age)
                                                     sub_recommended = TargetQueries._determine_target_compression(
-                                                        strategy_rules, 'TABLE', 0, table_stats, platform_type)
+                                                        strategy_rules, 'TABLE', sub_hot['hotness_score'],
+                                                        table_stats, platform_type)
                                                     sub_ratios = {k: None for k in ('basic', 'oltp', 'query_low', 'query_high', 'archive_low', 'archive_high')}
                                                     sub_rec_ratio = 1.0
                                                     if sub_recommended != 'NONE':
@@ -385,29 +389,38 @@ class TargetQueries:
                                                         'BLKCNT_UNCMP_OLTP': None, 'BLKCNT_CMP_OLTP': None,
                                                         'BLKCNT_UNCMP_ADV_LOW': None, 'BLKCNT_CMP_ADV_LOW': None,
                                                         'BLKCNT_UNCMP_ADV_HIGH': None, 'BLKCNT_CMP_ADV_HIGH': None,
-                                                        'INSERT_COUNT': 0, 'UPDATE_COUNT': 0, 'DELETE_COUNT': 0,
-                                                        'LOGICAL_READS': None, 'PHYSICAL_READS': None,
-                                                        'ACCESS_FREQUENCY': None, 'LAST_ACCESS_DATE': None,
-                                                        'HOTNESS_SCORE': 0, 'READ_RATIO': None, 'WRITE_RATIO': None,
-                                                        'DML_24H_RATE': None, 'LAST_ANALYZED': None, 'DATA_AGE_DAYS': None,
+                                                        **TargetQueries._hotness_columns(sub_hot),
+                                                        'LAST_ACCESS_DATE': None,
+                                                        'LAST_ANALYZED': subpart_info.get('last_analyzed'),
+                                                        'DATA_AGE_DAYS': None,
                                                         'CURRENT_COMPRESSION': sub_current_comp,
                                                         'ADVISABLE_COMPRESSION': sub_recommended,
-                                                        'RECOMMENDATION_REASON': f'Subpartition of composite {part_name}',
+                                                        'RECOMMENDATION_REASON': (
+                                                            f'Subpartition of composite {part_name}; '
+                                                            f"Hotness: {sub_hot['hotness_score']:.0f}/100 "
+                                                            f"({sub_hot['hotness_category']}; {sub_hot['basis']})"),
                                                         'CONFIDENCE_SCORE': None,
                                                         'PROJECTED_SAVINGS_BYTES': int(sub_savings_mb * 1048576),
                                                         'PROJECTED_SAVINGS_PCT': sub_savings_pct,
                                                         'ANALYSIS_DURATION_SEC': None, 'SAMPLE_SIZE_ROWS': None,
                                                     })
-                                                    objects_analyzed += 1
-                                                except Exception:
-                                                    objects_failed += 1
-                                        except Exception:
-                                            pass
+                                                    tables_analyzed += 1
+                                                except Exception as sub_e:
+                                                    tables_failed += 1
+                                                    log_warning(f"Failed to analyze subpartition "
+                                                                f"{tbl_owner}.{tbl_name}.{sub_name}: {sub_e}")
+                                        except Exception as comp_e:
+                                            log_warning(f"Failed to analyze subpartitions of "
+                                                        f"{tbl_owner}.{tbl_name}.{part_name}: {comp_e}")
                                         continue  # Skip to next partition
 
                                     try:
-                                        part_dml_info = part_dml.get(part_name, {})
-                                        part_hotness = part_dml_info.get('hotness_score', 0)
+                                        part_la, part_age = TargetQueries._stats_window(part_info, table_info)
+                                        part_hot = TargetQueries._score_hotness(
+                                            hotness_inputs, tbl_owner, tbl_name, part_name,
+                                            num_rows=part_info.get('num_rows'),
+                                            last_analyzed=part_la, stats_age_days=part_age)
+                                        part_hotness = part_hot['hotness_score']
                                         part_recommended = TargetQueries._determine_target_compression(
                                             strategy_rules, 'TABLE', part_hotness, table_stats, platform_type
                                         )
@@ -433,7 +446,8 @@ class TargetQueries:
                                             part_current_comp = 'NONE'
 
                                         part_rationale = TargetQueries._generate_rationale(
-                                            part_size_mb, part_hotness, part_ratios, part_recommended
+                                            part_size_mb, part_hotness, part_ratios, part_recommended,
+                                            hotness=part_hot
                                         )
 
                                         part_result = {
@@ -455,15 +469,10 @@ class TargetQueries:
                                             'BLKCNT_UNCMP_OLTP': None, 'BLKCNT_CMP_OLTP': None,
                                             'BLKCNT_UNCMP_ADV_LOW': None, 'BLKCNT_CMP_ADV_LOW': None,
                                             'BLKCNT_UNCMP_ADV_HIGH': None, 'BLKCNT_CMP_ADV_HIGH': None,
-                                            'INSERT_COUNT': part_dml_info.get('inserts', 0),
-                                            'UPDATE_COUNT': part_dml_info.get('updates', 0),
-                                            'DELETE_COUNT': part_dml_info.get('deletes', 0),
-                                            'LOGICAL_READS': None, 'PHYSICAL_READS': None,
-                                            'ACCESS_FREQUENCY': None, 'LAST_ACCESS_DATE': None,
-                                            'HOTNESS_SCORE': part_hotness,
-                                            'READ_RATIO': None, 'WRITE_RATIO': None,
-                                            'DML_24H_RATE': None,
-                                            'LAST_ANALYZED': None, 'DATA_AGE_DAYS': None,
+                                            **TargetQueries._hotness_columns(part_hot),
+                                            'LAST_ACCESS_DATE': None,
+                                            'LAST_ANALYZED': part_info.get('last_analyzed'),
+                                            'DATA_AGE_DAYS': None,
                                             'CURRENT_COMPRESSION': part_current_comp,
                                             'ADVISABLE_COMPRESSION': part_recommended,
                                             'RECOMMENDATION_REASON': part_rationale,
@@ -530,6 +539,7 @@ class TargetQueries:
             SELECT t.owner, t.table_name, t.num_rows, t.blocks,
                    t.avg_row_len,
                    t.last_analyzed,
+                   (SYSDATE - t.last_analyzed) as stats_age_days,
                    t.partitioned,
                    t.compression, t.compress_for,
                    NVL(s.total_bytes, 0) as size_bytes,
@@ -577,6 +587,7 @@ class TargetQueries:
                     'blocks': _safe_int(row.get('BLOCKS')),
                     'avg_row_len': _safe_int(row.get('AVG_ROW_LEN')),
                     'last_analyzed': row.get('LAST_ANALYZED'),
+                    'stats_age_days': row.get('STATS_AGE_DAYS'),
                     'partitioned': row.get('PARTITIONED', 'NO'),
                     'compression': row.get('COMPRESSION', 'NONE'),
                     'compress_for': row.get('COMPRESS_FOR'),
@@ -597,6 +608,8 @@ class TargetQueries:
             SELECT p.partition_name, p.composite,
                    p.compression, p.compress_for,
                    p.num_rows, p.blocks,
+                   p.last_analyzed,
+                   (SYSDATE - p.last_analyzed) as stats_age_days,
                    NVL(s.bytes, 0) as size_bytes,
                    ROUND(NVL(s.bytes, 0) / 1024 / 1024, 2) as size_mb
             FROM dba_tab_partitions p
@@ -622,6 +635,8 @@ class TargetQueries:
                     'compress_for': row.get('COMPRESS_FOR'),
                     'num_rows': _safe_int(row.get('NUM_ROWS')),
                     'blocks': _safe_int(row.get('BLOCKS')),
+                    'last_analyzed': row.get('LAST_ANALYZED'),
+                    'stats_age_days': row.get('STATS_AGE_DAYS'),
                     'size_bytes': _safe_int(row.get('SIZE_BYTES')),
                     'size_mb': _safe_float(row.get('SIZE_MB')),
                 })
@@ -639,6 +654,8 @@ class TargetQueries:
             SELECT sp.subpartition_name,
                    sp.compression, sp.compress_for,
                    sp.num_rows, sp.blocks,
+                   sp.last_analyzed,
+                   (SYSDATE - sp.last_analyzed) as stats_age_days,
                    NVL(s.bytes, 0) as size_bytes,
                    ROUND(NVL(s.bytes, 0) / 1024 / 1024, 2) as size_mb
             FROM dba_tab_subpartitions sp
@@ -667,6 +684,8 @@ class TargetQueries:
                     'compress_for': row.get('COMPRESS_FOR'),
                     'num_rows': _safe_int(row.get('NUM_ROWS')),
                     'blocks': _safe_int(row.get('BLOCKS')),
+                    'last_analyzed': row.get('LAST_ANALYZED'),
+                    'stats_age_days': row.get('STATS_AGE_DAYS'),
                     'size_bytes': _safe_int(row.get('SIZE_BYTES')),
                     'size_mb': _safe_float(row.get('SIZE_MB')),
                 })
@@ -675,51 +694,184 @@ class TargetQueries:
             log_warning(f"Failed to discover subpartitions for {owner}.{table_name}.{partition_name}: {e}")
             return []
 
-    @staticmethod
-    def _get_batch_partition_dml_stats(
-        database_id: int, owner: str, table_name: str
-    ) -> Dict[str, Dict]:
-        """Fetch partition-level DML stats. Returns dict keyed by partition_name."""
-        import math
+    # ------------------------------------------------------------------------
+    # HOTNESS INPUTS
+    # Each source is fetched once per run for the whole scope and scored per
+    # object by hotness.compute_hotness (absolute scale, see that module).
+    # A source that cannot be read is logged and returned as None so the
+    # score falls back to the remaining sources instead of silently being 0.
+    # ------------------------------------------------------------------------
 
-        query = """
-            SELECT partition_name,
-                   NVL(inserts, 0) as inserts,
-                   NVL(updates, 0) as updates,
-                   NVL(deletes, 0) as deletes
-            FROM all_tab_modifications
-            WHERE table_owner = :owner
-              AND table_name = :table_name
-              AND partition_name IS NOT NULL
-              AND subpartition_name IS NULL
+    @staticmethod
+    def _query_target_quiet(
+        database_id: int, query: str, params: Optional[Dict[str, Any]] = None
+    ) -> pd.DataFrame:
+        """Run a best-effort SELECT on the target and RAISE on failure.
+
+        TargetConnector.execute_query turns every oracledb error into an empty
+        DataFrame plus an st.error() banner, which makes "no rows" and "no
+        privilege" indistinguishable. Optional hotness sources (V$ views, AWR)
+        need to tell those apart, and a missing grant is not worth a red UI
+        banner, so this goes to the pool directly (like
+        _safe_flush_monitoring_info) and lets the caller log the failure.
+        """
+        from hcc_advisor.utils.central_queries import CentralQueries
+        db_info = CentralQueries.get_target_database(database_id)
+        if not db_info:
+            raise ValueError(f"Target database {database_id} not found in central registry")
+        pool = TargetConnector.get_pool(database_id, db_info)
+        connection = pool.acquire()
+        try:
+            cursor = connection.cursor()
+            try:
+                if params:
+                    cursor.execute(query, params)
+                else:
+                    cursor.execute(query)
+                columns = [d[0] for d in cursor.description]
+                return pd.DataFrame(cursor.fetchall(), columns=columns)
+            finally:
+                cursor.close()
+        finally:
+            pool.release(connection)
+
+    @staticmethod
+    def _get_segment_activity(database_id: int, owner: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Per-segment reads and block changes from V$SEGMENT_STATISTICS.
+
+        V$SEGMENT_STATISTICS is a plain dynamic performance view (no Diagnostics
+        Pack needed; SELECT_CATALOG_ROLE / SELECT ANY DICTIONARY is enough). Its
+        counters are cumulative since instance startup, so the window is the
+        instance uptime. Unlike DBA_TAB_MODIFICATIONS it is not reset by a
+        statistics gather and it also sees reads. On RAC this is the connected
+        instance only (a lower bound).
+
+        Returns {'window_days': float, 'objects': hotness.index_segment_rows(...)}
+        or None when the views cannot be read (logged).
+        """
+        owner_filter = "AND owner = :owner" if owner else ""
+        params = {'owner': owner.upper()} if owner else None
+        query = f"""
+            SELECT owner, object_name, subobject_name,
+                   SUM(CASE WHEN statistic_name = 'logical reads' THEN value ELSE 0 END) AS logical_reads,
+                   SUM(CASE WHEN statistic_name = 'physical reads' THEN value ELSE 0 END) AS physical_reads,
+                   SUM(CASE WHEN statistic_name = 'db block changes' THEN value ELSE 0 END) AS block_changes
+            FROM v$segment_statistics
+            WHERE object_type IN ('TABLE', 'TABLE PARTITION', 'TABLE SUBPARTITION')
+              AND statistic_name IN ('logical reads', 'physical reads', 'db block changes')
+              {owner_filter}
+            GROUP BY owner, object_name, subobject_name
         """
         try:
-            df = TargetConnector.execute_query(
-                database_id, query, {'owner': owner, 'table_name': table_name}
+            up = TargetQueries._query_target_quiet(
+                database_id, "SELECT (SYSDATE - startup_time) AS uptime_days FROM v$instance")
+            window_days = _safe_float(up.iloc[0]['UPTIME_DAYS']) if not up.empty else 0.0
+            df = TargetQueries._query_target_quiet(database_id, query, params)
+        except Exception as e:
+            log_warning(
+                f"[Target db_id={database_id}] Hotness: V$SEGMENT_STATISTICS/V$INSTANCE not readable "
+                f"({str(e)[:200]}); reads and block changes will not contribute to hotness. "
+                "Grant SELECT_CATALOG_ROLE (or SELECT on V_$SEGMENT_STATISTICS and V_$INSTANCE) "
+                "to the advisor user to enable them."
             )
-            raw = {}
-            if not df.empty:
-                for _, row in df.iterrows():
-                    pname = row['PARTITION_NAME']
-                    ins = int(row.get('INSERTS', 0) or 0)
-                    upd = int(row.get('UPDATES', 0) or 0)
-                    dlt = int(row.get('DELETES', 0) or 0)
-                    raw[pname] = {'inserts': ins, 'updates': upd, 'deletes': dlt,
-                                  'total_dml': ins + upd + dlt}
+            return None
+        df.columns = [c.lower() for c in df.columns]
+        objects = index_segment_rows(df.to_dict('records'))
+        log_debug(f"[Target db_id={database_id}] Hotness: {len(df)} segments from "
+                  f"V$SEGMENT_STATISTICS over {window_days:.1f} days of uptime")
+        return {'window_days': window_days, 'objects': objects}
 
-            # Log-relative hotness normalization
-            max_dml = max((v['total_dml'] for v in raw.values()), default=0)
-            log_max = math.log10(max_dml + 1) if max_dml > 0 else 1
-            for key, v in raw.items():
-                total = v['total_dml']
-                if total > 0 and max_dml > 0:
-                    v['hotness_score'] = round((math.log10(total + 1) / log_max) * 100, 2)
-                else:
-                    v['hotness_score'] = 0
+    @staticmethod
+    def _awr_acknowledged() -> bool:
+        """True when an admin acknowledged the Diagnostics Pack licence
+        (Admin > AWR License, stored as t_schema_metadata.awr_acknowledged='Y').
+        Read from the central DB rather than st.session_state because analyses
+        run in background threads."""
+        from hcc_advisor.utils.central_connector import CentralConnector
+        try:
+            df = CentralConnector.execute_query(
+                "SELECT value FROM t_schema_metadata WHERE key = 'awr_acknowledged'"
+            )
+            return not df.empty and str(df.iloc[0]['VALUE']).upper() == 'Y'
+        except Exception as e:
+            log_debug(f"Could not read AWR acknowledgement flag: {e}")
+            return False
 
-            return raw
-        except Exception:
-            return {}
+    @staticmethod
+    def _collect_hotness_inputs(database_id: int, owner: Optional[str] = None) -> Dict[str, Any]:
+        """Fetch every hotness source once for the run (best effort).
+
+        Call after _safe_flush_monitoring_info so the DML counters that are
+        still only in the SGA are visible. AWR is only queried when the
+        Diagnostics Pack licence has been acknowledged.
+        """
+        inputs = {
+            'dml': TargetQueries._get_batch_dml_stats(database_id, owner),
+            'segments': TargetQueries._get_segment_activity(database_id, owner),
+            'awr': None,
+        }
+        if TargetQueries._awr_acknowledged():
+            inputs['awr'] = TargetQueries.get_awr_segment_stats(database_id, owner)
+
+        available = [label for label, key in ((SOURCE_DML, 'dml'), (SOURCE_SEGSTATS, 'segments'),
+                                              (SOURCE_AWR, 'awr')) if inputs[key] is not None]
+        if available:
+            log_info(f"[Target db_id={database_id}] Hotness sources: {', '.join(available)}")
+        else:
+            log_warning(
+                f"[Target db_id={database_id}] Hotness: no activity source could be read "
+                "(DBA/ALL_TAB_MODIFICATIONS, V$SEGMENT_STATISTICS); every object will score 0 "
+                "and recommendations will treat all tables as cold."
+            )
+        return inputs
+
+    @staticmethod
+    def _score_hotness(
+        inputs: Dict[str, Any], owner: str, table_name: str,
+        partition_name: Optional[str] = None, subpartition_name: Optional[str] = None,
+        num_rows: Any = None, last_analyzed: Any = None, stats_age_days: Any = None
+    ) -> Dict[str, Any]:
+        """Score one table / partition / subpartition from the run's inputs."""
+        dml_index = inputs.get('dml')
+        dml = (lookup_dml(dml_index, owner, table_name, partition_name, subpartition_name)
+               if dml_index is not None else None)
+        subobject = subpartition_name or partition_name
+        segments = inputs.get('segments')
+        awr = inputs.get('awr')
+        return compute_hotness(
+            dml,
+            num_rows=num_rows,
+            last_analyzed=last_analyzed,
+            dml_window_days=stats_age_days,
+            segment_stats=lookup_segment(segments, owner, table_name, subobject) if segments else None,
+            awr_stats=lookup_segment(awr, owner, table_name, subobject) if awr else None,
+        )
+
+    @staticmethod
+    def _stats_window(obj_info: Dict[str, Any], table_info: Dict[str, Any]):
+        """(last_analyzed, stats_age_days) of a (sub)partition, falling back to
+        the table's when the (sub)partition itself has never been analyzed."""
+        age = obj_info.get('stats_age_days')
+        if age is None or pd.isna(age):
+            return table_info.get('last_analyzed'), table_info.get('stats_age_days')
+        return obj_info.get('last_analyzed'), age
+
+    @staticmethod
+    def _hotness_columns(hot: Dict[str, Any]) -> Dict[str, Any]:
+        """T_COMPRESSION_ANALYSIS activity columns filled from a hotness result."""
+        reads = hot.get('reads_per_day')
+        return {
+            'INSERT_COUNT': hot.get('inserts', 0),
+            'UPDATE_COUNT': hot.get('updates', 0),
+            'DELETE_COUNT': hot.get('deletes', 0),
+            'LOGICAL_READS': hot.get('logical_reads'),
+            'PHYSICAL_READS': hot.get('physical_reads'),
+            'ACCESS_FREQUENCY': reads,
+            'HOTNESS_SCORE': hot.get('hotness_score', 0),
+            'READ_RATIO': hot.get('read_ratio'),
+            'WRITE_RATIO': hot.get('write_ratio'),
+            'DML_24H_RATE': hot.get('dml_per_day'),
+        }
 
     @staticmethod
     def _get_compression_ratios_ctas(
@@ -787,69 +939,49 @@ class TargetQueries:
             return {'basic': 1, 'oltp': 1}
 
     @staticmethod
-    def _get_batch_dml_stats(database_id: int, owner: Optional[str] = None) -> Dict[str, Dict]:
-        """Batch-fetch DML activity for all tables in scope.
+    def _get_batch_dml_stats(database_id: int, owner: Optional[str] = None) -> Optional[Dict]:
+        """Batch-fetch DML counters for every table/partition/subpartition in scope.
 
-        Returns dict keyed by 'OWNER.TABLE_NAME' with values:
-            {inserts, updates, deletes, total_dml, hotness_score}
+        DBA/ALL_TAB_MODIFICATIONS only hold DML since the last statistics gather
+        (the row disappears when stats are gathered), so these counters are
+        turned into a per-day rate over the LAST_ANALYZED window by
+        hotness.compute_hotness, never scored on their own. All levels are read
+        in one query so partitioned tables whose table-level row is missing can
+        be rebuilt from their partition rows (see hotness.lookup_dml).
 
-        Hotness is computed as a relative score (0-100) where the table with
-        the highest cumulative DML in the batch gets 100 and others scale
-        proportionally using log-relative normalization. This ensures tables
-        with >1M DML are still differentiated by their relative activity.
+        Tries DBA_TAB_MODIFICATIONS first (all schemas) and falls back to
+        ALL_TAB_MODIFICATIONS (objects the user can access).
+
+        Returns a hotness.index_dml_rows index, or None when neither view can
+        be read (logged, so the run is not silently all-zero).
         """
-        import math
-
-        if owner:
-            query = """
-                SELECT table_owner, table_name,
+        owner_filter = "WHERE table_owner = :owner" if owner else ""
+        params = {'owner': owner.upper()} if owner else None
+        last_error = None
+        for view in ('dba_tab_modifications', 'all_tab_modifications'):
+            query = f"""
+                SELECT table_owner, table_name, partition_name, subpartition_name,
                        NVL(inserts, 0) as inserts,
                        NVL(updates, 0) as updates,
                        NVL(deletes, 0) as deletes
-                FROM all_tab_modifications
-                WHERE table_owner = :owner AND partition_name IS NULL
+                FROM {view}
+                {owner_filter}
             """
-            params = {'owner': owner.upper()}
-        else:
-            query = """
-                SELECT table_owner, table_name,
-                       NVL(inserts, 0) as inserts,
-                       NVL(updates, 0) as updates,
-                       NVL(deletes, 0) as deletes
-                FROM all_tab_modifications
-                WHERE partition_name IS NULL
-            """
-            params = None
+            try:
+                df = TargetQueries._query_target_quiet(database_id, query, params)
+            except Exception as e:
+                last_error = e
+                log_debug(f"[Target db_id={database_id}] Hotness: {view} not readable: {str(e)[:200]}")
+                continue
+            df.columns = [c.lower() for c in df.columns]
+            log_debug(f"[Target db_id={database_id}] Hotness: {len(df)} rows from {view}")
+            return index_dml_rows(df.to_dict('records'))
 
-        try:
-            df = TargetConnector.execute_query(database_id, query, params)
-            raw = {}
-            if not df.empty:
-                for _, row in df.iterrows():
-                    key = f"{row['TABLE_OWNER']}.{row['TABLE_NAME']}"
-                    ins = int(row.get('INSERTS', 0) or 0)
-                    upd = int(row.get('UPDATES', 0) or 0)
-                    dlt = int(row.get('DELETES', 0) or 0)
-                    raw[key] = {'inserts': ins, 'updates': upd, 'deletes': dlt,
-                                'total_dml': ins + upd + dlt}
-
-            # Compute relative hotness: normalize against the max DML in the batch
-            max_dml = max((v['total_dml'] for v in raw.values()), default=0)
-            log_max = math.log10(max_dml + 1) if max_dml > 0 else 1
-
-            for key, v in raw.items():
-                total = v['total_dml']
-                if total > 0 and max_dml > 0:
-                    # Log-relative: preserves order, spreads values across 0-100
-                    v['hotness_score'] = round(
-                        (math.log10(total + 1) / log_max) * 100, 2
-                    )
-                else:
-                    v['hotness_score'] = 0
-
-            return raw
-        except Exception:
-            return {}
+        log_warning(
+            f"[Target db_id={database_id}] Hotness: DBA/ALL_TAB_MODIFICATIONS not readable "
+            f"({str(last_error)[:200]}); DML counters will not contribute to hotness."
+        )
+        return None
 
     @staticmethod
     def _get_batch_table_stats(database_id: int, owner: Optional[str] = None) -> Dict[str, Dict]:
@@ -918,28 +1050,18 @@ class TargetQueries:
             25-44 → QUERY HIGH
             10-24 → ARCHIVE LOW
             <10  → ARCHIVE HIGH
+
+        The hotness score already measures activity per day (DML counters are
+        divided by the time since LAST_ANALYZED, segment statistics by their own
+        window), so the age of the statistics is no longer subtracted here: that
+        double-counted, and pushed tables that are busy but have old/locked
+        statistics towards ARCHIVE. The adjustments below are compressibility
+        hints (NULL density, cardinality, row width), not activity.
         """
         stats = table_stats or {}
 
         # --- Compute effective hotness adjusting for table statistics ---
-        effective_hotness = hotness_score
-
-        last_analyzed = stats.get('last_analyzed')
-        if last_analyzed:
-            from datetime import datetime, date
-            try:
-                if isinstance(last_analyzed, (datetime, date)):
-                    la = last_analyzed if isinstance(last_analyzed, datetime) \
-                        else datetime.combine(last_analyzed, datetime.min.time())
-                    age_days = (datetime.now() - la).days
-                else:
-                    age_days = 0
-                if age_days > 365:
-                    effective_hotness = max(0, effective_hotness - 30)
-                elif age_days > 90:
-                    effective_hotness = max(0, effective_hotness - 15)
-            except Exception:
-                pass
+        effective_hotness = hotness_score or 0
 
         avg_null_pct = stats.get('avg_null_pct', 0) or 0
         if avg_null_pct > 0.5:
@@ -1053,12 +1175,21 @@ class TargetQueries:
     @staticmethod
     def _generate_rationale(
         size_mb: float, hotness_score: float, ratios: Dict[str, Any],
-        recommended: str, table_stats: Optional[Dict[str, Any]] = None
+        recommended: str, table_stats: Optional[Dict[str, Any]] = None,
+        hotness: Optional[Dict[str, Any]] = None
     ) -> str:
-        """Generate human-readable rationale for compression recommendation."""
+        """Generate human-readable rationale for compression recommendation.
+
+        ``hotness`` is the hotness.compute_hotness result; when given, the
+        category and the measured rates/sources are shown even for a score of
+        0, so "idle" and "activity data unavailable" can be told apart.
+        """
         stats = table_stats or {}
         parts = [f'Size: {size_mb:.2f} MB']
-        if hotness_score > 0:
+        if hotness:
+            parts.append(f"Hotness: {hotness['hotness_score']:.0f}/100 "
+                         f"({hotness['hotness_category']}; {hotness['basis']})")
+        elif hotness_score > 0:
             label = 'High DML' if hotness_score > 70 else ('Moderate DML' if hotness_score > 30 else 'Low DML')
             parts.append(f'Hotness: {hotness_score}/100 ({label})')
 
@@ -2462,38 +2593,65 @@ ONLINE PARALLEL {parallel_degree};"""
     # ============================================================================
 
     @staticmethod
-    def get_awr_segment_stats(database_id: int, owner: Optional[str] = None) -> Dict[str, float]:
-        """Query DBA_HIST_SEG_STAT for physical reads per segment.
-        Returns dict keyed by 'OWNER.TABLE_NAME' with read_score 0-100.
-        WARNING: Requires Oracle Diagnostics Pack license."""
-        owner_filter = "AND s.obj#owner = :owner" if owner else ""
-        params = {'owner': owner} if owner else {}
+    def get_awr_segment_stats(
+        database_id: int, owner: Optional[str] = None, lookback_days: int = 7
+    ) -> Optional[Dict[str, Any]]:
+        """Per-segment reads and block changes over the last ``lookback_days``
+        from AWR (DBA_HIST_SEG_STAT), used as a hotness source.
 
+        WARNING: requires an Oracle Diagnostics Pack licence. Only called when
+        an admin has acknowledged it (Admin > AWR License); see
+        _collect_hotness_inputs.
+
+        AWR keeps only the top-N segments per snapshot, so sums can under-count;
+        hotness.compute_hotness therefore takes the highest rate across sources.
+
+        Returns {'window_days': float, 'objects': hotness.index_segment_rows(...)}
+        or None when AWR is not readable or has no snapshots (logged).
+        """
+        owner_filter = "AND o.owner = :owner" if owner else ""
+        params: Dict[str, Any] = {'days': lookback_days}
+        if owner:
+            params['owner'] = owner.upper()
+
+        window_query = """
+            SELECT CAST(MAX(end_interval_time) AS DATE)
+                   - CAST(MIN(begin_interval_time) AS DATE) AS window_days
+            FROM dba_hist_snapshot
+            WHERE end_interval_time > SYSTIMESTAMP - NUMTODSINTERVAL(:days, 'DAY')
+        """
         query = f"""
-            SELECT o.owner, o.object_name,
-                   SUM(s.physical_reads_delta) as total_reads
+            SELECT o.owner, o.object_name, o.subobject_name,
+                   SUM(s.logical_reads_delta)    AS logical_reads,
+                   SUM(s.physical_reads_delta)   AS physical_reads,
+                   SUM(s.db_block_changes_delta) AS block_changes
             FROM dba_hist_seg_stat s
+            JOIN dba_hist_snapshot sn
+              ON sn.snap_id = s.snap_id
+             AND sn.dbid = s.dbid
+             AND sn.instance_number = s.instance_number
             JOIN dba_objects o ON o.object_id = s.obj#
-            WHERE o.object_type = 'TABLE'
-              AND s.snap_id > (SELECT MAX(snap_id) - 48 FROM dba_hist_snapshot)
+            WHERE sn.end_interval_time > SYSTIMESTAMP - NUMTODSINTERVAL(:days, 'DAY')
+              AND o.object_type IN ('TABLE', 'TABLE PARTITION', 'TABLE SUBPARTITION')
               {owner_filter}
-            GROUP BY o.owner, o.object_name
-            HAVING SUM(s.physical_reads_delta) > 0
+            GROUP BY o.owner, o.object_name, o.subobject_name
         """
         try:
-            df = TargetConnector.execute_query(database_id, query, params if params else None)
-            if df.empty:
-                return {}
-            import math
-            max_reads = df['TOTAL_READS'].max()
-            result = {}
-            for _, r in df.iterrows():
-                reads = float(r['TOTAL_READS'])
-                score = (math.log10(reads + 1) / math.log10(max_reads + 1)) * 100 if max_reads > 0 else 0
-                result[f"{r['OWNER']}.{r['OBJECT_NAME']}"] = round(score, 1)
-            return result
-        except Exception:
-            return {}
+            wdf = TargetQueries._query_target_quiet(database_id, window_query, {'days': lookback_days})
+            window_days = _safe_float(wdf.iloc[0]['WINDOW_DAYS']) if not wdf.empty else 0.0
+            if window_days <= 0:
+                log_info(f"[Target db_id={database_id}] Hotness: no AWR snapshots in the last "
+                         f"{lookback_days} days; AWR not used")
+                return None
+            df = TargetQueries._query_target_quiet(database_id, query, params)
+        except Exception as e:
+            log_warning(f"[Target db_id={database_id}] Hotness: AWR (DBA_HIST_SEG_STAT) not readable "
+                        f"({str(e)[:200]}); AWR not used")
+            return None
+        df.columns = [c.lower() for c in df.columns]
+        log_debug(f"[Target db_id={database_id}] Hotness: {len(df)} segments from AWR "
+                  f"over {window_days:.1f} days")
+        return {'window_days': window_days, 'objects': index_segment_rows(df.to_dict('records'))}
 
     # ============================================================================
     # SCHEDULED RECURRING ANALYSIS
@@ -2619,15 +2777,18 @@ ONLINE PARALLEL {parallel_degree};"""
         if not tables:
             return []
 
-        dml_stats = TargetQueries._get_batch_dml_stats(database_id, owner)
+        hotness_inputs = TargetQueries._collect_hotness_inputs(database_id, owner)
         col_stats = TargetQueries._get_batch_table_stats(database_id, owner)
 
         results = []
         for t in tables:
             tbl_owner, tbl_name = t['owner'], t['table_name']
             hkey = f"{tbl_owner}.{tbl_name}"
-            dml = dml_stats.get(hkey, {})
-            hotness = dml.get('hotness_score', 0) if isinstance(dml, dict) else 0
+            hot = TargetQueries._score_hotness(
+                hotness_inputs, tbl_owner, tbl_name,
+                num_rows=t.get('num_rows'), last_analyzed=t.get('last_analyzed'),
+                stats_age_days=t.get('stats_age_days'))
+            hotness = hot['hotness_score']
             cs = col_stats.get(hkey, {})
             ts = {
                 'avg_row_len': t.get('avg_row_len', 0), 'last_analyzed': t.get('last_analyzed'),
@@ -2652,16 +2813,12 @@ ONLINE PARALLEL {parallel_degree};"""
                 'BLKCNT_UNCMP_OLTP': None, 'BLKCNT_CMP_OLTP': None,
                 'BLKCNT_UNCMP_ADV_LOW': None, 'BLKCNT_CMP_ADV_LOW': None,
                 'BLKCNT_UNCMP_ADV_HIGH': None, 'BLKCNT_CMP_ADV_HIGH': None,
-                'INSERT_COUNT': dml.get('inserts', 0) if isinstance(dml, dict) else 0,
-                'UPDATE_COUNT': dml.get('updates', 0) if isinstance(dml, dict) else 0,
-                'DELETE_COUNT': dml.get('deletes', 0) if isinstance(dml, dict) else 0,
-                'LOGICAL_READS': None, 'PHYSICAL_READS': None,
-                'ACCESS_FREQUENCY': None, 'LAST_ACCESS_DATE': None,
-                'HOTNESS_SCORE': hotness, 'READ_RATIO': None, 'WRITE_RATIO': None,
-                'DML_24H_RATE': None, 'LAST_ANALYZED': t.get('last_analyzed'),
+                **TargetQueries._hotness_columns(hot),
+                'LAST_ACCESS_DATE': None, 'LAST_ANALYZED': t.get('last_analyzed'),
                 'DATA_AGE_DAYS': None, 'CURRENT_COMPRESSION': current_comp,
                 'ADVISABLE_COMPRESSION': advised,
-                'RECOMMENDATION_REASON': f'Quick scan: hotness={hotness:.0f}',
+                'RECOMMENDATION_REASON': (f"Quick scan: hotness={hotness:.0f} "
+                                          f"({hot['hotness_category']}; {hot['basis']})"),
                 'CONFIDENCE_SCORE': None,
                 'PROJECTED_SAVINGS_BYTES': 0, 'PROJECTED_SAVINGS_PCT': 0,
                 'ANALYSIS_DURATION_SEC': None, 'SAMPLE_SIZE_ROWS': None,
@@ -2670,7 +2827,6 @@ ONLINE PARALLEL {parallel_degree};"""
             # Partition analysis
             if include_partitions and t.get('partitioned') == 'YES':
                 parts = TargetQueries._discover_partitions(database_id, tbl_owner, tbl_name)
-                part_dml = TargetQueries._get_batch_partition_dml_stats(database_id, tbl_owner, tbl_name)
                 for p in parts:
                     is_composite = p.get('composite') == 'YES'
 
@@ -2680,8 +2836,13 @@ ONLINE PARALLEL {parallel_degree};"""
                         subs = TargetQueries._discover_subpartitions(
                             database_id, tbl_owner, tbl_name, p['partition_name'])
                         for sp in subs:
+                            sp_la, sp_age = TargetQueries._stats_window(sp, t)
+                            sh = TargetQueries._score_hotness(
+                                hotness_inputs, tbl_owner, tbl_name, p['partition_name'],
+                                sp['subpartition_name'], num_rows=sp.get('num_rows'),
+                                last_analyzed=sp_la, stats_age_days=sp_age)
                             sa = TargetQueries._determine_target_compression(
-                                strategy_rules, 'TABLE', 0, ts, platform_type)
+                                strategy_rules, 'TABLE', sh['hotness_score'], ts, platform_type)
                             sc = sp.get('compress_for') or sp.get('compression', 'NONE')
                             if sc in ('DISABLED', None, ''):
                                 sc = 'NONE'
@@ -2699,13 +2860,14 @@ ONLINE PARALLEL {parallel_degree};"""
                                 'BLKCNT_UNCMP_OLTP': None, 'BLKCNT_CMP_OLTP': None,
                                 'BLKCNT_UNCMP_ADV_LOW': None, 'BLKCNT_CMP_ADV_LOW': None,
                                 'BLKCNT_UNCMP_ADV_HIGH': None, 'BLKCNT_CMP_ADV_HIGH': None,
-                                'INSERT_COUNT': 0, 'UPDATE_COUNT': 0, 'DELETE_COUNT': 0,
-                                'LOGICAL_READS': None, 'PHYSICAL_READS': None,
-                                'ACCESS_FREQUENCY': None, 'LAST_ACCESS_DATE': None,
-                                'HOTNESS_SCORE': 0, 'READ_RATIO': None, 'WRITE_RATIO': None,
-                                'DML_24H_RATE': None, 'LAST_ANALYZED': None, 'DATA_AGE_DAYS': None,
+                                **TargetQueries._hotness_columns(sh),
+                                'LAST_ACCESS_DATE': None, 'LAST_ANALYZED': sp.get('last_analyzed'),
+                                'DATA_AGE_DAYS': None,
                                 'CURRENT_COMPRESSION': sc, 'ADVISABLE_COMPRESSION': sa,
-                                'RECOMMENDATION_REASON': f'Quick scan subpartition of {p["partition_name"]}',
+                                'RECOMMENDATION_REASON': (
+                                    f'Quick scan subpartition of {p["partition_name"]}: '
+                                    f"hotness={sh['hotness_score']:.0f} "
+                                    f"({sh['hotness_category']}; {sh['basis']})"),
                                 'CONFIDENCE_SCORE': None,
                                 'PROJECTED_SAVINGS_BYTES': 0, 'PROJECTED_SAVINGS_PCT': 0,
                                 'ANALYSIS_DURATION_SEC': None, 'SAMPLE_SIZE_ROWS': None,
@@ -2713,7 +2875,11 @@ ONLINE PARALLEL {parallel_degree};"""
                         continue  # Skip to next partition
 
                     # Non-composite partition — can be MOVE'd directly
-                    ph = part_dml.get(p['partition_name'], {}).get('hotness_score', 0)
+                    p_la, p_age = TargetQueries._stats_window(p, t)
+                    phot = TargetQueries._score_hotness(
+                        hotness_inputs, tbl_owner, tbl_name, p['partition_name'],
+                        num_rows=p.get('num_rows'), last_analyzed=p_la, stats_age_days=p_age)
+                    ph = phot['hotness_score']
                     pa = TargetQueries._determine_target_compression(
                         strategy_rules, 'TABLE', ph, ts, platform_type)
                     pc = p.get('compress_for') or p.get('compression', 'NONE')
@@ -2730,13 +2896,12 @@ ONLINE PARALLEL {parallel_degree};"""
                         'BLKCNT_UNCMP_OLTP': None, 'BLKCNT_CMP_OLTP': None,
                         'BLKCNT_UNCMP_ADV_LOW': None, 'BLKCNT_CMP_ADV_LOW': None,
                         'BLKCNT_UNCMP_ADV_HIGH': None, 'BLKCNT_CMP_ADV_HIGH': None,
-                        'INSERT_COUNT': 0, 'UPDATE_COUNT': 0, 'DELETE_COUNT': 0,
-                        'LOGICAL_READS': None, 'PHYSICAL_READS': None,
-                        'ACCESS_FREQUENCY': None, 'LAST_ACCESS_DATE': None,
-                        'HOTNESS_SCORE': ph, 'READ_RATIO': None, 'WRITE_RATIO': None,
-                        'DML_24H_RATE': None, 'LAST_ANALYZED': None, 'DATA_AGE_DAYS': None,
+                        **TargetQueries._hotness_columns(phot),
+                        'LAST_ACCESS_DATE': None, 'LAST_ANALYZED': p.get('last_analyzed'),
+                        'DATA_AGE_DAYS': None,
                         'CURRENT_COMPRESSION': pc, 'ADVISABLE_COMPRESSION': pa,
-                        'RECOMMENDATION_REASON': f'Quick scan partition: hotness={ph:.0f}',
+                        'RECOMMENDATION_REASON': (f"Quick scan partition: hotness={ph:.0f} "
+                                                  f"({phot['hotness_category']}; {phot['basis']})"),
                         'CONFIDENCE_SCORE': None,
                         'PROJECTED_SAVINGS_BYTES': 0, 'PROJECTED_SAVINGS_PCT': 0,
                         'ANALYSIS_DURATION_SEC': None, 'SAMPLE_SIZE_ROWS': None,

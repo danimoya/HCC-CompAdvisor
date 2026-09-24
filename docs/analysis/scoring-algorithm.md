@@ -32,29 +32,86 @@ Normalization: CES_NORMALIZED = MIN(100, CES × 20)
 #### B. Activity Hotness Score (AHS)
 **Weight: 30%**
 
-Quantifies object access intensity and DML frequency:
+Quantifies how actively an object is written and read. This is the
+`HOTNESS_SCORE` stored in `T_COMPRESSION_ANALYSIS` by both the full analysis
+and the quick scan; the implementation is `compute_hotness()` in
+`python/hcc_advisor/utils/hotness.py`, applied to tables, partitions and
+subpartitions alike.
+
+The score is on an **absolute** scale: the same object gets the same score no
+matter which other tables are in the scan (the previous model normalised
+against the busiest table in the batch, so the busiest table always scored 100
+and everything else was relative to it).
 
 ```
-DML_HEAT = (INSERTS + UPDATES + DELETES) / TIME_WINDOW_HOURS
+-- Write rate (changes per day): highest estimate from any readable source
+DML_RATE      = (INSERTS + UPDATES + DELETES)            -- DBA/ALL_TAB_MODIFICATIONS
+                / MAX(DAYS_SINCE_LAST_ANALYZED, 1 hour)   -- counters reset at each stats gather
+                                                          -- (1 day if never analyzed)
+CHANGE_RATE   = DB_BLOCK_CHANGES / UPTIME_DAYS            -- V$SEGMENT_STATISTICS
+AWR_CHG_RATE  = DB_BLOCK_CHANGES_DELTA / AWR_WINDOW_DAYS  -- DBA_HIST_SEG_STAT, last 7 days
+WRITE_RATE    = MAX(DML_RATE, CHANGE_RATE, AWR_CHG_RATE)
 
-ACCESS_INTENSITY = LOG10(1 + LOGICAL_READS + PHYSICAL_READS) / LOG10(1000000)
+-- Read rate (block reads per day)
+READ_RATE     = MAX((LOGICAL_READS + PHYSICAL_READS) / UPTIME_DAYS,          -- V$SEGMENT_STATISTICS
+                    (LOGICAL_READS_DELTA + PHYSICAL_READS_DELTA) / AWR_DAYS)  -- AWR
 
-RECENCY_FACTOR = EXP(-DAYS_SINCE_LAST_ACCESS / 30)
+-- Intensities (log scale, clamped to 0..1)
+W_ABS  = LOG10(1 + WRITE_RATE) / LOG10(1 + 1,000,000)     -- 1M changes/day = 1.0
+CHURN  = WRITE_RATE / NUM_ROWS                             -- fraction of the rows changed per day
+W_CHURN = (LOG10(CHURN) + 4) / 4                           -- 0.01%/day = 0, 100%/day = 1
+W      = 0.6 × W_ABS + 0.4 × W_CHURN   (W = W_ABS when NUM_ROWS is unknown)
+R      = LOG10(1 + READ_RATE) / LOG10(1 + 1,000,000,000)   -- 1G block reads/day = 1.0
 
-AHS = (
-  (DML_HEAT × 0.40) +
-  (ACCESS_INTENSITY × 0.35) +
-  (RECENCY_FACTOR × 0.25)
-) × 100
+AHS = 100 × (1 − (1 − W) × (1 − 0.6 × R))
 
 Range: 0-100 (0=cold, 100=extremely hot)
+Category: HOT >= 75, WARM >= 50, COOL >= 25, else COLD
 ```
 
+Design notes:
+- **Why a rate, not a count**: `DBA_TAB_MODIFICATIONS` only holds DML since
+  the last statistics gather and its row disappears when stats are gathered
+  (e.g. by the nightly auto-stats job). A raw count therefore made a busy table
+  score 0 the morning after its stats were refreshed. Dividing by the days
+  since `LAST_ANALYZED` (computed as `SYSDATE - LAST_ANALYZED` on the target)
+  turns it into a comparable rate.
+- **Why several sources and MAX**: every source can under-count
+  (`TAB_MODIFICATIONS` resets at a stats gather, AWR keeps only the top-N
+  segments per snapshot, `V$SEGMENT_STATISTICS` averages since instance
+  startup and is per instance on RAC). Taking the highest observed rate means
+  any real evidence of activity counts. A source that cannot be read (missing
+  grant, AWR not licensed) is skipped and logged instead of zeroing the score.
+- **Reads vs writes**: reads alone can reach at most 60 (WARM). Frequently
+  queried, rarely modified data is still a good HCC `QUERY` candidate; `HOT`
+  (and therefore `OLTP`/no compression) is reserved for objects that are also
+  written.
+- **Churn**: 10K DML/day is hot for a 50K-row table but a trickle for a
+  1B-row fact table, so the write intensity blends in DML relative to
+  `NUM_ROWS`.
+- The score is monotonic: more DML, more block changes or more reads never
+  lower it.
+- Stale statistics are no longer subtracted from the score when choosing the
+  compression type; the per-day rate already accounts for the window.
+
+Reference points (no `NUM_ROWS`, no reads): 1 DML/day ≈ 5, 1K/day ≈ 50,
+10K/day ≈ 67, 100K/day ≈ 83, 1M/day = 100. Read-only: 1.3M block reads/day
+(one full scan of a 10 GB table) ≈ 41, 10G/day = 60.
+
 **Data Sources**:
-- `ALL_TAB_MODIFICATIONS`: DML statistics
-- `DBA_HIST_SEG_STAT`: Historical segment access patterns
-- `V$SEGMENT_STATISTICS`: Real-time access counters
-- `DBA_TAB_STATISTICS`: Last analysis timestamps
+- `DBA_TAB_MODIFICATIONS` (falls back to `ALL_TAB_MODIFICATIONS`): DML since the
+  last stats gather; `DBMS_STATS.FLUSH_DATABASE_MONITORING_INFO` is called first
+  when the user has `ANALYZE ANY`
+- `ALL_TABLES` / `DBA_TAB_PARTITIONS` / `DBA_TAB_SUBPARTITIONS`: `LAST_ANALYZED`, `NUM_ROWS`
+- `V$SEGMENT_STATISTICS` + `V$INSTANCE`: logical reads, physical reads and db
+  block changes since instance startup (no Diagnostics Pack needed; needs
+  `SELECT_CATALOG_ROLE` or equivalent)
+- `DBA_HIST_SEG_STAT` + `DBA_HIST_SNAPSHOT`: last 7 days of AWR, **only** when the
+  Diagnostics Pack licence has been acknowledged under Admin > AWR License
+
+Known limitation: reads by `DBMS_STATS` and by the advisor's own
+`DBMS_COMPRESSION` sampling are counted as reads, so a large table whose
+statistics were just re-gathered can show some read activity.
 
 #### C. Storage Impact Score (SIS)
 **Weight: 25%**
@@ -327,11 +384,11 @@ INSERT INTO SCORING_PARAMETERS VALUES
 **Object**: SALES.ORDERS_2023 (Partitioned Table)
 
 **Input Metrics**:
-- Size: 50 GB
+- Size: 50 GB, NUM_ROWS: 120,000,000
 - Compression ratios: OLTP=2.3, Query Low=3.5, Query High=5.2, Archive Low=6.1, Archive High=7.8
-- DML last 24h: 1,500 operations
-- Logical reads: 2,500,000
-- Last access: 2 days ago
+- Statistics gathered 6 hours ago; `DBA_TAB_MODIFICATIONS` since then: 350 inserts, 50 updates
+- `V$SEGMENT_STATISTICS` over 10 days of uptime: 25,000,000 logical reads,
+  1,200,000 physical reads, 15,000 db block changes
 - Read/write ratio: 85:1
 
 **Calculation**:
@@ -340,10 +397,15 @@ INSERT INTO SCORING_PARAMETERS VALUES
 CES = (2.3×0.15 + 3.5×0.20 + 5.2×0.25 + 6.1×0.20 + 7.8×0.20) / 5 = 5.04
 CES_NORMALIZED = MIN(100, 5.04 × 20) = 100
 
-DML_HEAT = 1500/24 = 62.5
-ACCESS_INTENSITY = LOG10(1 + 2500000) / LOG10(1000000) = 1.05
-RECENCY_FACTOR = EXP(-2/30) = 0.935
-AHS = (62.5×0.40 + 1.05×0.35 + 0.935×0.25) × 100 = 48.2
+DML_RATE    = 400 / 0.25 days = 1,600/day
+CHANGE_RATE = 15,000 / 10 days = 1,500/day
+WRITE_RATE  = MAX(1,600, 1,500) = 1,600/day
+W_ABS   = LOG10(1601) / LOG10(1,000,001) = 0.534
+W_CHURN = 0 (1,600 / 120M rows = 0.0013%/day, below the 0.01% floor)
+W       = 0.6 × 0.534 + 0.4 × 0 = 0.320
+READ_RATE = (25,000,000 + 1,200,000) / 10 = 2,620,000/day
+R       = LOG10(2,620,001) / LOG10(1,000,000,001) = 0.713
+AHS = 100 × (1 − (1 − 0.320) × (1 − 0.6 × 0.713)) = 61.1  (WARM)
 
 SIZE_FACTOR = LOG10(51) / LOG10(1000) = 0.568
 GROWTH_RATE = 0.12 (12% monthly growth)
@@ -355,10 +417,11 @@ CPU_OVERHEAD (Query High) = 0.25
 INDEX_DENSITY = 5/12 = 0.417
 PRS = (1/86×0.40 + 0.25×0.35 + 0.417×0.25) × 100 = 19.3
 
-CCCS = (100×0.35 + 51.8×0.30 + 46.4×0.25 + 80.7×0.10) = 74.7
+CCCS = (100×0.35 + (100 − 61.1)×0.30 + 46.4×0.25 + 80.7×0.10) = 66.3
 ```
 
-**Result**: Score 74.7 → "Good Candidate" (P1), Recommended: QUERY_HIGH, Confidence: 92%
+**Result**: Score 66.3 → "Moderate Candidate" (P2), Recommended: QUERY_LOW
+(AHS 50-75 with READ_WRITE_RATIO > 10), Confidence: 92%
 
 ## Conclusion
 
