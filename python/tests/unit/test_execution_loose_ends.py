@@ -728,8 +728,9 @@ class TestNoRawBannerOnTheRace:
         central.unique_open = True
 
         def enqueue_meanwhile(s, p):
-            # another session queues the segment right after the open-row check
-            if s.startswith('SELECT history_id, operation_status FROM') and not central.rows:
+            # another session queues the segment right after the overlap check
+            # (execute_compression checks overlapping rows, _overlapping_open_row)
+            if s.startswith('SELECT history_id, operation_status, partition_name') and not central.rows:
                 central.add(partition_name='P1', operation_status='QUEUED')
         central.after_query = enqueue_meanwhile
         res = TargetQueries.execute_compression(1, 'APP', 'ORDERS', 'OLTP', 'P1', dry_run=False)

@@ -40,11 +40,15 @@ def _history_row(status='SUCCESS', rollback_status=None, object_type='TABLE',
 class _Recorder:
     """Patches the connectors and records every statement sent to them."""
 
+    # history_id of the IN_PROGRESS row a rollback writes for itself
+    OWN_ROW_ID = 900
+
     def __init__(self, index_rows=None, history=None, plsql_ok=True, open_rows=None):
         self.plsql = []            # PL/SQL blocks sent to the target
         self.target_queries = []   # (sql, params) sent to the target
         self.central_dml = []      # (sql, params) sent to central
         self.central_queries = []  # (sql, params) sent to central
+        self.central_inserts = []  # (sql, params) of INSERT ... RETURNING sent to central
         self._index_df = pd.DataFrame(index_rows or [], columns=INDEX_COLS)
         self._history = history if history is not None else _history_row()
         self._plsql_ok = plsql_ok
@@ -64,6 +68,10 @@ class _Recorder:
         self.central_dml.append((sql, params))
         return 1
 
+    def _central_dml_returning(self, sql, params=None, *a, **k):
+        self.central_inserts.append((sql, params))
+        return self.OWN_ROW_ID
+
     def _central_query(self, sql, params=None, *a, **k):
         self.central_queries.append((sql, params))
         if "operation_status IN ('QUEUED', 'IN_PROGRESS')" in sql:
@@ -79,6 +87,8 @@ class _Recorder:
             patch.object(TargetConnector, 'execute_plsql', side_effect=self._execute_plsql),
             patch.object(TargetConnector, 'execute_query', side_effect=self._target_query),
             patch.object(CentralConnector, 'execute_dml', side_effect=self._central_dml),
+            patch.object(CentralConnector, 'execute_dml_returning',
+                         side_effect=self._central_dml_returning),
             patch.object(CentralConnector, 'execute_query', side_effect=self._central_query),
         ]
         for p in self._patches:
@@ -95,7 +105,15 @@ class _Recorder:
 
     @property
     def history_updates(self):
-        return [(s, p) for s, p in self.central_dml if 't_compression_history' in s]
+        """Updates of the compression's history row (not the rollback's own row)."""
+        return [(s, p) for s, p in self.central_dml if 't_compression_history' in s
+                and (p or {}).get('hid') != self.OWN_ROW_ID]
+
+    @property
+    def own_row_updates(self):
+        """Updates of the IN_PROGRESS row the rollback wrote for itself."""
+        return [(s, p) for s, p in self.central_dml if 't_compression_history' in s
+                and (p or {}).get('hid') == self.OWN_ROW_ID]
 
 
 # ============================================================================
@@ -276,10 +294,16 @@ class TestRollbackHistory:
         with _Recorder() as rec:
             TargetQueries.rollback_compression(7, 'SCOTT', 'SALES')
         assert rec.history_updates == [] and rec.history_checks == []
-        # the only central read: the queue check every rollback makes
-        (sql, params), = rec.central_queries
-        assert "operation_status IN ('QUEUED', 'IN_PROGRESS')" in sql
-        assert params == {'db': 7, 'o': 'SCOTT', 't': 'SALES'}
+        # the only central reads: the queue check every rollback makes, before
+        # and after writing its own open row (which it then closes)
+        assert len(rec.central_queries) == 2
+        for sql, params in rec.central_queries:
+            assert "operation_status IN ('QUEUED', 'IN_PROGRESS')" in sql
+            assert params == {'db': 7, 'o': 'SCOTT', 't': 'SALES'}
+        (_, own), = rec.central_inserts
+        assert own['clause'] == 'ROLLBACK to NOCOMPRESS'
+        (_, close), = rec.own_row_updates
+        assert close['st'] == 'SUCCESS'
 
     @pytest.mark.parametrize('history', [
         _history_row(status='ROLLED_BACK'),
