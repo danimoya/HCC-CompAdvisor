@@ -3002,10 +3002,3 @@ class CentralQueries:
             deleted=deleted,
         )
         return True, f"Deleted {total:,} historical row(s) for {scope_label}.", deleted
-
-
-# Create singleton accessor function
-@st.cache_resource
-def get_central_queries() -> CentralQueries:
-    """Get cached CentralQueries instance"""
-    return CentralQueries()

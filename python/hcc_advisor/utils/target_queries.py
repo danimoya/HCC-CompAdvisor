@@ -4572,10 +4572,3 @@ MOVE {compression_clause}
         """Poll entry point (Scheduler / Quick Action / Wizard refresh): runs
         reconcile_operations and returns the history rows it actually closed."""
         return TargetQueries.reconcile_operations(database_id).get('updated', [])
-
-
-# Create singleton accessor function
-@st.cache_resource
-def get_target_queries() -> TargetQueries:
-    """Get cached TargetQueries instance"""
-    return TargetQueries()

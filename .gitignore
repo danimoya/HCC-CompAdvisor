@@ -48,3 +48,9 @@ build/
 # Runtime logs
 logs/
 *.log
+
+# Test coverage output (python -m pytest in python/)
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml

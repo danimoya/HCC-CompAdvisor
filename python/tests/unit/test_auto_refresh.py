@@ -615,7 +615,6 @@ def _page_12_app(auto_refresh):
     at = AppTest.from_string(PAGE_12_SCRIPT, default_timeout=TIMEOUT)
     at.session_state["authenticated"] = True
     at.session_state["active_database_id"] = 1
-    at.session_state["scheduler_pending_queue"] = []  # skip the queue reload
     at.session_state["scheduler_auto_refresh"] = auto_refresh
     return at
 

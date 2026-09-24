@@ -9,7 +9,6 @@ import pandas as pd
 from hcc_advisor.utils.central_connector import CentralConnector
 from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.logger import log_error, log_warning
-from hcc_advisor.config import config
 from hcc_advisor.auth import AuthManager, ROLE_ADMIN
 # Patch detection/recording is shared with the deployment page's Upgrade.
 from hcc_advisor.utils.sql_patches import (
@@ -211,7 +210,7 @@ def show_sql_patches():
                 st.code(sql_text, language='sql')
 
                 if not is_applied:
-                    if st.button(f"Apply Patch", key=f"apply_{patch_name}", type="primary"):
+                    if st.button("Apply Patch", key=f"apply_{patch_name}", type="primary"):
                         with st.spinner(f"Applying {patch_name}..."):
                             st.session_state['admin_patch_result'] = _apply_patch(patch_name, sql_text)
                         # Rerun either way so the patch status reflects the
@@ -591,12 +590,12 @@ _PURGE_TABLE_DESCRIPTIONS = {
     'T_ADVISOR_RUN': 'Advisor analysis runs',
 }
 
-# Session-state keys holding data derived from the purged tables: the scheduler
-# queue view (QUEUED rows), the last quick-scan count, AI Advisor context built
-# from analysis/history. Wizard state (wizard_*/wiz_*) is reset as a whole since
-# its later steps refer to purged scan results.
+# Session-state keys holding data derived from the purged tables: the last
+# quick-scan count, AI Advisor context built from analysis/history. (The
+# scheduler queue is read from T_COMPRESSION_HISTORY on every render, so it has
+# no session copy to drop.) Wizard state (wizard_*/wiz_*) is reset as a whole
+# since its later steps refer to purged scan results.
 _PURGE_SESSION_KEYS = (
-    'scheduler_pending_queue',
     'qs_last_count',
     'ai_last_prompt', 'ai_last_response', 'ai_last_context',
     'ai_chat_history', 'ai_last_followup_prompt',
@@ -607,7 +606,7 @@ def _clear_history_ui_state():
     """Drop cached query results and session state that reference purged rows.
     st.cache_data is process-wide, so cached reads are cleared for everyone;
     session_state is per browser session, so other already-open sessions may
-    show a stale queue / AI context until they reload."""
+    show stale AI context until they reload."""
     try:
         st.cache_data.clear()
     except Exception as e:

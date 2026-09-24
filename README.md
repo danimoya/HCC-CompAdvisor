@@ -257,10 +257,16 @@ ENCRYPTION_KEY=your_fernet_key
 cd sql
 sqlplus COMPRESSION_MGR/password@database @tests/test_analysis.sql
 
-# Python Tests
+# Python Tests (coverage report and floor configured in python/pytest.ini)
 cd python
-python -m pytest tests/
+pip install -r requirements.txt -r requirements-test.txt
+python -m pytest
 ```
+
+The integration tests in `python/tests/integration` connect to a real Oracle
+database only when `HCC_TEST_DB_HOST`, `HCC_TEST_DB_SERVICE`, `HCC_TEST_DB_USER`
+and `HCC_TEST_DB_PASSWORD` (optionally `HCC_TEST_DB_PORT`) are set; otherwise
+they are skipped.
 
 ### Building Docker Image
 
