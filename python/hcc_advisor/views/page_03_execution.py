@@ -10,6 +10,7 @@ import time
 from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.target_queries import TargetQueries
 from hcc_advisor.utils.leaf_segments import leaf_segments
+from hcc_advisor.utils.ui_refresh import schedule_rerun
 from hcc_advisor.utils.sql_builder import (
     build_compression_script,
     gather_dependent_indexes,
@@ -83,6 +84,10 @@ def show_execution_page():
 
     with tab3:
         show_execution_monitor()
+
+    # Auto-refresh (Monitor Progress tab): every tab is rendered by now, so
+    # wait the chosen interval and rerun in the same session.
+    schedule_rerun("auto_refresh", st.session_state.get("refresh_interval", 10))
 
 
 def show_single_execution():
@@ -453,18 +458,15 @@ def show_execution_monitor():
     # Auto-refresh toggle
     col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
-        auto_refresh = st.checkbox("Auto-refresh", value=False, key="auto_refresh")
+        st.checkbox("Auto-refresh", value=False, key="auto_refresh")
     with col2:
         if st.button("Refresh Now", use_container_width=True):
             st.rerun()
     with col3:
-        refresh_interval = st.slider("Refresh interval (seconds)", 5, 60, 10, key="refresh_interval")
+        st.slider("Refresh interval (seconds)", 5, 60, 10, key="refresh_interval")
 
-    # Auto-refresh logic
-    if auto_refresh:
-        import time
-        time.sleep(refresh_interval)
-        st.rerun()
+    # Auto-refresh ("auto_refresh"): the wait and rerun happen at the end of
+    # show_execution_page(), once this monitor has been rendered.
 
     st.markdown("---")
 
