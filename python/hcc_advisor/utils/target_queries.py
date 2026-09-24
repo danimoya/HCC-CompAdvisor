@@ -6,6 +6,8 @@ table introspection, and session monitoring on target instances.
 """
 
 import re
+import threading
+import oracledb
 import pandas as pd
 import streamlit as st
 from typing import Optional, Dict, Any, List
@@ -184,6 +186,135 @@ def rollback_block_reason(operation_status, rollback_status=None,
     return None
 
 
+# ----------------------------------------------------------------------------
+# Scheduler job queue / reconcile helpers
+# ----------------------------------------------------------------------------
+
+# Work this app process is doing right now: history rows of synchronous
+# execute_compression calls and advisor runs of start_analysis threads. The
+# reconciler never touches these, whatever their age (Streamlit sessions share
+# the process, so this covers every open browser session of this app).
+_ACTIVE_LOCK = threading.Lock()
+_ACTIVE_HISTORY_IDS: set = set()
+_ACTIVE_ADVISOR_RUNS: set = set()
+
+
+def _set_active(registry: set, key, active: bool) -> None:
+    if key is None:
+        return
+    with _ACTIVE_LOCK:
+        if active:
+            registry.add(int(key))
+        else:
+            registry.discard(int(key))
+
+
+def _active_snapshot(registry: set) -> set:
+    with _ACTIVE_LOCK:
+        return set(registry)
+
+
+def _segment_label(owner, table_name, partition_name=None, subpartition_name=None) -> str:
+    label = f"{owner}.{table_name}"
+    if subpartition_name:
+        return f"{label} subpartition {subpartition_name}"
+    if partition_name:
+        return f"{label} partition {partition_name}"
+    return label
+
+
+def segments_overlap(part_a, sub_a, part_b, sub_b) -> bool:
+    """True if two MOVE jobs on the SAME table touch overlapping segments.
+
+    Duplicate/concurrency key of the scheduler: (database, owner, table,
+    partition, subpartition). Jobs on different partitions (or different
+    subpartitions) of one table may run concurrently. A table-level job
+    overlaps every job on that table in both directions: it rewrites every
+    segment under a table lock, so a partition MOVE would queue behind it (or
+    fail) and the two jobs' before/after sizes would measure each other's work.
+    Likewise a partition-level job overlaps its own subpartitions. A missing
+    partition name counts as table-level (the conservative reading).
+    """
+    part_a, sub_a = _blank_to_none(part_a), _blank_to_none(sub_a)
+    part_b, sub_b = _blank_to_none(part_b), _blank_to_none(sub_b)
+    if part_a is None or part_b is None:
+        return True
+    if str(part_a).upper() != str(part_b).upper():
+        return False
+    if sub_a is None or sub_b is None:
+        return True
+    return str(sub_a).upper() == str(sub_b).upper()
+
+
+def _history_compression_type(value) -> str:
+    """Compression type as stored in T_COMPRESSION_HISTORY: CHK_HISTORY_COMPRESSION_TYPE
+    accepts 'QUERY HIGH' but not the 'QUERY_HIGH' spelling generate_ddl also takes."""
+    key = str(value or '').strip().upper()
+    if key in ('QUERY_LOW', 'QUERY_HIGH', 'ARCHIVE_LOW', 'ARCHIVE_HIGH'):
+        return key.replace('_', ' ')
+    return key
+
+
+# Errors after which a job submission is worth retrying later (target down,
+# connection lost, lock timeout): the queue item goes back to QUEUED instead of
+# FAILED. ORA-27477 (job already exists) is handled separately.
+_RETRYABLE_ERROR_CODES = (
+    'DPY-4011', 'DPY-6005', 'ORA-00054', 'ORA-03113', 'ORA-03114', 'ORA-03135',
+    'ORA-12170', 'ORA-12514', 'ORA-12516', 'ORA-12520', 'ORA-12528', 'ORA-12537',
+    'ORA-12541', 'ORA-12543',
+)
+
+
+def _is_retryable_error(exc: BaseException) -> bool:
+    if isinstance(exc, (oracledb.OperationalError, oracledb.InterfaceError)):
+        return True
+    text = str(exc)
+    return any(code in text for code in _RETRYABLE_ERROR_CODES)
+
+
+def _lob_text(value, limit: int = 4000) -> Optional[str]:
+    """Text of a VARCHAR2/CLOB column value (LOB objects are read), capped."""
+    value = _blank_to_none(value)
+    if value is None:
+        return None
+    if hasattr(value, 'read'):
+        try:
+            value = value.read()
+        except Exception:
+            return None
+    return str(value)[:limit]
+
+
+def _py_datetime(value):
+    """datetime for binding (pandas Timestamp -> datetime), None for NaT/None."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if hasattr(value, 'to_pydatetime'):
+        return value.to_pydatetime()
+    return value
+
+
+def _segment_size_query(owner, table_name, partition_name=None, subpartition_name=None):
+    """DBA_SEGMENTS size query for exactly the segment a MOVE touches: the whole
+    table, one partition, or one subpartition (a subpartition's segment carries
+    the subpartition name in DBA_SEGMENTS.PARTITION_NAME). Returns (sql, binds)."""
+    sql = """
+        SELECT NVL(SUM(bytes), 0) as size_bytes
+        FROM dba_segments WHERE owner = :owner AND segment_name = :table_name
+    """
+    binds = {'owner': owner, 'table_name': table_name}
+    segment = _blank_to_none(subpartition_name) or _blank_to_none(partition_name)
+    if segment:
+        sql += "    AND partition_name = :partition_name\n"
+        binds['partition_name'] = segment
+    return sql, binds
+
+
 class TargetQueries:
     """Data access layer for operations on remote target Oracle databases"""
 
@@ -243,6 +374,8 @@ class TargetQueries:
             ok, run_id = CentralQueries.store_advisor_run(database_id, run_data)
             if not ok or not run_id:
                 return {'success': False, 'run_id': None, 'message': 'Failed to create advisor run record'}
+            # While this thread lives, the stale-run reaper leaves the run alone.
+            _set_active(_ACTIVE_ADVISOR_RUNS, run_id, True)
 
             log_info(f"Analysis run created: run_id={run_id}, db_id={database_id}, schema={owner or 'ALL'}")
 
@@ -595,6 +728,8 @@ class TargetQueries:
                 except Exception:
                     pass
             return {'success': False, 'run_id': run_id, 'message': f'Analysis failed: {str(e)}'}
+        finally:
+            _set_active(_ACTIVE_ADVISOR_RUNS, run_id, False)
 
     # ============================================================================
     # ANALYSIS HELPER METHODS (private)
@@ -1543,7 +1678,8 @@ class TargetQueries:
         compression_type: str,
         partition_name: Optional[str] = None,
         dry_run: bool = True,
-        parallel_degree: int = 4
+        parallel_degree: int = 4,
+        executed_by: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Execute compression for a specific table or partition on the target database.
@@ -1556,19 +1692,27 @@ class TargetQueries:
             partition_name: Optional partition name
             dry_run: If True, only generate DDL without executing
             parallel_degree: Parallel execution degree
+            executed_by: Audit user for the history row. Worker threads (batch
+                execution) have no Streamlit session, so their caller passes
+                the acting user in; defaults to _acting_user().
 
         Returns:
-            dict with execution result
+            dict with execution result. An invalid name/type/DOP (generate_ddl
+            ValueError) is returned as {'success': False, 'error': ...}.
         """
         # Handle None/NaN partition name
         if partition_name is not None and pd.isna(partition_name):
             partition_name = None
 
-        if dry_run:
+        try:
             ddl = TargetQueries.generate_ddl(
                 owner, table_name, compression_type, partition_name,
                 parallel_degree=parallel_degree
             )
+        except (ValueError, TypeError, AttributeError) as e:
+            return {'success': False, 'error': str(e)}
+
+        if dry_run:
             return {
                 'success': True,
                 'dry_run': True,
@@ -1576,16 +1720,13 @@ class TargetQueries:
                 'message': 'DDL generated successfully (dry run)'
             }
 
-        import time as _time
         from datetime import datetime
-        from hcc_advisor.utils.central_queries import CentralQueries
-        from hcc_advisor.utils.central_connector import CentralConnector
+        from hcc_advisor.utils.central_queries import CentralQueries, history_clause
 
-        ddl = TargetQueries.generate_ddl(
-            owner, table_name, compression_type, partition_name,
-            parallel_degree=parallel_degree
-        )
         ddl_exec = ddl.rstrip().rstrip(';')
+        # COMPRESSION_CLAUSE is VARCHAR2(200): a long DDL used to fail the
+        # history INSERT and run untracked. The full text goes to ORIGINAL_DDL.
+        clause = history_clause(ddl_exec)
 
         # Pre-compression validation: check for LOB columns
         try:
@@ -1603,19 +1744,8 @@ class TargetQueries:
 
         # Get original size from target before compression
         orig_size = 0
+        seg_q, seg_params = _segment_size_query(owner, table_name, partition_name)
         try:
-            seg_q = """
-                SELECT NVL(SUM(bytes), 0) as size_bytes
-                FROM dba_segments WHERE owner = :owner AND segment_name = :table_name
-            """
-            seg_params = {'owner': owner, 'table_name': table_name}
-            if partition_name:
-                seg_q = """
-                    SELECT NVL(SUM(bytes), 0) as size_bytes
-                    FROM dba_segments WHERE owner = :owner AND segment_name = :table_name
-                    AND partition_name = :partition_name
-                """
-                seg_params['partition_name'] = partition_name
             seg_df = TargetConnector.execute_query(database_id, seg_q, seg_params)
             if not seg_df.empty:
                 orig_size = int(seg_df.iloc[0]['SIZE_BYTES'] or 0)
@@ -1630,15 +1760,33 @@ class TargetQueries:
             'object_type': 'PARTITION' if partition_name else 'TABLE',
             'partition_name': partition_name,
             'compression_type_applied': compression_type,
-            'compression_clause': ddl_exec,
+            'compression_clause': clause,
+            'original_ddl': ddl_exec,
             'execution_mode': 'ONLINE',
             'parallel_degree': parallel_degree,
             'original_size_bytes': orig_size,
             'operation_status': 'IN_PROGRESS',
             'start_time': start_dt,
-            'executed_by': _acting_user(),
+            'executed_by': executed_by or _acting_user(),
         }
         history_id = CentralQueries.store_compression_history(database_id, history_record)
+        # The reconciler must not reap this row while this call is running.
+        _set_active(_ACTIVE_HISTORY_IDS, history_id, True)
+        try:
+            return TargetQueries._run_compression_ddl(
+                database_id, owner, table_name, compression_type, partition_name,
+                parallel_degree, ddl_exec, clause, orig_size, history_id, seg_q, seg_params)
+        finally:
+            _set_active(_ACTIVE_HISTORY_IDS, history_id, False)
+
+    @staticmethod
+    def _run_compression_ddl(database_id, owner, table_name, compression_type, partition_name,
+                             parallel_degree, ddl_exec, clause, orig_size, history_id,
+                             seg_q, seg_params) -> Dict[str, Any]:
+        """execute_compression after its IN_PROGRESS history row is written:
+        run the MOVE, rebuild unusable indexes, record the outcome on the row."""
+        import time as _time
+        from hcc_advisor.utils.central_connector import CentralConnector
 
         # Status/size updates below must hit exactly the row inserted above.
         # Matching on owner+table alone could land on another target's row (a
@@ -1662,7 +1810,7 @@ class TargetQueries:
             """
             hist_binds = {'hist_db': database_id, 'hist_owner': owner,
                           'hist_tbl': table_name, 'hist_part': partition_name,
-                          'hist_clause': ddl_exec}
+                          'hist_clause': clause}
 
         try:
             t0 = _time.perf_counter()
@@ -1675,6 +1823,7 @@ class TargetQueries:
             if success:
                 # Rebuild unusable indexes after ALTER TABLE MOVE
                 idx_rebuilt = 0
+                idx_failed = 0
                 idx_time = 0
                 try:
                     idx_q = """
@@ -1702,12 +1851,18 @@ class TargetQueries:
                                 # interpolating them into EXECUTE IMMEDIATE.
                                 _io = _validate_identifier(idx_owner, "index owner")
                                 _in = _validate_identifier(idx_name, "index name")
-                                TargetConnector.execute_plsql(
+                                rebuilt = TargetConnector.execute_plsql(
                                     database_id,
                                     f"BEGIN EXECUTE IMMEDIATE 'ALTER INDEX {_io}.{_in} REBUILD ONLINE PARALLEL {_pd}'; END;"
                                 )
-                                idx_rebuilt += 1
                             except Exception:
+                                rebuilt = False
+                            # execute_plsql reports a DB error by returning False:
+                            # only a True result is a rebuilt index.
+                            if rebuilt:
+                                idx_rebuilt += 1
+                            else:
+                                idx_failed += 1
                                 log_warning(f"Failed to rebuild index {idx_owner}.{idx_name}")
                         idx_time = round(_time.perf_counter() - it0, 1)
                 except Exception:
@@ -1734,11 +1889,15 @@ class TargetQueries:
                         compressed_size_bytes = :comp_size,
                         compression_ratio_achieved = :ratio,
                         indexes_rebuilt_count = :idx_cnt,
-                        index_rebuild_time_sec = :idx_time
+                        index_rebuild_time_sec = :idx_time,
+                        index_rebuild_status = :idx_status
                     {hist_where}
                 """, {
                     'dur': total_elapsed, 'comp_size': comp_size,
                     'ratio': ratio, 'idx_cnt': idx_rebuilt, 'idx_time': idx_time,
+                    'idx_status': ('FAILED' if idx_failed and not idx_rebuilt
+                                   else 'PARTIAL' if idx_failed
+                                   else 'COMPLETED' if idx_rebuilt else None),
                     **hist_binds
                 })
 
@@ -1761,6 +1920,8 @@ class TargetQueries:
 
                 saved_mb = round((orig_size - comp_size) / 1048576, 2)
                 idx_msg = f", {idx_rebuilt} indexes rebuilt" if idx_rebuilt else ""
+                if idx_failed:
+                    idx_msg += f", {idx_failed} index rebuild(s) FAILED (still UNUSABLE)"
                 return {
                     'success': True,
                     'message': f"Compression completed in {total_elapsed:.0f}s, saved {saved_mb} MB{idx_msg}"
@@ -1818,6 +1979,18 @@ class TargetQueries:
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
+        # Worker threads have no Streamlit session: resolve the acting user here.
+        executed_by = _acting_user()
+
+        def _entry(item, res):
+            return {
+                'owner': item.get('owner'),
+                'table_name': item.get('table_name'),
+                'partition_name': item.get('partition_name'),
+                'compression_type': item.get('compression_type'),
+                'result': res
+            }
+
         def _compress_one(item):
             res = TargetQueries.execute_compression(
                 database_id=database_id,
@@ -1826,15 +1999,10 @@ class TargetQueries:
                 compression_type=item.get('compression_type'),
                 partition_name=item.get('partition_name'),
                 dry_run=dry_run,
-                parallel_degree=parallel_degree
+                parallel_degree=parallel_degree,
+                executed_by=executed_by
             )
-            return {
-                'owner': item.get('owner'),
-                'table_name': item.get('table_name'),
-                'partition_name': item.get('partition_name'),
-                'compression_type': item.get('compression_type'),
-                'result': res
-            }
+            return _entry(item, res)
 
         results = []
         success_count = 0
@@ -1845,7 +2013,14 @@ class TargetQueries:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(_compress_one, item): item for item in items}
             for future in as_completed(futures):
-                entry = future.result()
+                # One bad item (e.g. an invalid name raising in generate_ddl) is
+                # that item's failure, not the whole batch's.
+                try:
+                    entry = future.result()
+                except Exception as e:
+                    log_warning(f"Batch item {futures[future].get('owner')}."
+                                f"{futures[future].get('table_name')} failed: {e}")
+                    entry = _entry(futures[future], {'success': False, 'error': str(e)})
                 results.append(entry)
                 if entry['result'].get('success'):
                     success_count += 1
@@ -3014,9 +3189,11 @@ ONLINE PARALLEL {parallel_degree};"""
         """Fast analysis using hotness + table stats only (no DBMS_COMPRESSION).
         Returns list of result dicts and MERGE-es them into t_compression_analysis."""
         import math
+        import time
         from hcc_advisor.utils.central_queries import CentralQueries
         from hcc_advisor.utils.central_connector import CentralConnector
 
+        scan_start = time.time()
         db_info = CentralQueries.get_target_database(database_id)
         platform_type = (db_info.get('platform_type') or 'STANDARD').upper()
 
@@ -3193,6 +3370,10 @@ ONLINE PARALLEL {parallel_degree};"""
 
             results_df = pd.DataFrame(results)
             CentralQueries.store_analysis_results(database_id, run_id, results_df)
+            # The scan is finished: close its run record. Left RUNNING, it would
+            # look like a dead analysis to the stale-run reaper.
+            if run_id:
+                TargetQueries._complete_advisor_run(run_id, len(results), 0, results, scan_start)
 
         return results
 
@@ -3341,63 +3522,369 @@ ONLINE PARALLEL {parallel_degree};"""
         return results
 
     # ============================================================================
-    # DBMS_SCHEDULER JOB SUBMISSION
+    # DBMS_SCHEDULER JOB QUEUE
     # ============================================================================
+    #
+    # A scheduler job is one T_COMPRESSION_HISTORY row for its whole life:
+    #   QUEUED       inserted by enqueue_compression_jobs / submit_compression_job
+    #                and never rewritten while it waits. FIFO order is the
+    #                enqueue START_TIME, then HISTORY_ID.
+    #   IN_PROGRESS  claimed by exactly one drainer: UPDATE ... WHERE
+    #                operation_status = 'QUEUED' must hit 1 row. The claim stores
+    #                the job name in COMPRESSION_CLAUSE, the DDL in ORIGINAL_DDL
+    #                and the claim time in START_TIME, so the row the duplicate
+    #                check sees is the job's own row before CREATE_JOB runs.
+    #   QUEUED again an overlapping job on the same table is running, or the
+    #                target could not be reached: the original START_TIME is put
+    #                back, so the item keeps its place in the queue.
+    #   FAILED       invalid item or CREATE_JOB error, with the reason on the row.
+    #   SUCCESS / FAILED  set by reconcile_operations from the target's
+    #                scheduler views.
+    # Every statement is scoped by DATABASE_ID (and HISTORY_ID for one row).
+
+    # A claimed job may be missing from the target's scheduler views this long
+    # (claim -> CREATE_JOB commit) before it is declared lost.
+    JOB_NOT_FOUND_GRACE_MINUTES = 15
+    # A synchronous (execute_compression) IN_PROGRESS row that no live thread of
+    # this app owns, and whose MOVE no target session is running, is closed as
+    # FAILED (outcome unknown) this many hours after it started.
+    SYNC_STALE_HOURS = 24
+    # A RUNNING advisor run that no live analysis thread of this app owns is
+    # closed as FAILED this many hours after it started.
+    ADVISOR_RUN_STALE_HOURS = 24
+
+    _QUEUE_INSERT_SQL = """
+        INSERT INTO t_compression_history (
+            database_id, owner, object_name, object_type,
+            partition_name, subpartition_name, compression_type_applied,
+            execution_mode, parallel_degree, operation_status, start_time, executed_by
+        ) VALUES (
+            :db, :owner, :tbl, :otype,
+            :part, :sub, :comp,
+            'ONLINE', :dop, 'QUEUED', SYSTIMESTAMP, :executed_by
+        )"""
+
+    # DBA_SCHEDULER_JOBS states of a job that will still run (after a logged
+    # failed run, e.g. RETRY SCHEDULED).
+    _JOB_PENDING_STATES = frozenset({
+        'SCHEDULED', 'RETRY SCHEDULED', 'RUNNING', 'BLOCKED',
+        'RESOURCE_UNAVAILABLE', 'CHAIN_STALLED', 'REMOTE',
+    })
 
     @staticmethod
-    def submit_compression_job(
-        database_id: int, owner: str, table_name: str,
-        compression_type: str, partition_name: Optional[str] = None,
-        parallel_degree: int = 4
-    ) -> Dict[str, Any]:
-        """Submit ALTER TABLE MOVE as a DBMS_SCHEDULER job on the target database."""
-        from datetime import datetime
-        from hcc_advisor.utils.central_queries import CentralQueries
+    def _prepare_queue_row(item: Dict, executed_by: str):
+        """(binds for _QUEUE_INSERT_SQL, None) for a valid queue item, else
+        (None, reason). Names are upper-cased (unquoted identifiers) so the
+        duplicate check compares like with like."""
+        def _name(value):
+            value = _blank_to_none(value)
+            return str(value).strip().upper() if value is not None else None
+
+        owner = _name(item.get('owner'))
+        table = _name(item.get('table_name', item.get('object_name')))
+        part = _name(item.get('partition_name'))
+        sub = _name(item.get('subpartition_name'))
+        comp = item.get('compression_type')
+        label = _segment_label(owner, table, part, sub)
+        try:
+            did = int(_blank_to_none(item.get('database_id')))
+        except (TypeError, ValueError):
+            return None, f"{label}: no target database"
+        if not is_supported_compression_type(comp):
+            return None, f"{label}: unsupported compression type {comp!r}"
+        dop = _blank_to_none(item.get('dop', item.get('parallel_degree')))
+        try:
+            dop = _validate_parallel_degree(4 if dop is None else dop)
+            # Validates names, refuses Oracle-maintained schemas (ValueError).
+            TargetQueries.generate_ddl(owner, table, comp, part, sub, parallel_degree=dop)
+        except (ValueError, TypeError, AttributeError) as e:
+            return None, f"{label}: {e}"
+        return {
+            'db': did, 'owner': owner, 'tbl': table,
+            'otype': 'SUBPARTITION' if sub else 'PARTITION' if part else 'TABLE',
+            'part': part, 'sub': sub, 'comp': _history_compression_type(comp),
+            'dop': dop, 'executed_by': executed_by,
+        }, None
+
+    @staticmethod
+    def enqueue_compression_jobs(items: List[Dict], executed_by: Optional[str] = None) -> Dict[str, Any]:
+        """Add segments to the scheduler queue as new QUEUED rows.
+
+        Rows already in the queue are never deleted or rewritten. A segment that
+        already has a QUEUED or IN_PROGRESS row on its database is skipped as a
+        duplicate; an item generate_ddl would reject (bad name, unsupported
+        type, Oracle-maintained schema, DOP out of range) is not queued. The new
+        rows of one call are inserted in one transaction.
+
+        Args:
+            items: dicts with database_id, owner, table_name (or object_name),
+                compression_type, dop, optional partition_name/subpartition_name
+            executed_by: audit user; defaults to _acting_user() (call from the
+                Streamlit thread)
+
+        Returns:
+            {'added': n, 'duplicates': n, 'rejected': n, 'errors': [reason, ...]}
+        """
         from hcc_advisor.utils.central_connector import CentralConnector
 
-        import random
-        ts = datetime.now().strftime('%m%d%H%M%S') + f"{random.randint(0,999):03d}"
-        obj_short = table_name[:30]
-        job_name = f"HCC_{obj_short}_{ts}"
+        executed_by = executed_by or _acting_user()
+        out = {'added': 0, 'duplicates': 0, 'rejected': 0, 'errors': []}
+        open_by_db: Dict[int, Optional[set]] = {}
+        rows = []
+        for item in items or []:
+            row, err = TargetQueries._prepare_queue_row(item, executed_by)
+            if err:
+                out['rejected'] += 1
+                out['errors'].append(err)
+                continue
+            did = row['db']
+            if did not in open_by_db:
+                try:
+                    df = CentralConnector.execute_query("""
+                        SELECT owner, object_name, partition_name, subpartition_name
+                        FROM t_compression_history
+                        WHERE database_id = :db
+                          AND operation_status IN ('QUEUED', 'IN_PROGRESS')
+                    """, {'db': did}, raise_on_error=True)
+                    open_by_db[did] = {
+                        (r['OWNER'], r['OBJECT_NAME'], _blank_to_none(r['PARTITION_NAME']),
+                         _blank_to_none(r['SUBPARTITION_NAME']))
+                        for r in df.to_dict('records')
+                    }
+                except Exception as e:
+                    log_warning(f"Scheduler: reading the queue of db_id={did} failed: {e}")
+                    open_by_db[did] = None
+            open_keys = open_by_db[did]
+            if open_keys is None:
+                out['rejected'] += 1
+                out['errors'].append(f"{_segment_label(row['owner'], row['tbl'], row['part'], row['sub'])}: "
+                                     f"could not read the queue of database {did}")
+                continue
+            key = (row['owner'], row['tbl'], row['part'], row['sub'])
+            if key in open_keys:
+                out['duplicates'] += 1
+                continue
+            open_keys.add(key)  # also de-duplicates within this call
+            rows.append(row)
 
-        # Check queue — prevent overload
-        running_df = TargetQueries.get_running_compression_jobs(database_id)
-        running_count = len(running_df) if not running_df.empty else 0
+        if rows:
+            try:
+                with CentralConnector.get_connection() as conn:
+                    cur = conn.cursor()
+                    try:
+                        cur.executemany(TargetQueries._QUEUE_INSERT_SQL, rows)
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        raise
+                    finally:
+                        cur.close()
+                out['added'] = len(rows)
+            except Exception as e:
+                log_error(e, "TargetQueries.enqueue_compression_jobs", {'rows': len(rows)})
+                out['rejected'] += len(rows)
+                out['errors'].append(f"Could not write {len(rows)} item(s) to the queue: {e}")
+        return out
 
-        # Check double-submission via central history (IN_PROGRESS means job is active)
+    @staticmethod
+    def get_queued_compression_jobs(database_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        """QUEUED rows in FIFO order (enqueue START_TIME, then HISTORY_ID), for one
+        database or all. Raises on a database error."""
         from hcc_advisor.utils.central_connector import CentralConnector
-        dup_df = CentralConnector.execute_query("""
-            SELECT 1 FROM t_compression_history
-            WHERE database_id = :db AND owner = :o AND object_name = :t
-              AND operation_status = 'IN_PROGRESS'
-              AND ROWNUM = 1
-        """, {'db': database_id, 'o': owner, 't': table_name})
-        if not dup_df.empty:
-            return {'success': False, 'error': f'{owner}.{table_name} already has a running job'}
 
-        ddl = TargetQueries.generate_ddl(
-            owner, table_name, compression_type, partition_name,
-            parallel_degree=parallel_degree
-        ).rstrip().rstrip(';')
+        db_filter = "AND database_id = :db" if database_id else ""
+        df = CentralConnector.execute_query(f"""
+            SELECT history_id, database_id, owner, object_name, partition_name,
+                   subpartition_name, compression_type_applied, parallel_degree, start_time
+            FROM t_compression_history
+            WHERE operation_status = 'QUEUED' {db_filter}
+            ORDER BY start_time, history_id
+        """, {'db': database_id} if database_id else None, raise_on_error=True)
+        items = []
+        for r in df.to_dict('records'):
+            items.append({
+                'history_id': int(r['HISTORY_ID']),
+                'database_id': int(r['DATABASE_ID']),
+                'owner': r['OWNER'],
+                'table_name': r['OBJECT_NAME'],
+                'partition_name': _blank_to_none(r['PARTITION_NAME']),
+                'subpartition_name': _blank_to_none(r['SUBPARTITION_NAME']),
+                'compression_type': r['COMPRESSION_TYPE_APPLIED'],
+                'dop': _blank_to_none(r['PARALLEL_DEGREE']),
+                'start_time': _py_datetime(r['START_TIME']),
+            })
+        return items
 
-        # Build PL/SQL action with index rebuild
-        part_filter = f"AND table_name = ''{table_name}''" if not partition_name else \
-                      f"AND table_name = ''{table_name}''"
+    @staticmethod
+    def _requeue_job_row(database_id: int, history_id: int, start_time, message: str) -> int:
+        """Put a claimed row back to QUEUED at its original queue position."""
+        from hcc_advisor.utils.central_connector import CentralConnector
+
+        start_time = _py_datetime(start_time)
+        set_start = ", start_time = :orig_start" if start_time is not None else ""
+        binds = {'msg': str(message)[:4000], 'hid': history_id, 'db': database_id}
+        if start_time is not None:
+            binds['orig_start'] = start_time
+        try:
+            return CentralConnector.execute_dml(f"""
+                UPDATE t_compression_history
+                   SET operation_status = 'QUEUED', compression_clause = NULL,
+                       error_message = :msg {set_start}
+                 WHERE history_id = :hid AND database_id = :db
+                   AND operation_status = 'IN_PROGRESS'
+            """, binds, raise_on_error=True)
+        except Exception as e:
+            # Left IN_PROGRESS without a job: reconcile_operations closes it as
+            # "job not found" after the grace period, so it is not lost silently.
+            log_error(e, "TargetQueries._requeue_job_row", {'history_id': history_id})
+            return 0
+
+    @staticmethod
+    def _close_job_row(database_id: int, history_id: int, status: str, message: Optional[str],
+                       from_status: str = 'IN_PROGRESS', error_code=None, duration=None) -> int:
+        """Set an open row to SUCCESS/FAILED (by id + database, only while it is
+        still in from_status). Returns the number of rows updated (0 or 1)."""
+        from hcc_advisor.utils.central_connector import CentralConnector
+
+        try:
+            return CentralConnector.execute_dml("""
+                UPDATE t_compression_history
+                   SET operation_status = :st, end_time = SYSTIMESTAMP,
+                       duration_seconds = :dur,
+                       error_code = :code, error_message = :msg
+                 WHERE history_id = :hid AND database_id = :db
+                   AND operation_status = :from_st
+            """, {
+                'st': status, 'dur': duration, 'code': error_code,
+                'msg': str(message)[:4000] if message else None,
+                'hid': history_id, 'db': database_id, 'from_st': from_status,
+            }, raise_on_error=True)
+        except Exception as e:
+            log_error(e, "TargetQueries._close_job_row", {'history_id': history_id, 'status': status})
+            return 0
+
+    @staticmethod
+    def _segment_size_bytes(database_id: int, owner: str, table_name: str,
+                            partition_name: Optional[str] = None,
+                            subpartition_name: Optional[str] = None) -> Optional[int]:
+        """Size of the one segment a job moves (table, partition or subpartition);
+        None if the target could not be asked."""
+        sql, binds = _segment_size_query(owner, table_name, partition_name, subpartition_name)
+        try:
+            df = TargetConnector.execute_query(database_id, sql, binds, raise_on_error=True)
+        except Exception as e:
+            log_warning(f"Size lookup of {_segment_label(owner, table_name, partition_name, subpartition_name)} "
+                        f"on db_id={database_id} failed: {e}")
+            return None
+        if df.empty:
+            return None
+        return _safe_int(_blank_to_none(df.iloc[0]['SIZE_BYTES']))
+
+    @staticmethod
+    def submit_queued_job(item: Dict) -> Dict[str, Any]:
+        """Claim one QUEUED row and submit it as a DBMS_SCHEDULER job.
+
+        Args:
+            item: a get_queued_compression_jobs() entry (history_id, database_id,
+                owner, table_name, partition/subpartition, compression_type, dop,
+                start_time)
+
+        Returns:
+            dict with 'status' and 'history_id', 'label', 'job_name', 'error':
+              SUBMITTED    job created; the row is its IN_PROGRESS row
+              NOT_CLAIMED  another drainer claimed it first (or it left QUEUED)
+              BLOCKED      an overlapping job on the table is running; row QUEUED
+              RETRY        target or central DB unreachable; row QUEUED
+              FAILED       invalid item or CREATE_JOB error; row FAILED
+        """
+        from hcc_advisor.utils.central_connector import CentralConnector
+
+        hid, did = int(item['history_id']), int(item['database_id'])
+        owner = item.get('owner')
+        table = item.get('table_name', item.get('object_name'))
+        part = _blank_to_none(item.get('partition_name'))
+        sub = _blank_to_none(item.get('subpartition_name'))
+        comp = item.get('compression_type')
+        label = _segment_label(owner, table, part, sub)
+        out = {'history_id': hid, 'database_id': did, 'label': label, 'job_name': None}
+
+        # An item that can never succeed goes straight to FAILED (never dropped).
+        try:
+            dop = _blank_to_none(item.get('dop'))
+            dop = _validate_parallel_degree(4 if dop is None else dop)
+            ddl = TargetQueries.generate_ddl(
+                owner, table, comp, part, sub, parallel_degree=dop
+            ).rstrip().rstrip(';')
+        except (ValueError, TypeError, AttributeError) as e:
+            n = TargetQueries._close_job_row(did, hid, 'FAILED', f"Not submitted: {e}",
+                                             from_status='QUEUED')
+            return {**out, 'status': 'FAILED' if n else 'NOT_CLAIMED', 'error': str(e)}
+
+        # Deterministic, unique name: a retried CREATE_JOB can't start a second job.
+        job_name = f"HCC_{str(table).upper()[:30]}_{hid}"
+        out['job_name'] = job_name
+
+        # Atomic claim: only one drainer gets rowcount 1.
+        try:
+            claimed = CentralConnector.execute_dml("""
+                UPDATE t_compression_history
+                   SET operation_status = 'IN_PROGRESS', compression_clause = :job,
+                       original_ddl = :ddl, start_time = SYSTIMESTAMP,
+                       end_time = NULL, error_message = NULL
+                 WHERE history_id = :hid AND database_id = :db
+                   AND operation_status = 'QUEUED'
+            """, {'job': job_name, 'ddl': ddl, 'hid': hid, 'db': did}, raise_on_error=True)
+        except Exception as e:
+            log_warning(f"Scheduler: claiming queue item {hid} failed: {e}")
+            return {**out, 'status': 'RETRY', 'error': f"Could not claim {label}: {e}"}
+        if claimed != 1:
+            return {**out, 'status': 'NOT_CLAIMED', 'error': f"{label} was already taken from the queue"}
+
+        # Duplicate / overlap check against the other IN_PROGRESS rows of this
+        # table (our own row is excluded). If two claimers of overlapping
+        # segments race, each sees the other's committed claim, so at most one
+        # proceeds; a loser simply waits in the queue.
+        try:
+            running = CentralConnector.execute_query("""
+                SELECT history_id, compression_clause, partition_name, subpartition_name
+                FROM t_compression_history
+                WHERE database_id = :db AND owner = :o AND object_name = :t
+                  AND operation_status = 'IN_PROGRESS' AND history_id <> :hid
+            """, {'db': did, 'o': owner, 't': table, 'hid': hid}, raise_on_error=True)
+        except Exception as e:
+            msg = f"Waiting: could not check for running jobs ({e})"
+            TargetQueries._requeue_job_row(did, hid, item.get('start_time'), msg)
+            return {**out, 'status': 'RETRY', 'error': msg}
+        for r in running.to_dict('records'):
+            if segments_overlap(part, sub, r['PARTITION_NAME'], r['SUBPARTITION_NAME']):
+                blocker = _segment_label(owner, table, _blank_to_none(r['PARTITION_NAME']),
+                                         _blank_to_none(r['SUBPARTITION_NAME']))
+                msg = (f"Waiting: {blocker} has a running job "
+                       f"({_blank_to_none(r['COMPRESSION_CLAUSE']) or 'history_id ' + str(r['HISTORY_ID'])})")
+                TargetQueries._requeue_job_row(did, hid, item.get('start_time'), msg)
+                return {**out, 'status': 'BLOCKED', 'error': msg}
+
+        # "Before" size of this job's own segment, taken before the job can start.
+        orig_size = TargetQueries._segment_size_bytes(did, owner, table, part, sub)
+
+        idx_owner, idx_table = str(owner).upper(), str(table).upper()
         action = f"""
             DECLARE v_n NUMBER := 0;
             BEGIN
                 EXECUTE IMMEDIATE '{ddl.replace("'", "''")}';
                 FOR idx IN (SELECT owner, index_name FROM all_indexes
-                            WHERE table_owner = '{owner}' AND table_name = '{table_name}'
+                            WHERE table_owner = '{idx_owner}' AND table_name = '{idx_table}'
                               AND status = 'UNUSABLE')
                 LOOP
                     EXECUTE IMMEDIATE 'ALTER INDEX ' || idx.owner || '.' || idx.index_name
-                                      || ' REBUILD ONLINE PARALLEL {parallel_degree}';
+                                      || ' REBUILD ONLINE PARALLEL {dop}';
                     v_n := v_n + 1;
                 END LOOP;
             END;
         """
-
+        # Every interpolated value is a validated identifier or an allowlisted
+        # compression type (generate_ddl above); COMMENTS holds 240 bytes at most.
+        comments = f"HCC Advisor: {_history_compression_type(comp)} on {label}"[:200]
         create_job_plsql = f"""
             BEGIN
                 DBMS_SCHEDULER.CREATE_JOB(
@@ -3406,45 +3893,164 @@ ONLINE PARALLEL {parallel_degree};"""
                     job_action => q'§{action}§',
                     enabled    => TRUE,
                     auto_drop  => TRUE,
-                    comments   => 'HCC Advisor: {compression_type} on {owner}.{table_name}'
+                    comments   => '{comments}'
                 );
             END;
         """
-
         try:
-            success = TargetConnector.execute_plsql(database_id, create_job_plsql)
-            if not success:
-                return {'success': False, 'error': 'Failed to create scheduler job'}
-
-            # Get original size
-            orig_size = 0
-            try:
-                sq = "SELECT NVL(SUM(bytes),0) as sz FROM dba_segments WHERE owner=:o AND segment_name=:t"
-                sp = {'o': owner, 't': table_name}
-                sdf = TargetConnector.execute_query(database_id, sq, sp)
-                if not sdf.empty:
-                    orig_size = int(sdf.iloc[0]['SZ'] or 0)
-            except Exception:
-                pass
-
-            # Record IN_PROGRESS in history
-            CentralQueries.store_compression_history(database_id, {
-                'owner': owner, 'object_name': table_name,
-                'object_type': 'PARTITION' if partition_name else 'TABLE',
-                'partition_name': partition_name,
-                'compression_type_applied': compression_type,
-                'compression_clause': job_name,
-                'execution_mode': 'ONLINE', 'parallel_degree': parallel_degree,
-                'original_size_bytes': orig_size,
-                'operation_status': 'IN_PROGRESS',
-                'start_time': datetime.now(), 'executed_by': _acting_user(),
-            })
-
-            return {'success': True, 'job_name': job_name}
-
+            TargetConnector.execute_plsql(did, create_job_plsql, raise_on_error=True)
         except Exception as e:
-            log_error(e, "submit_compression_job")
-            return {'success': False, 'error': str(e)}
+            if 'ORA-27477' in str(e):
+                # The name is unique to this row: an earlier attempt did create
+                # the job (e.g. its reply was lost). Track that job.
+                log_warning(f"Scheduler job {job_name} already exists; tracking it for {label}")
+            elif _is_retryable_error(e):
+                msg = f"Waiting: could not reach the target, will retry ({str(e)[:500]})"
+                TargetQueries._requeue_job_row(did, hid, item.get('start_time'), msg)
+                return {**out, 'status': 'RETRY', 'error': str(e)}
+            else:
+                log_error(e, "TargetQueries.submit_queued_job", {'history_id': hid, 'job_name': job_name})
+                TargetQueries._close_job_row(did, hid, 'FAILED', f"CREATE_JOB failed: {e}")
+                return {**out, 'status': 'FAILED', 'error': str(e)}
+
+        if orig_size is not None:
+            try:
+                CentralConnector.execute_dml("""
+                    UPDATE t_compression_history SET original_size_bytes = :sz
+                    WHERE history_id = :hid AND database_id = :db
+                """, {'sz': orig_size, 'hid': hid, 'db': did}, raise_on_error=True)
+            except Exception as e:
+                log_warning(f"Scheduler: recording the size of {label} failed: {e}")
+        return {**out, 'status': 'SUBMITTED'}
+
+    @staticmethod
+    def submit_compression_job(
+        database_id: int, owner: str, table_name: str,
+        compression_type: str, partition_name: Optional[str] = None,
+        parallel_degree: int = 4, subpartition_name: Optional[str] = None,
+        executed_by: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Submit one segment now as a DBMS_SCHEDULER job, through the queue: it
+        gets a QUEUED row that is claimed and submitted like a drained item.
+
+        Returns:
+            {'success': True, 'job_name', 'history_id'} when the job was created;
+            {'success': False, 'queued': True, 'error'} when it waits in the queue
+                (overlapping running job, target unreachable);
+            {'success': False, 'duplicate': True, 'error'} when the segment is
+                already queued or running;
+            {'success': False, 'error'} otherwise (invalid item, CREATE_JOB error).
+        """
+        from hcc_advisor.utils.central_connector import CentralConnector
+
+        row, err = TargetQueries._prepare_queue_row({
+            'database_id': database_id, 'owner': owner, 'table_name': table_name,
+            'partition_name': partition_name, 'subpartition_name': subpartition_name,
+            'compression_type': compression_type, 'dop': parallel_degree,
+        }, executed_by or _acting_user())
+        if err:
+            return {'success': False, 'error': err}
+        label = _segment_label(row['owner'], row['tbl'], row['part'], row['sub'])
+        try:
+            dup = CentralConnector.execute_query("""
+                SELECT 1 FROM t_compression_history
+                WHERE database_id = :db AND owner = :o AND object_name = :t
+                  AND NVL(partition_name, '~') = NVL(:p, '~')
+                  AND NVL(subpartition_name, '~') = NVL(:sp, '~')
+                  AND operation_status IN ('QUEUED', 'IN_PROGRESS')
+                  AND ROWNUM = 1
+            """, {'db': row['db'], 'o': row['owner'], 't': row['tbl'],
+                  'p': row['part'], 'sp': row['sub']}, raise_on_error=True)
+        except Exception as e:
+            return {'success': False, 'error': f"Could not check the queue for {label}: {e}"}
+        if not dup.empty:
+            return {'success': False, 'duplicate': True,
+                    'error': f'{label} already has a queued or running job'}
+
+        history_id = CentralConnector.execute_dml_returning(
+            TargetQueries._QUEUE_INSERT_SQL + "\n        RETURNING history_id INTO :new_id", row)
+        if not history_id:
+            return {'success': False, 'error': f"Could not record {label} in the queue"}
+
+        res = TargetQueries.submit_queued_job({
+            'history_id': history_id, 'database_id': row['db'], 'owner': row['owner'],
+            'table_name': row['tbl'], 'partition_name': row['part'],
+            'subpartition_name': row['sub'], 'compression_type': row['comp'],
+            'dop': row['dop'], 'start_time': None,
+        })
+        if res['status'] == 'SUBMITTED':
+            return {'success': True, 'job_name': res['job_name'], 'history_id': history_id}
+        if res['status'] in ('BLOCKED', 'RETRY', 'NOT_CLAIMED'):
+            return {'success': False, 'queued': True, 'history_id': history_id,
+                    'error': res.get('error') or f"{label} is waiting in the queue"}
+        return {'success': False, 'history_id': history_id, 'error': res.get('error')}
+
+    @staticmethod
+    def drain_compression_queue(database_id: Optional[int] = None) -> Dict[str, Any]:
+        """Submit QUEUED items in FIFO order within each database's DOP budget
+        (CPU_COUNT/2 minus the DOP of its IN_PROGRESS rows).
+
+        Items that don't fit the budget, overlap a running job, or hit a
+        retryable error stay QUEUED; an invalid item or a CREATE_JOB error ends
+        FAILED with the reason on its row. Nothing is dropped.
+
+        Returns:
+            {'submitted', 'blocked', 'failed', 'not_claimed', 'waiting',
+             'skipped_databases': [db_id], 'errors': [str]}
+        """
+        stats = {'submitted': 0, 'blocked': 0, 'failed': 0, 'not_claimed': 0,
+                 'waiting': 0, 'skipped_databases': [], 'errors': []}
+        try:
+            queue = TargetQueries.get_queued_compression_jobs(database_id)
+        except Exception as e:
+            log_warning(f"Scheduler: reading the job queue failed: {e}")
+            stats['errors'].append(f"Could not read the queue: {e}")
+            return stats
+
+        by_db: Dict[int, List[Dict]] = {}
+        for item in queue:
+            by_db.setdefault(item['database_id'], []).append(item)
+
+        for did, items in by_db.items():
+            try:
+                budget = max(1, TargetQueries.get_cpu_count(did) // 2)
+                free = max(0, budget - TargetQueries.get_running_total_dop(did))
+            except Exception as e:
+                log_warning(f"Scheduler: DOP-budget lookup for db_id={did} failed, "
+                            f"queue drain skips this database: {e}")
+                stats['skipped_databases'].append(did)
+                stats['waiting'] += len(items)
+                continue
+
+            for i, item in enumerate(items):
+                try:
+                    dop = max(1, int(item.get('dop') or 4))
+                except (TypeError, ValueError):
+                    dop = 4
+                if free < dop:
+                    stats['waiting'] += 1
+                    continue
+                res = TargetQueries.submit_queued_job(item)
+                status = res['status']
+                if status == 'SUBMITTED':
+                    stats['submitted'] += 1
+                    free -= dop
+                elif status == 'BLOCKED':
+                    stats['blocked'] += 1
+                    stats['waiting'] += 1
+                elif status == 'NOT_CLAIMED':
+                    stats['not_claimed'] += 1
+                elif status == 'RETRY':
+                    # Target (or central DB) unreachable: leave the rest of this
+                    # database's queue for the next drain.
+                    stats['waiting'] += len(items) - i
+                    stats['skipped_databases'].append(did)
+                    stats['errors'].append(f"db_id={did}: {res.get('error')}")
+                    break
+                else:
+                    stats['failed'] += 1
+                    stats['errors'].append(f"{res.get('label')}: {res.get('error')}")
+        return stats
 
     @staticmethod
     def get_running_compression_jobs(database_id: int) -> pd.DataFrame:
@@ -3480,98 +4086,282 @@ ONLINE PARALLEL {parallel_degree};"""
             pass
         return 0
 
+    # ============================================================================
+    # RECONCILE STALE OPERATIONS
+    # ============================================================================
+
     @staticmethod
-    def check_completed_jobs(database_id: int) -> List[Dict]:
-        """Check DBA_SCHEDULER_JOB_RUN_DETAILS for recently completed HCC_% jobs.
-        Updates t_compression_history from IN_PROGRESS to SUCCESS/FAILED."""
+    def _query_by_job_names(database_id: int, sql_template: str, names: List[str]) -> pd.DataFrame:
+        """Run sql_template (with a {names} IN-list placeholder) for the job names
+        in bound chunks; raises on a database error."""
+        frames = []
+        for start in range(0, len(names), 500):
+            chunk = names[start:start + 500]
+            binds = {f"j{i}": n for i, n in enumerate(chunk)}
+            sql = sql_template.format(names=", ".join(f":j{i}" for i in range(len(chunk))))
+            df = TargetConnector.execute_query(database_id, sql, binds, raise_on_error=True)
+            if not df.empty:
+                frames.append(df)
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+    @staticmethod
+    def _move_session_active(database_id: int, owner: str, table_name: str) -> bool:
+        """True if an active target session is executing a MOVE of the table.
+        Raises on a database error (e.g. no access to V$SESSION)."""
+        def _esc(value):
+            return str(value).upper().replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+        df = TargetConnector.execute_query(database_id, """
+            SELECT COUNT(*) AS n
+            FROM v$session s
+            JOIN v$sql q ON q.sql_id = s.sql_id AND q.child_number = s.sql_child_number
+            WHERE s.status = 'ACTIVE'
+              AND UPPER(q.sql_text) LIKE :pat ESCAPE '\\'
+        """, {'pat': f"%ALTER TABLE {_esc(owner)}.{_esc(table_name)}%MOVE%"}, raise_on_error=True)
+        return not df.empty and _safe_int(_blank_to_none(df.iloc[0]['N'])) > 0
+
+    @staticmethod
+    def _record_job_success(database_id: int, row: Dict, duration) -> bool:
+        """Close a scheduler row as SUCCESS with the size of its own segment."""
         from hcc_advisor.utils.central_connector import CentralConnector
 
-        query = """
-            SELECT job_name, status,
-                   TO_CHAR(actual_start_date, 'YYYY-MM-DD HH24:MI:SS') as start_time,
-                   TO_CHAR(run_duration) as run_duration,
-                   error# as error_num,
-                   SUBSTR(additional_info, 1, 2000) as additional_info
-            FROM dba_scheduler_job_run_details
-            WHERE job_name LIKE 'HCC_%'
-              AND actual_start_date > SYSDATE - 1
-            ORDER BY actual_start_date DESC
-        """
+        owner, table = row['OWNER'], row['OBJECT_NAME']
+        part = _blank_to_none(row.get('PARTITION_NAME'))
+        sub = _blank_to_none(row.get('SUBPARTITION_NAME'))
+        comp_size = TargetQueries._segment_size_bytes(database_id, owner, table, part, sub)
+        orig = _safe_int(_blank_to_none(row.get('ORIGINAL_SIZE_BYTES')))
+        ratio = min(round(orig / comp_size, 2), 999.99) if comp_size and orig else None
         try:
-            df = TargetConnector.execute_query(database_id, query)
-        except Exception:
-            return []
+            n = CentralConnector.execute_dml("""
+                UPDATE t_compression_history
+                   SET operation_status = 'SUCCESS', end_time = SYSTIMESTAMP,
+                       duration_seconds = :dur,
+                       compressed_size_bytes = :cs,
+                       compression_ratio_achieved = :ratio,
+                       error_message = NULL
+                 WHERE history_id = :hid AND database_id = :db
+                   AND operation_status = 'IN_PROGRESS'
+            """, {'dur': duration, 'cs': comp_size, 'ratio': ratio,
+                  'hid': int(row['HISTORY_ID']), 'db': database_id}, raise_on_error=True)
+        except Exception as e:
+            log_error(e, "TargetQueries._record_job_success", {'history_id': row['HISTORY_ID']})
+            return False
+        if n == 1 and comp_size is not None:
+            try:
+                CentralConnector.execute_dml("""
+                    UPDATE t_compression_analysis
+                       SET size_bytes = :cs, current_compression = :comp
+                     WHERE database_id = :db AND owner = :o AND object_name = :t
+                       AND NVL(partition_name, '~') = NVL(:p, '~')
+                       AND NVL(subpartition_name, '~') = NVL(:sp, '~')
+                """, {'cs': comp_size, 'comp': row.get('COMPRESSION_TYPE_APPLIED'),
+                      'db': database_id, 'o': owner, 't': table, 'p': part, 'sp': sub},
+                    raise_on_error=True)
+            except Exception as e:
+                log_warning(f"Updating the analysis row of {_segment_label(owner, table, part, sub)} failed: {e}")
+        return n == 1
 
-        if df.empty:
-            return []
+    @staticmethod
+    def reconcile_operations(
+        database_id: int,
+        job_grace_minutes: Optional[float] = None,
+        sync_stale_hours: Optional[float] = None,
+        run_stale_hours: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """Close IN_PROGRESS history rows and RUNNING advisor runs of one target
+        that nothing else would ever close.
 
-        df.columns = [c.lower() for c in df.columns]
-        updated = []
+        Scheduler rows (COMPRESSION_CLAUSE = 'HCC_...' job name):
+          - job in DBA_SCHEDULER_RUNNING_JOBS: still running;
+          - latest DBA_SCHEDULER_JOB_RUN_DETAILS entry, any age: SUCCEEDED ->
+            SUCCESS (with the size of the job's own segment); FAILED, STOPPED or
+            any other end -> FAILED with the job's error, unless the job still
+            exists and will run again;
+          - no run entry but the job exists in DBA_SCHEDULER_JOBS: pending
+            (SUCCEEDED -> SUCCESS; BROKEN/FAILED/STOPPED/COMPLETED -> FAILED);
+          - in none of them and claimed more than job_grace_minutes ago ->
+            FAILED "job not found (never created, dropped or purged)".
+          If any of these lookups fails, no scheduler row is touched: an
+          unreachable target must not read as "job not found".
+        Synchronous rows (execute_compression): not owned by a live thread of
+        this app, older than sync_stale_hours, and no active target session
+        running a MOVE of the table -> FAILED "outcome unknown".
+        Advisor runs: RUNNING, older than run_stale_hours, not owned by a live
+        analysis thread of this app -> FAILED.
 
-        for _, row in df.iterrows():
-            job_name = row.get('job_name', '')
-            job_status = row.get('status', '')
+        Updates are by history_id/run_id + database_id and only while the row is
+        still open; only rows actually updated are reported.
 
-            if job_status == 'SUCCEEDED':
-                # Update history to SUCCESS, get new size
-                try:
-                    # Find the matching history row
-                    hist = CentralConnector.execute_query("""
-                        SELECT history_id, owner, object_name, partition_name
-                        FROM t_compression_history
-                        WHERE compression_clause = :jn AND operation_status = 'IN_PROGRESS'
-                          AND ROWNUM = 1
-                    """, {'jn': job_name})
-                    if not hist.empty:
-                        h = hist.iloc[0]
-                        o, t = h['OWNER'], h['OBJECT_NAME']
-                        # Get new size
-                        comp_size = 0
-                        try:
-                            sdf = TargetConnector.execute_query(database_id,
-                                "SELECT NVL(SUM(bytes),0) as sz FROM dba_segments WHERE owner=:o AND segment_name=:t",
-                                {'o': o, 't': t})
-                            if not sdf.empty:
-                                comp_size = int(sdf.iloc[0]['SZ'] or 0)
-                        except Exception:
-                            pass
+        Returns:
+            {'database_id', 'updated': [{'history_id', 'job_name', 'object',
+             'status', 'reason'}], 'running': n, 'pending': n,
+             'advisor_runs_failed': n, 'errors': [str]}
+        """
+        from hcc_advisor.utils.central_connector import CentralConnector
 
-                        CentralConnector.execute_dml("""
-                            UPDATE t_compression_history
-                            SET operation_status = 'SUCCESS', end_time = SYSTIMESTAMP,
-                                compressed_size_bytes = :cs
-                            WHERE compression_clause = :jn AND operation_status = 'IN_PROGRESS'
-                              AND ROWNUM = 1
-                        """, {'cs': comp_size, 'jn': job_name})
+        grace = TargetQueries.JOB_NOT_FOUND_GRACE_MINUTES if job_grace_minutes is None else job_grace_minutes
+        sync_hours = TargetQueries.SYNC_STALE_HOURS if sync_stale_hours is None else sync_stale_hours
+        run_hours = TargetQueries.ADVISOR_RUN_STALE_HOURS if run_stale_hours is None else run_stale_hours
+        result = {'database_id': database_id, 'updated': [], 'running': 0, 'pending': 0,
+                  'advisor_runs_failed': 0, 'errors': []}
 
-                        # Update analysis row
-                        CentralConnector.execute_dml("""
-                            UPDATE t_compression_analysis
-                            SET size_bytes = :cs
-                            WHERE database_id = :db AND owner = :o AND object_name = :t
-                              AND NVL(partition_name, '~') = NVL(:p, '~')
-                        """, {'cs': comp_size, 'db': database_id, 'o': o, 't': t,
-                              'p': h.get('PARTITION_NAME')})
+        def _closed(row, status, reason):
+            result['updated'].append({
+                'history_id': int(row['HISTORY_ID']),
+                'job_name': _blank_to_none(row.get('COMPRESSION_CLAUSE')),
+                'object': _segment_label(row['OWNER'], row['OBJECT_NAME'],
+                                         _blank_to_none(row.get('PARTITION_NAME')),
+                                         _blank_to_none(row.get('SUBPARTITION_NAME'))),
+                'status': status, 'reason': reason,
+            })
 
-                        updated.append({'job_name': job_name, 'status': 'SUCCESS'})
-                except Exception:
-                    pass
+        def _fail(row, reason, error_code=None, duration=None):
+            if TargetQueries._close_job_row(database_id, int(row['HISTORY_ID']), 'FAILED', reason,
+                                            error_code=error_code, duration=duration) == 1:
+                _closed(row, 'FAILED', reason)
 
-            elif job_status == 'FAILED':
-                err = row.get('additional_info', '')
-                try:
-                    CentralConnector.execute_dml("""
-                        UPDATE t_compression_history
-                        SET operation_status = 'FAILED', end_time = SYSTIMESTAMP,
-                            error_message = :err
-                        WHERE compression_clause = :jn AND operation_status = 'IN_PROGRESS'
-                          AND ROWNUM = 1
-                    """, {'err': str(err)[:4000], 'jn': job_name})
-                    updated.append({'job_name': job_name, 'status': 'FAILED'})
-                except Exception:
-                    pass
+        try:
+            open_df = CentralConnector.execute_query("""
+                SELECT history_id, owner, object_name, partition_name, subpartition_name,
+                       compression_type_applied, compression_clause, original_size_bytes,
+                       ROUND((SYSDATE - CAST(start_time AS DATE)) * 1440, 1) AS age_minutes
+                FROM t_compression_history
+                WHERE database_id = :db AND operation_status = 'IN_PROGRESS'
+                ORDER BY history_id
+            """, {'db': database_id}, raise_on_error=True)
+            open_rows = open_df.to_dict('records')
+        except Exception as e:
+            result['errors'].append(f"Could not read open operations: {e}")
+            open_rows = []
 
-        return updated
+        def _age_minutes(row):
+            age = _blank_to_none(row.get('AGE_MINUTES'))
+            return float('inf') if age is None else float(age)
+
+        sched_rows, sync_rows = [], []
+        for r in open_rows:
+            is_job = str(_blank_to_none(r.get('COMPRESSION_CLAUSE')) or '').startswith('HCC_')
+            (sched_rows if is_job else sync_rows).append(r)
+
+        # --- scheduler jobs ---
+        if sched_rows:
+            names = sorted({str(r['COMPRESSION_CLAUSE']) for r in sched_rows})
+            try:
+                running_df = TargetQueries._query_by_job_names(database_id, """
+                    SELECT job_name FROM dba_scheduler_running_jobs
+                    WHERE job_name IN ({names})""", names)
+                jobs_df = TargetQueries._query_by_job_names(database_id, """
+                    SELECT job_name, state FROM dba_scheduler_jobs
+                    WHERE job_name IN ({names})""", names)
+                runs_df = TargetQueries._query_by_job_names(database_id, """
+                    SELECT job_name, status, error# AS error_num,
+                           SUBSTR(additional_info, 1, 2000) AS additional_info,
+                           EXTRACT(DAY FROM run_duration) * 86400
+                             + EXTRACT(HOUR FROM run_duration) * 3600
+                             + EXTRACT(MINUTE FROM run_duration) * 60
+                             + EXTRACT(SECOND FROM run_duration) AS run_seconds,
+                           log_id
+                    FROM dba_scheduler_job_run_details
+                    WHERE job_name IN ({names})
+                    ORDER BY log_id""", names)
+            except Exception as e:
+                log_warning(f"Reconcile db_id={database_id}: scheduler lookup failed: {e}")
+                result['errors'].append(f"Scheduler lookup on the target failed; "
+                                        f"scheduler jobs left unchanged: {e}")
+                sched_rows = []
+                running_df = jobs_df = runs_df = pd.DataFrame()
+
+            running = {str(v) for v in running_df.get('JOB_NAME', [])}
+            jobs = {str(r['JOB_NAME']): str(r['STATE'] or '').upper()
+                    for r in jobs_df.to_dict('records')}
+            runs = {str(r['JOB_NAME']): r for r in runs_df.to_dict('records')}  # last log_id wins
+
+            for row in sched_rows:
+                job = str(row['COMPRESSION_CLAUSE'])
+                if job in running:
+                    result['running'] += 1
+                    continue
+                run, state = runs.get(job), jobs.get(job)
+                if run is not None:
+                    status = str(run.get('STATUS') or '').upper()
+                    duration = _blank_to_none(run.get('RUN_SECONDS'))
+                    duration = round(float(duration), 1) if duration is not None else None
+                    if status == 'SUCCEEDED':
+                        if TargetQueries._record_job_success(database_id, row, duration):
+                            _closed(row, 'SUCCESS', f"Scheduler job {job} SUCCEEDED")
+                    elif state in TargetQueries._JOB_PENDING_STATES:
+                        result['pending'] += 1
+                    else:
+                        info = _lob_text(run.get('ADDITIONAL_INFO'), 3000) or 'no details'
+                        what = 'was STOPPED' if status == 'STOPPED' else f"ended {status or 'without a status'}"
+                        code = _blank_to_none(run.get('ERROR_NUM'))
+                        _fail(row, f"Scheduler job {job} {what}: {info}",
+                              error_code=int(code) if code else None, duration=duration)
+                elif state is not None:
+                    if state == 'SUCCEEDED':
+                        if TargetQueries._record_job_success(database_id, row, None):
+                            _closed(row, 'SUCCESS', f"Scheduler job {job} SUCCEEDED")
+                    elif state in ('BROKEN', 'FAILED', 'STOPPED', 'COMPLETED'):
+                        _fail(row, f"Scheduler job {job} is {state} with no run log entry; "
+                                   f"outcome unknown - check the segment before resubmitting")
+                    else:
+                        result['pending'] += 1
+                elif _age_minutes(row) < grace:
+                    result['pending'] += 1  # just claimed: CREATE_JOB may still be in flight
+                else:
+                    _fail(row, f"Scheduler job {job} not found on the target (never created, "
+                               f"dropped, or its run log was purged); outcome unknown - check the "
+                               f"segment's compression before resubmitting")
+
+        # --- synchronous executions (execute_compression) ---
+        active_ids = _active_snapshot(_ACTIVE_HISTORY_IDS)
+        for row in sync_rows:
+            hid = int(row['HISTORY_ID'])
+            age_hours = _age_minutes(row) / 60
+            if hid in active_ids or age_hours < sync_hours:
+                result['running'] += 1
+                continue
+            note = ""
+            try:
+                if TargetQueries._move_session_active(database_id, row['OWNER'], row['OBJECT_NAME']):
+                    result['running'] += 1
+                    continue
+            except Exception as e:
+                log_warning(f"Reconcile db_id={database_id}: session check failed: {e}")
+                note = " (target sessions could not be checked)"
+            age_text = f"{age_hours:.0f}h" if age_hours != float('inf') else "an unknown time"
+            _fail(row, f"Interrupted: no result recorded {age_text} after the synchronous "
+                       f"compression started and no target session is running it{note} - the app "
+                       f"was probably restarted mid-MOVE. Outcome unknown: check the segment's "
+                       f"compression before retrying.")
+
+        # --- advisor runs left RUNNING by a dead analysis thread ---
+        active_runs = sorted(_active_snapshot(_ACTIVE_ADVISOR_RUNS))
+        binds = {'db': database_id, 'hrs': float(run_hours),
+                 'msg': (f"Marked FAILED by reconcile: still RUNNING {run_hours:g}h after it started "
+                         f"and no analysis thread of this app is running it (the app was probably "
+                         f"restarted during the analysis).")}
+        exclude = ""
+        if active_runs:
+            binds.update({f"r{i}": rid for i, rid in enumerate(active_runs)})
+            exclude = "AND run_id NOT IN (" + ", ".join(f":r{i}" for i in range(len(active_runs))) + ")"
+        try:
+            result['advisor_runs_failed'] = CentralConnector.execute_dml(f"""
+                UPDATE t_advisor_run
+                   SET run_status = 'FAILED', end_time = SYSTIMESTAMP, error_message = :msg
+                 WHERE database_id = :db AND run_status = 'RUNNING'
+                   AND start_time < SYSTIMESTAMP - NUMTODSINTERVAL(:hrs, 'HOUR')
+                   {exclude}
+            """, binds, raise_on_error=True) or 0
+        except Exception as e:
+            result['errors'].append(f"Could not reap stale advisor runs: {e}")
+
+        return result
+
+    @staticmethod
+    def check_completed_jobs(database_id: int) -> List[Dict]:
+        """Poll entry point (Scheduler / Quick Action / Wizard refresh): runs
+        reconcile_operations and returns the history rows it actually closed."""
+        return TargetQueries.reconcile_operations(database_id).get('updated', [])
 
 
 # Create singleton accessor function

@@ -36,6 +36,39 @@ _CONNECTION_MODE_PATCH_MSG = (
 # leaf_segments.py). Object-level lists keep reading the table itself.
 _LEAF_ANALYSIS = leaf_analysis_sql()
 
+# T_COMPRESSION_HISTORY.COMPRESSION_CLAUSE is VARCHAR2(200) (byte semantics).
+# The scheduler stores its job name there; direct executions store the DDL,
+# whose full text goes to ORIGINAL_DDL (CLOB) instead.
+_HISTORY_CLAUSE_MAX_BYTES = 200
+
+
+def history_clause(value: Optional[str]) -> Optional[str]:
+    """Fit a value into T_COMPRESSION_HISTORY.COMPRESSION_CLAUSE.
+
+    Values longer than 200 bytes (a MOVE of long partition/table names) used to
+    make the whole history INSERT fail, leaving the compression untracked.
+    Longer text is cut on a character boundary and marked with '...'; callers
+    keep the full statement in ORIGINAL_DDL.
+    """
+    if value is None:
+        return None
+    text = str(value)
+    if len(text.encode('utf-8')) <= _HISTORY_CLAUSE_MAX_BYTES:
+        return text
+    budget = _HISTORY_CLAUSE_MAX_BYTES - 3
+    cut = text.encode('utf-8')[:budget].decode('utf-8', errors='ignore')
+    return cut + '...'
+
+
+def _scheduler_window(alias: str = '') -> str:
+    """Scheduler monitor rows: started or ended in the last 24h, plus queued /
+    running rows of any age. The queue keeps each row's original enqueue time,
+    and the reconciler closes rows that started long ago, so neither may drop
+    out of the monitor."""
+    p = f"{alias}." if alias else ''
+    return (f"({p}start_time > SYSDATE - 1 OR {p}end_time > SYSDATE - 1"
+            f" OR {p}operation_status IN ('QUEUED', 'IN_PROGRESS'))")
+
 
 @st.cache_data(ttl=_TARGET_DATABASES_TTL_SECONDS, show_spinner=False)
 def _cached_target_databases() -> pd.DataFrame:
@@ -133,7 +166,7 @@ class CentralQueries:
                 SUM(CASE WHEN operation_status = 'FAILED' THEN 1 ELSE 0 END) as failed,
                 COUNT(*) as total
             FROM t_compression_history
-            WHERE start_time > SYSDATE - 1 {db_filter}
+            WHERE {_scheduler_window()} {db_filter}
         """
         params = {'database_id': database_id} if database_id else {}
         try:
@@ -218,7 +251,7 @@ class CentralQueries:
                 h.error_message
             FROM t_compression_history h
             {db_join}
-            WHERE h.start_time > SYSDATE - 1 {db_filter}
+            WHERE {_scheduler_window('h')} {db_filter}
             ORDER BY
                 CASE h.operation_status
                     WHEN 'IN_PROGRESS' THEN 1 WHEN 'FAILED' THEN 2
@@ -2584,7 +2617,10 @@ class CentralQueries:
                   original_row_count, compressed_size_bytes, compressed_blocks,
                   compressed_row_count, compression_ratio_achieved, predicted_ratio,
                   start_time, end_time, duration_seconds, operation_status,
-                  error_code, error_message, analysis_id, executed_by
+                  error_code, error_message, analysis_id, executed_by, original_ddl
+                compression_clause is fitted to its VARCHAR2(200) column (see
+                history_clause); a longer value is also kept whole in
+                original_ddl unless the record supplies one.
 
         Returns:
             Optional[int]: history_id of the new row, or None on failure.
@@ -2602,7 +2638,7 @@ class CentralQueries:
                 compression_ratio_achieved, predicted_ratio,
                 start_time, end_time, duration_seconds,
                 operation_status, error_code, error_message,
-                analysis_id, executed_by
+                analysis_id, executed_by, original_ddl
             ) VALUES (
                 :database_id, SEQ_EXECUTION_ID.NEXTVAL,
                 :owner, :object_name, :object_type, :partition_name, :subpartition_name,
@@ -2613,7 +2649,7 @@ class CentralQueries:
                 :compression_ratio_achieved, :predicted_ratio,
                 :start_time, :end_time, :duration_seconds,
                 :operation_status, :error_code, :error_message,
-                :analysis_id, :executed_by
+                :analysis_id, :executed_by, :original_ddl
             )
             RETURNING history_id INTO :new_id
         """
@@ -2643,6 +2679,15 @@ class CentralQueries:
         params.setdefault('error_message', None)
         params.setdefault('analysis_id', None)
         params.setdefault('executed_by', None)
+        params.setdefault('original_ddl', None)
+
+        clause = params.get('compression_clause')
+        fitted = history_clause(clause)
+        if fitted != clause:
+            params['original_ddl'] = params['original_ddl'] or clause
+            params['compression_clause'] = fitted
+        if params.get('error_message'):
+            params['error_message'] = str(params['error_message'])[:4000]
 
         try:
             new_id = CentralConnector.execute_dml_returning(insert_query, params, out_bind='new_id')

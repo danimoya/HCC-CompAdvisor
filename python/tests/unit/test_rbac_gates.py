@@ -101,7 +101,10 @@ class TestSchedulerRefreshDrain:
     ])
     def test_drain_requires_operator(self, session, role, drains):
         session.update(authenticated=True, role=role)
-        with patch.object(TargetQueries, 'check_completed_jobs') as poll, \
+        # _do_refresh reconciles job status (reconcile_operations) for every
+        # role; only the queue drain, which submits jobs, is operator-only.
+        with patch.object(TargetQueries, 'reconcile_operations',
+                          return_value={'errors': []}) as poll, \
                 patch.object(page_12_scheduler, '_drain_pending_queue') as drain:
             page_12_scheduler._do_refresh(1)
         poll.assert_called_once_with(1)  # status polling stays open to viewers

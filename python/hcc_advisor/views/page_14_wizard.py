@@ -4,7 +4,6 @@ Step-by-step guided compression lifecycle
 """
 
 import streamlit as st
-import pandas as pd
 from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.target_queries import TargetQueries
 from hcc_advisor.utils.leaf_segments import leaf_segments
@@ -220,23 +219,20 @@ def _step_submit():
     dop = max(1, cpu // profile['divisor'])
     max_queue = max(1, cpu // profile['divisor'])
 
-    # Get pending candidates
-    recs = CentralQueries.get_recommendations(
-        schema=schema, database_id=db_id, show_executed=False,
-        min_savings_pct=0, limit=5000
-    )
+    # Pending leaf segments only: the TABLE row of a partitioned table (ORA-14511)
+    # or a composite partition (ORA-14257) cannot be moved.
+    from hcc_advisor.views.page_08_quick_scan import pending_leaf_candidates
+    candidates = pending_leaf_candidates(schema, db_id, dop)
 
-    if recs.empty:
+    if not candidates:
         st.info("No pending candidates to submit.")
         _nav_buttons(can_next=True, next_label="Skip to Monitor")
         return
 
-    recs.columns = [c.lower() for c in recs.columns]
-
     # Summary
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("Objects", len(recs))
+        st.metric("Objects", len(candidates))
     with col2:
         st.metric("Throttle", throttle)
     with col3:
@@ -257,24 +253,12 @@ def _step_submit():
     if st.button("Submit All to Scheduler", disabled=not (confirm and can_submit), type="primary",
                  use_container_width=True, key="wiz_submit_btn",
                  help=submit_help) and AuthManager.require_role(ROLE_OPERATOR):
-        # Build candidate list
-        candidates = []
-        for _, r in recs.iterrows():
-            pn = r.get('partition_name')
-            candidates.append({
-                'database_id': db_id,
-                'owner': r['table_owner'],
-                'table_name': r['table_name'],
-                'compression_type': r['recommended_strategy'],
-                'partition_name': pn if pd.notna(pn) else None,
-                'dop': dop,
-            })
-
         from hcc_advisor.views.page_08_quick_scan import _bulk_submit
         result = _bulk_submit(candidates, db_id, max_queue, dop)
         st.success(
             f"Submitted: {result['submitted']}, "
             f"Queued: {result['queued']}, "
+            f"Already queued/running: {result['duplicates']}, "
             f"Failed: {result['failed']}"
         )
         st.session_state.wizard_step = 5

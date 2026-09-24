@@ -6,7 +6,8 @@ Lightweight hotness-based analysis with DBMS_SCHEDULER job queue
 import streamlit as st
 import pandas as pd
 from hcc_advisor.utils.central_queries import CentralQueries
-from hcc_advisor.utils.target_queries import TargetQueries
+from hcc_advisor.utils.target_queries import TargetQueries, segments_overlap
+from hcc_advisor.utils.leaf_segments import leaf_segment_mask
 from hcc_advisor.config import config
 from hcc_advisor.auth import AuthManager, ROLE_OPERATOR
 
@@ -84,20 +85,30 @@ def show_quick_scan_page():
 
     # Get running jobs for status overlay
     running_jobs = TargetQueries.get_running_compression_jobs(db_id)
-    # Also get IN_PROGRESS objects from central history for status overlay
+    # Also get IN_PROGRESS segments from central history for status overlay:
+    # one entry per running job (partitions of one table may run concurrently)
     running_set = set()
     try:
         from hcc_advisor.utils.central_connector import CentralConnector
         in_prog = CentralConnector.execute_query("""
-            SELECT owner, object_name FROM t_compression_history
+            SELECT owner, object_name, partition_name, subpartition_name
+            FROM t_compression_history
             WHERE operation_status = 'IN_PROGRESS'
               AND database_id = :db
         """, {'db': db_id})
         if not in_prog.empty:
             for _, rj in in_prog.iterrows():
-                running_set.add(f"{rj['OWNER']}.{rj['OBJECT_NAME']}")
+                running_set.add((rj['OWNER'], rj['OBJECT_NAME'],
+                                 rj['PARTITION_NAME'], rj['SUBPARTITION_NAME']))
     except Exception:
         pass
+
+    def _is_running(r):
+        # A row is Running when a running job touches its segment (a table-level
+        # job covers its partitions and vice versa).
+        return any(o == r.get('table_owner') and t == r.get('table_name')
+                   and segments_overlap(r.get('partition_name'), r.get('subpartition_name'), p, s)
+                   for o, t, p, s in running_set)
 
     st.markdown("---")
 
@@ -116,7 +127,7 @@ def show_quick_scan_page():
 
     # Add status from running jobs
     df['status'] = df.apply(
-        lambda r: 'Running' if f"{r.get('table_owner','')}.{r.get('table_name','')}" in running_set
+        lambda r: 'Running' if _is_running(r)
         else r.get('execution_status', 'Pending'), axis=1
     )
 
@@ -364,15 +375,22 @@ def _render_scan_tab(df, obj_type, db_id, max_queue, max_dop, running_set):
                         pass
                     else:
                         part = None
+                    sub = row.get('subpartition_name')
+                    sub = sub if pd.notna(sub) and sub else None
 
                     row_dop = int(row.get('dop', max_dop) or max_dop)
                     result = TargetQueries.submit_compression_job(
                         db_id, owner, table, comp,
-                        partition_name=part, parallel_degree=row_dop
+                        partition_name=part, parallel_degree=row_dop,
+                        subpartition_name=sub
                     )
                     if result.get('success'):
                         submitted += 1
                         st.toast(f"Submitted: {owner}.{table} → {result.get('job_name')}")
+                    elif result.get('queued') or result.get('duplicate'):
+                        # Waiting behind a running job on the same segment, or
+                        # already queued/running: nothing is lost.
+                        st.warning(f"{owner}.{table}: {result.get('error')}")
                     else:
                         st.error(f"Failed {owner}.{table}: {result.get('error')}")
 
@@ -406,25 +424,10 @@ def _render_schemas_tab(db_id, max_queue, max_dop):
         st.caption("Select one or more schemas above.")
         return
 
-    # Count pending candidates across selected schemas
+    # Count pending candidates (leaf segments only) across selected schemas
     all_candidates = []
     for s in selected_schemas:
-        recs = CentralQueries.get_recommendations(
-            schema=s, database_id=db_id, show_executed=False,
-            min_savings_pct=0, limit=5000
-        )
-        if not recs.empty:
-            recs.columns = [c.lower() for c in recs.columns]
-            for _, r in recs.iterrows():
-                pn = r.get('partition_name')
-                all_candidates.append({
-                    'database_id': db_id,
-                    'owner': r['table_owner'],
-                    'table_name': r['table_name'],
-                    'compression_type': r['recommended_strategy'],
-                    'partition_name': pn if pd.notna(pn) else None,
-                    'dop': bulk_dop,
-                })
+        all_candidates.extend(pending_leaf_candidates(s, db_id, bulk_dop))
 
     st.info(f"**{len(all_candidates)}** pending candidates across **{len(selected_schemas)}** schema(s)")
 
@@ -445,6 +448,7 @@ def _render_schemas_tab(db_id, max_queue, max_dop):
             st.success(
                 f"Submitted: {result['submitted']}, "
                 f"Queued for later: {result['queued']}, "
+                f"Already queued/running: {result['duplicates']}, "
                 f"Failed: {result['failed']}"
             )
             if result['queued'] > 0:
@@ -453,71 +457,67 @@ def _render_schemas_tab(db_id, max_queue, max_dop):
             st.rerun()
 
 
-def _bulk_submit(candidates, db_id, max_queue, default_dop):
-    """Submit candidates respecting per-database DOP budget (CPU_COUNT/2).
-    Total DOP of running jobs + new job DOP must not exceed the budget.
-    Overflow goes to session_state queue for background drain."""
-    from collections import defaultdict
+def pending_leaf_candidates(schema, db_id, dop):
+    """Queue items for the not-yet-compressed leaf segments of `schema`.
 
-    # Group candidates by database_id
-    by_db = defaultdict(list)
-    for item in candidates:
-        did = item.get('database_id', db_id)
-        by_db[did].append(item)
-
-    # Calculate DOP budget and current usage per database
-    db_dop_remaining = {}
-    for did in by_db:
-        try:
-            cpu = TargetQueries.get_cpu_count(did)
-            budget = max(1, cpu // 2)
-            used = TargetQueries.get_running_total_dop(did)
-            db_dop_remaining[did] = max(0, budget - used)
-        except Exception:
-            db_dop_remaining[did] = max(0, default_dop)
-
-    submitted = 0
-    failed = 0
-    overflow = []
-
-    for did, items in by_db.items():
-        for item in items:
-            item_dop = int(item.get('dop', default_dop) or default_dop)
-            if db_dop_remaining.get(did, 0) >= item_dop:
-                result = TargetQueries.submit_compression_job(
-                    did, item['owner'], item['table_name'],
-                    item['compression_type'],
-                    partition_name=item.get('partition_name'),
-                    parallel_degree=item_dop
-                )
-                if result.get('success'):
-                    submitted += 1
-                    db_dop_remaining[did] -= item_dop
-                elif 'already has a running job' not in result.get('error', ''):
-                    failed += 1
-            else:
-                overflow.append(item)
-
-    # Persist overflow by MERGING into the full cross-database queue. Reload the
-    # complete persisted set first so the global delete-then-reinsert in
-    # _save_persistent_queue can't drop other databases' QUEUED rows that were
-    # never loaded into this session.
-    from hcc_advisor.views.page_12_scheduler import (
-        _save_persistent_queue, _load_persistent_queue,
+    Only a leaf segment can be MOVEd: a TABLE row of a partitioned table fails
+    with ORA-14511 and a composite partition with ORA-14257. The leaf rule
+    (leaf_segments.py) is applied to every analysed row of the schema — also
+    compressed and NONE-advised rows, so a table whose other partitions are
+    done still counts as partitioned — and structurally: analysis timestamps
+    are ignored, so a partitioned table's partition (or subpartition) rows
+    always win over its TABLE row.
+    """
+    recs = CentralQueries.get_recommendations(
+        schema=schema, database_id=db_id, show_executed=True, include_none=True,
+        min_savings_pct=0, limit=None
     )
-    full_queue = _load_persistent_queue(None)
-    seen = {(q['database_id'], q['owner'], q['table_name'], q.get('partition_name'))
-            for q in full_queue}
-    for item in overflow:
-        k = (item.get('database_id', db_id), item['owner'], item['table_name'],
-             item.get('partition_name'))
-        if k not in seen:
-            full_queue.append(item)
-            seen.add(k)
-    st.session_state.scheduler_pending_queue = full_queue
-    _save_persistent_queue(full_queue)
+    if recs.empty:
+        return []
+    recs.columns = [c.lower() for c in recs.columns]
+    leaves = recs[leaf_segment_mask(recs.drop(columns=['analysis_timestamp'], errors='ignore'))]
+    items = []
+    for _, r in leaves.iterrows():
+        comp = r.get('recommended_strategy')
+        if r.get('execution_status') == 'Compressed' or not comp or str(comp).upper() == 'NONE':
+            continue
+        pn, sn = r.get('partition_name'), r.get('subpartition_name')
+        items.append({
+            'database_id': db_id,
+            'owner': r['table_owner'],
+            'table_name': r['table_name'],
+            'compression_type': comp,
+            'partition_name': pn if pd.notna(pn) and pn else None,
+            'subpartition_name': sn if pd.notna(sn) and sn else None,
+            'dop': dop,
+        })
+    return items
 
-    return {'submitted': submitted, 'queued': len(overflow), 'failed': failed}
+
+def _bulk_submit(candidates, db_id, max_queue, default_dop):
+    """Queue candidates and submit what fits now.
+
+    Every candidate becomes a QUEUED row (segments already queued or running
+    are skipped). The queue of each affected database is then drained in FIFO
+    order within its DOP budget (CPU_COUNT/2); the rest stays QUEUED for the
+    Scheduler page's drain. Rows already queued are never rewritten."""
+    for item in candidates:
+        if item.get('database_id') is None:
+            item['database_id'] = db_id
+        if item.get('dop') is None:
+            item['dop'] = default_dop
+    enq = TargetQueries.enqueue_compression_jobs(candidates)
+
+    submitted = failed = waiting = 0
+    for did in dict.fromkeys(int(c['database_id']) for c in candidates):
+        stats = TargetQueries.drain_compression_queue(did)
+        submitted += stats['submitted']
+        failed += stats['failed']
+        waiting += stats['waiting']
+
+    return {'submitted': submitted, 'queued': waiting,
+            'failed': failed + enq['rejected'], 'duplicates': enq['duplicates'],
+            'errors': enq['errors']}
 
 
 if __name__ == "__main__":
