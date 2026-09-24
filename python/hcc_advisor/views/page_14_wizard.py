@@ -7,6 +7,7 @@ import streamlit as st
 import pandas as pd
 from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.target_queries import TargetQueries
+from hcc_advisor.utils.leaf_segments import leaf_segments
 
 STEPS = [
     "Select Database",
@@ -164,16 +165,17 @@ def _step_review_candidates():
 
     recs.columns = [c.lower() for c in recs.columns]
 
-    # Summary
+    # Summary — size/average count each segment once (see leaf_segments)
+    leaves = leaf_segments(recs)
     col1, col2, col3 = st.columns(3)
     with col1:
         st.metric("Candidates", len(recs))
     with col2:
-        total_mb = recs['current_size_mb'].sum() if 'current_size_mb' in recs.columns else 0
+        total_mb = leaves['current_size_mb'].sum() if 'current_size_mb' in recs.columns else 0
         st.metric("Total Size", f"{total_mb / 1024:.2f} GB")
     with col3:
         if 'savings_pct' in recs.columns:
-            avg_sav = recs['savings_pct'].mean()
+            avg_sav = leaves['savings_pct'].mean()
             st.metric("Avg Savings", f"{avg_sav:.1f}%")
 
     # Optional AI analysis
