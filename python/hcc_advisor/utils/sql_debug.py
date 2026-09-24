@@ -7,6 +7,8 @@ import streamlit as st
 from datetime import datetime
 from typing import Optional, Dict, Any
 
+from hcc_advisor.utils.redaction import redact
+
 MAX_SQL_LOG_ENTRIES = 200
 
 
@@ -56,22 +58,22 @@ def is_debug_enabled():
     return st.session_state.get('sql_debug_enabled', False)
 
 
-# Substrings that mark a bind-parameter key as sensitive; matched
-# case-insensitively against the key name. Covers password / encrypted-password /
-# short-form pwd/passwd / dash_pwd / credential / secret / key / token variants.
-_SENSITIVE_PARAM_KEYS = (
-    'password', 'passwd', 'pwd', 'secret', 'key', 'token', 'cred',
-)
-
-
 def _sanitize_params(params):
-    """Redact password-like parameters for safe display."""
+    """Redact password-like parameters for safe display.
+
+    Sensitive keys are masked at any depth by the shared helper
+    (utils/redaction.py, also used by the application log); values that
+    st.json cannot show as-is are then shown as their repr.
+    """
     if not params:
         return None
-    safe = {}
-    for k, v in params.items():
-        if any(word in str(k).lower() for word in _SENSITIVE_PARAM_KEYS):
-            safe[k] = '***'
-        else:
-            safe[k] = repr(v) if not isinstance(v, (str, int, float, type(None))) else v
-    return safe
+    safe = redact(params)
+
+    def _display(v):
+        return v if isinstance(v, (str, int, float, type(None))) else repr(v)
+
+    if isinstance(safe, dict):
+        return {k: _display(v) for k, v in safe.items()}
+    if isinstance(safe, (list, tuple)):  # positional binds
+        return [_display(v) for v in safe]
+    return _display(safe)

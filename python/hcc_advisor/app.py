@@ -380,6 +380,11 @@ def main():
         # Logout button
         render_logout_button()
 
+    # Auto-refreshing pages only record their refresh while they render; the
+    # wait + rerun is the last step of main(), after the SQL Debug Console.
+    from hcc_advisor.utils.ui_refresh import defer_reruns, run_deferred_rerun
+    defer_reruns()
+
     # Route to selected page
     if selected == "Overview":
         show_dashboard()
@@ -429,6 +434,10 @@ def main():
     # SQL Debug Console (visible on all pages when enabled)
     if is_debug_enabled():
         render_sql_debug_console()
+
+    # Auto-refresh the page asked for: wait, then rerun. Keep this the very last
+    # statement, so the page and the console are on screen during the wait.
+    run_deferred_rerun()
 
 
 def render_sql_debug_console():
@@ -722,10 +731,12 @@ def show_dashboard():
             st.session_state.selected_page = "Compression Rules"
             st.rerun()
 
-    # Debug logs section
+    # Debug logs section. Loaded on demand: a collapsed st.expander still runs
+    # its body, which read the log file on every Overview render. Only the end
+    # of the log is read (utils/logger.py, MAX_TAIL_BYTES).
     st.markdown("---")
     st.markdown("<h3 style='text-align: center;'>Debug Logs</h3>", unsafe_allow_html=True)
-    with st.expander("View Application Logs", expanded=False):
+    if st.toggle("View Application Logs", key="show_app_logs", value=False):
         col1, col2, col3 = st.columns([1, 1, 2])
         with col1:
             log_type = st.selectbox(
@@ -748,11 +759,11 @@ def show_dashboard():
                 if st.button("Refresh Logs", key="refresh_logs_btn", use_container_width=True):
                     st.rerun()
             with btn_col2:
-                # Deleting the log files destroys the audit trail: admin only.
+                # Clearing the log destroys the audit trail: admin only.
                 can_clear, clear_help = AuthManager.role_gate(ROLE_ADMIN)
                 if st.button("Clear Logs", key="clear_logs_btn", use_container_width=True, type="secondary",
                              disabled=not can_clear, help=clear_help) and AuthManager.require_role(ROLE_ADMIN):
-                    result = clear_logs()
+                    result = clear_logs(cleared_by=AuthManager.get_current_user())
                     st.toast(result)
                     st.rerun()
 
