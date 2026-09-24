@@ -14,11 +14,16 @@ import argparse
 import sys
 import os
 import oracledb
+import pandas as pd
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 
 from hcc_advisor.config import config
 from hcc_advisor.utils.target_connector import build_connect_kwargs, parse_target_login
+from hcc_advisor.utils.target_names import (
+    ACTIVE_DISPLAY_NAMES_COLUMNS, ACTIVE_DISPLAY_NAMES_SQL,
+    display_name_conflict as _display_name_conflict,
+)
 from cryptography.fernet import Fernet
 
 BATCH_SIZE = 500
@@ -192,13 +197,34 @@ def column_exists(conn: oracledb.Connection, table_name: str, column_name: str) 
 # Registration
 # ---------------------------------------------------------------------------
 
+def display_name_conflict(central: oracledb.Connection, display_name: str) -> Optional[str]:
+    """Why display_name can't be registered, or None: the rule the app's add /
+    edit forms apply through CentralQueries.display_name_conflict (unique
+    among active targets, case-insensitively), checked against the registry
+    as read on the migration's own central connection."""
+    cur = central.cursor()
+    cur.execute(ACTIVE_DISPLAY_NAMES_SQL)
+    rows = list(cur.fetchall())
+    cur.close()
+    registry = pd.DataFrame(rows, columns=list(ACTIVE_DISPLAY_NAMES_COLUMNS))
+    return _display_name_conflict(display_name, registry)
+
+
 def register_target_database(
     central: oracledb.Connection, args: argparse.Namespace, dry_run: bool,
 ) -> Optional[int]:
-    """Insert a row into T_TARGET_DATABASES and return the new DATABASE_ID."""
+    """Insert a row into T_TARGET_DATABASES and return the new DATABASE_ID.
+
+    Raises RuntimeError (before anything is written, dry run included) when
+    --name is a display name another active target already uses.
+    """
     db_name = args.name.replace(" ", "_").upper()
     username, mode = parse_target_login(args.username, args.mode)
     enc_pwd = encrypt_password(args.password)
+
+    conflict = display_name_conflict(central, args.name)
+    if conflict:
+        raise RuntimeError(f"{conflict} Pass another one with --name.")
 
     if dry_run:
         print(f"  [DRY-RUN] Would register '{db_name}' -> {args.host}:{args.port}/{args.service}")

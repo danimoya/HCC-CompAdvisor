@@ -16,6 +16,10 @@ from hcc_advisor.utils.central_connector import CentralConnector
 from hcc_advisor.utils.logger import log_error, log_info, log_debug, log_warning
 from hcc_advisor.utils.target_connector import TargetConnector, parse_target_login
 from hcc_advisor.utils.leaf_segments import leaf_analysis_sql
+from hcc_advisor.utils.target_names import (
+    ACTIVE_DISPLAY_NAMES_SQL, cell_text as _cell_text,
+    display_name_conflict as _display_name_conflict,
+)
 
 
 # Target-database registry changes rarely but is read on every Streamlit rerun
@@ -35,6 +39,18 @@ _CONNECTION_MODE_PATCH_MSG = (
 # the table, so a table analysed with its partitions is not summed twice (see
 # leaf_segments.py). Object-level lists keep reading the table itself.
 _LEAF_ANALYSIS = leaf_analysis_sql()
+
+# An analysis row takes its execution status (Compressed / FAILED / ...), its
+# savings and its permanent-failure exclusion from the T_COMPRESSION_HISTORY
+# rows of exactly its own segment: DATABASE_ID, OWNER, OBJECT_NAME,
+# NVL(PARTITION_NAME, '~') and NVL(SUBPARTITION_NAME, '~'). So compressing one
+# subpartition does not mark its sibling subpartitions, its parent partition or
+# the table as compressed, and a TABLE row and a PARTITION row never share
+# history. Rows written before subpartition support recorded a subpartition
+# job under its parent partition with no SUBPARTITION_NAME; they ran MOVE
+# PARTITION on that parent (ORA-14257 on a composite partition), so they are
+# the parent partition's history and match only its own row, never its
+# subpartitions.
 
 # T_COMPRESSION_HISTORY.COMPRESSION_CLAUSE is VARCHAR2(200) (byte semantics).
 # The scheduler stores its job name there; direct executions store the DDL,
@@ -83,13 +99,6 @@ def _cached_target_databases() -> pd.DataFrame:
         ORDER BY display_name
     """
     return CentralConnector.execute_query(query)
-
-
-def _cell_text(value: Any) -> str:
-    """A registry cell as stripped text; '' for None / NaN."""
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return ''
-    return str(value).strip()
 
 
 def target_selector_labels(targets: Optional[pd.DataFrame]) -> Dict[int, str]:
@@ -285,7 +294,7 @@ class CentralQueries:
             SELECT
                 {db_col}
                 h.owner, h.object_name as table_name,
-                h.object_type, h.partition_name,
+                h.object_type, h.partition_name, h.subpartition_name,
                 h.compression_type_applied as strategy,
                 h.compression_clause as job_name,
                 h.operation_status as status,
@@ -351,12 +360,15 @@ class CentralQueries:
             LEFT JOIN (
                 SELECT h2.database_id as h_db_id, h2.owner as h_owner,
                        h2.object_name as h_obj, NVL(h2.partition_name, '~') as h_pn,
+                       NVL(h2.subpartition_name, '~') as h_sn,
                        h2.operation_status,
                        ROW_NUMBER() OVER (PARTITION BY h2.database_id, h2.owner, h2.object_name,
-                                          NVL(h2.partition_name, '~') ORDER BY h2.start_time DESC) as rn
+                                          NVL(h2.partition_name, '~'), NVL(h2.subpartition_name, '~')
+                                          ORDER BY h2.start_time DESC) as rn
                 FROM t_compression_history h2
             ) h ON h.h_db_id = a.database_id AND h.h_owner = a.owner
-               AND h.h_obj = a.object_name AND h.h_pn = NVL(a.partition_name, '~') AND h.rn = 1
+               AND h.h_obj = a.object_name AND h.h_pn = NVL(a.partition_name, '~')
+               AND h.h_sn = NVL(a.subpartition_name, '~') AND h.rn = 1
             WHERE a.advisable_compression IS NOT NULL
               AND a.advisable_compression != 'NONE'
               AND (h.operation_status IS NULL OR h.operation_status != 'SUCCESS')
@@ -390,23 +402,28 @@ class CentralQueries:
 
     @staticmethod
     def get_growth_alerts(database_id: Optional[int] = None, threshold_pct: float = 20.0) -> pd.DataFrame:
-        """Detect compressed tables that have grown beyond threshold since compression."""
+        """Detect compressed segments (table, partition or subpartition) that have
+        grown beyond threshold since their own compression."""
         db_filter = "AND a.database_id = :database_id" if database_id else ""
         query = f"""
             SELECT a.owner, a.object_name, a.object_type,
+                   a.partition_name, a.subpartition_name,
                    ROUND(h.compressed_size_bytes / 1048576, 1) as compressed_mb,
                    ROUND(a.size_bytes / 1048576, 1) as current_mb,
                    ROUND((a.size_bytes - h.compressed_size_bytes) / NULLIF(h.compressed_size_bytes, 0) * 100, 1) as growth_pct
             FROM t_compression_analysis a
             JOIN (
                 SELECT database_id, owner, object_name, NVL(partition_name, '~') as pn,
+                       NVL(subpartition_name, '~') as sn,
                        compressed_size_bytes,
                        ROW_NUMBER() OVER (PARTITION BY database_id, owner, object_name,
-                                          NVL(partition_name, '~') ORDER BY start_time DESC) as rn
+                                          NVL(partition_name, '~'), NVL(subpartition_name, '~')
+                                          ORDER BY start_time DESC) as rn
                 FROM t_compression_history
                 WHERE operation_status = 'SUCCESS' AND compressed_size_bytes > 0
             ) h ON h.database_id = a.database_id AND h.owner = a.owner
-               AND h.object_name = a.object_name AND h.pn = NVL(a.partition_name, '~') AND h.rn = 1
+               AND h.object_name = a.object_name AND h.pn = NVL(a.partition_name, '~')
+               AND h.sn = NVL(a.subpartition_name, '~') AND h.rn = 1
             WHERE a.size_bytes > h.compressed_size_bytes * (1 + :threshold / 100)
               {db_filter}
             ORDER BY (a.size_bytes - h.compressed_size_bytes) DESC
@@ -459,16 +476,19 @@ class CentralQueries:
             LEFT JOIN (
                 SELECT database_id, owner, object_name,
                        NVL(partition_name, '~') as pn,
+                       NVL(subpartition_name, '~') as sn,
                        operation_status, original_size_mb, compressed_size_mb,
                        ROW_NUMBER() OVER (
-                           PARTITION BY database_id, owner, object_name, NVL(partition_name, '~')
+                           PARTITION BY database_id, owner, object_name, NVL(partition_name, '~'),
+                                        NVL(subpartition_name, '~')
                            ORDER BY start_time DESC
                        ) as rn
                 FROM t_compression_history
                 WHERE 1=1 {hist_db_filter}
             ) h ON h.database_id = a.database_id
                AND h.owner = a.owner AND h.object_name = a.object_name
-               AND h.pn = NVL(a.partition_name, '~') AND h.rn = 1
+               AND h.pn = NVL(a.partition_name, '~')
+               AND h.sn = NVL(a.subpartition_name, '~') AND h.rn = 1
             WHERE 1=1 {db_filter}
         """
         params = {}
@@ -788,7 +808,9 @@ class CentralQueries:
             min_size_mb: Minimum table size in MB
             limit: Maximum number of results (None for no cap)
             database_id: Optional target database ID to filter results
-            show_executed: If False, hide objects already compressed successfully
+            show_executed: If False, hide segments already compressed successfully
+                (each row by the history of its own segment, down to the
+                subpartition: compressing one subpartition hides only that one)
             include_none: If True, also include objects whose advised compression is NONE
                 (very hot tables from hotness-only scans). Default False for backward compat.
             max_hotness: If set, only return objects whose hotness_score is <= this
@@ -796,6 +818,7 @@ class CentralQueries:
 
         Returns:
             DataFrame with recommendations including execution_status column
+            (the latest history row of the row's exact segment)
         """
         db_filter = "AND a.database_id = :database_id" if database_id else ""
         hist_db_filter = "AND database_id = :database_id" if database_id else ""
@@ -808,6 +831,7 @@ class CentralQueries:
             WHERE pf.database_id = a.database_id AND pf.owner = a.owner
               AND pf.object_name = a.object_name
               AND NVL(pf.partition_name, '~') = NVL(a.partition_name, '~')
+              AND NVL(pf.subpartition_name, '~') = NVL(a.subpartition_name, '~')
               AND pf.operation_status = 'FAILED'
               AND (pf.error_message LIKE '%ORA-14257%'
                    OR pf.error_message LIKE '%ORA-14808%'
@@ -845,16 +869,19 @@ class CentralQueries:
             LEFT JOIN (
                 SELECT owner, object_name,
                        NVL(partition_name, '~') as pn,
+                       NVL(subpartition_name, '~') as sn,
                        database_id, operation_status,
                        ROW_NUMBER() OVER (
-                           PARTITION BY database_id, owner, object_name, NVL(partition_name, '~')
+                           PARTITION BY database_id, owner, object_name, NVL(partition_name, '~'),
+                                        NVL(subpartition_name, '~')
                            ORDER BY start_time DESC
                        ) as rn
                 FROM t_compression_history
                 WHERE 1=1 {hist_db_filter}
             ) h ON h.database_id = a.database_id
                AND h.owner = a.owner AND h.object_name = a.object_name
-               AND h.pn = NVL(a.partition_name, '~') AND h.rn = 1
+               AND h.pn = NVL(a.partition_name, '~')
+               AND h.sn = NVL(a.subpartition_name, '~') AND h.rn = 1
             WHERE a.advisable_compression IS NOT NULL
               {none_filter}
               AND NVL(a.projected_savings_pct, 0) >= :min_savings_pct
@@ -2074,39 +2101,22 @@ class CentralQueries:
 
         Display names are compared case-insensitively, ignoring surrounding
         blanks, with every other ACTIVE target (the one being edited,
-        exclude_database_id, is skipped; removed targets don't count). The
-        registry has no constraint on the column, so a failed lookup is
-        logged and not treated as a conflict: the target selectors key on
-        DATABASE_ID and cope with duplicates.
+        exclude_database_id, is skipped; removed targets don't count; the
+        rule itself is target_names.display_name_conflict, which the
+        migration CLI applies too). The registry has no constraint on the
+        column, so a failed lookup is logged and not treated as a conflict:
+        the target selectors key on DATABASE_ID and cope with duplicates.
         """
         name = _cell_text(display_name)
         if not name:
             return None
         try:
-            df = CentralConnector.execute_query("""
-                SELECT database_id, database_name, display_name
-                FROM t_target_databases
-                WHERE is_active = 'Y' AND display_name IS NOT NULL
-            """, raise_on_error=True)
+            registry = CentralConnector.execute_query(ACTIVE_DISPLAY_NAMES_SQL,
+                                                      raise_on_error=True)
         except Exception as e:
             log_warning(f"Display-name check for '{name}' skipped: {e}")
             return None
-        for rec in df.to_dict('records'):
-            rec = {str(k).lower(): v for k, v in rec.items()}
-            other = _cell_text(rec.get('display_name'))
-            if not other or other.casefold() != name.casefold():
-                continue
-            try:
-                other_id = int(rec.get('database_id'))
-            except (TypeError, ValueError):
-                other_id = None
-            if exclude_database_id is not None and other_id == int(exclude_database_id):
-                continue
-            db_name = _cell_text(rec.get('database_name'))
-            return (f"The display name '{name}' is already used by target '{other}' "
-                    f"({db_name + ', ' if db_name else ''}ID {other_id}). "
-                    f"Choose a different display name.")
-        return None
+        return _display_name_conflict(name, registry, exclude_database_id)
 
     @staticmethod
     def get_target_database(database_id: int) -> Dict[str, Any]:

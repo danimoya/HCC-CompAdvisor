@@ -4,7 +4,7 @@ Step-by-step guided compression lifecycle
 """
 
 import streamlit as st
-from hcc_advisor.utils.central_queries import CentralQueries
+from hcc_advisor.utils.central_queries import CentralQueries, target_selector_labels
 from hcc_advisor.utils.target_queries import TargetQueries
 from hcc_advisor.utils.leaf_segments import leaf_segments
 from hcc_advisor.auth import AuthManager, ROLE_OPERATOR
@@ -75,17 +75,18 @@ def _nav_buttons(can_back=True, can_next=True, next_label="Next", next_disabled=
 def _step_select_database():
     st.subheader("Step 1: Select Target Database")
 
-    targets = CentralQueries.get_target_databases()
-    if targets.empty:
+    # Keyed on database_id like the sidebar selector: two targets may share a
+    # display name, and a name-keyed picker collapsed them into one option.
+    db_labels = target_selector_labels(CentralQueries.get_target_databases())
+    if not db_labels:
         st.warning("No target databases registered. Go to DB Connections to add one.")
         return
+    db_ids = list(db_labels)
+    current = st.session_state.get('wizard_db_id')   # kept when coming Back
+    index = db_ids.index(current) if current in db_labels else 0
 
-    targets.columns = [c.lower() for c in targets.columns]
-    db_options = {row['display_name'] or row['database_name']: row['database_id']
-                  for _, row in targets.iterrows()}
-
-    selected = st.selectbox("Target Database", list(db_options.keys()), key="wiz_db_select")
-    db_id = db_options[selected]
+    db_id = st.selectbox("Target Database", db_ids, index=index, key="wiz_db_select",
+                         format_func=lambda did: db_labels[did])
 
     st.session_state.wizard_db_id = db_id
 
@@ -191,8 +192,10 @@ def _step_review_candidates():
             st.session_state.selected_page = "AI Advisor"
             st.rerun()
 
-    # Display candidates table
-    display_cols = ['table_owner', 'table_name', 'object_type', 'current_size_mb',
+    # Display candidates table (one row per segment: sibling partitions and
+    # subpartitions each carry their own execution status)
+    display_cols = ['table_owner', 'table_name', 'object_type', 'partition_name',
+                    'subpartition_name', 'current_size_mb',
                     'recommended_strategy', 'hotness_score', 'execution_status']
     available = [c for c in display_cols if c in recs.columns]
     st.dataframe(recs[available], use_container_width=True, hide_index=True,

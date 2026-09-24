@@ -389,13 +389,21 @@ class TestMigrationSysdba:
     def _central(self, has_column):
         central = MagicMock()
         cur = central.cursor.return_value
+        cur.fetchall.return_value = []          # display-name check: no other targets
         cur.fetchone.side_effect = [(1 if has_column else 0,), (11,)]
         return central, cur
+
+    @staticmethod
+    def _insert(cur):
+        """(sql, params) of the registration INSERT (the display-name check and
+        the CONNECTION_MODE column check run before it)."""
+        return next(c.args for c in cur.execute.call_args_list
+                    if 'INSERT INTO t_target_databases' in c.args[0])
 
     def test_register_with_connection_mode(self):
         central, cur = self._central(has_column=True)
         assert migration.register_target_database(central, self._args(), dry_run=False) == 11
-        insert_sql, params = cur.execute.call_args_list[1].args
+        insert_sql, params = self._insert(cur)
         assert 'connection_mode' in insert_sql
         assert params['username'] == 'sys' and params['connection_mode'] == 'SYSDBA'
         assert set(params) == _binds(insert_sql)
@@ -409,7 +417,7 @@ class TestMigrationSysdba:
         central, cur = self._central(has_column=False)
         args = self._args(username='COMPRESSION_MGR')
         assert migration.register_target_database(central, args, dry_run=False) == 11
-        insert_sql, params = cur.execute.call_args_list[1].args
+        insert_sql, params = self._insert(cur)
         assert 'connection_mode' not in insert_sql and 'connection_mode' not in params
         assert set(params) == _binds(insert_sql)
 
