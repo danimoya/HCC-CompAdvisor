@@ -2117,9 +2117,9 @@ class CentralQueries:
                 existing_id = int(existing.iloc[0]['DATABASE_ID'])
                 if existing.iloc[0]['IS_ACTIVE'] == 'N':
                     # A removed (soft-deleted) target still owns the unique name but
-                    # is hidden from the Databases tab, so it can't be edited or
-                    # deleted there. Re-activate it with the new details instead
-                    # (e.g. the same database re-added to log on AS SYSDBA).
+                    # is hidden from the Registered Databases tab, so it can't be
+                    # edited or removed there. Re-activate it with the new details
+                    # instead (e.g. the same database re-added to log on AS SYSDBA).
                     ok, msg = CentralQueries.update_target_database(existing_id, db_data, reactivate=True)
                     if ok:
                         log_info(f"Target database re-activated: {db_name} (ID: {existing_id})")
@@ -2128,7 +2128,7 @@ class CentralQueries:
                 return (
                     False,
                     f"A target database named '{db_name}' already exists (ID {existing_id}). "
-                    f"Edit or delete it from the Databases tab instead of re-adding.",
+                    f"Edit or remove it under Registered Databases instead of re-adding it.",
                     existing_id
                 )
         except Exception as e:
@@ -2159,7 +2159,7 @@ class CentralQueries:
             msg = str(e)
             if 'ORA-00001' in msg and 'UNQ_DATABASE_NAME' in msg.upper():
                 msg = (f"A target database named '{db_name}' already exists. "
-                       f"Edit or delete it from the Databases tab instead of re-adding.")
+                       f"Edit or remove it under Registered Databases instead of re-adding it.")
             return False, msg, None
 
     @staticmethod
@@ -2180,28 +2180,9 @@ class CentralQueries:
         Returns:
             Tuple of (success, message)
         """
-        reactivate_sql = "is_active = 'Y'," if reactivate else ""
-        query = f"""
-            UPDATE t_target_databases SET
-                display_name = :display_name,
-                db_host = :db_host,
-                port = :port,
-                service_name = :service_name,
-                username = :username,
-                description = :description,
-                environment = :environment,
-                platform_type = :platform_type,
-                connection_mode = :connection_mode,
-                oracle_version = NVL(:oracle_version, oracle_version),
-                {reactivate_sql}
-                modified_date = SYSDATE,
-                modified_by = USER
-            WHERE database_id = :database_id
-        """
-
-        # Bind exactly the placeholders above: python-oracledb rejects unused
-        # named binds (DPY-4008), so passing db_data through as-is failed whenever
-        # it also carried password_encrypted / connection_mode.
+        # Bind exactly the placeholders of the UPDATE below: python-oracledb
+        # rejects unused named binds (DPY-4008), so passing db_data through
+        # as-is failed whenever it also carried extra keys.
         try:
             params = {k: db_data[k] for k in (
                 'display_name', 'db_host', 'port', 'service_name', 'username',
@@ -2216,40 +2197,49 @@ class CentralQueries:
         params['oracle_version'] = db_data.get('oracle_version')
         params['database_id'] = database_id
 
+        # A new password (when given) is written by the same statement as the
+        # other fields, so an edit is applied all-or-nothing: a failure can't
+        # leave a changed password behind unchanged connection details.
+        password_sql = ""
+        if db_data.get('password_encrypted'):
+            password_sql = "password_encrypted = :password_encrypted,"
+            params['password_encrypted'] = db_data['password_encrypted']
+        reactivate_sql = "is_active = 'Y'," if reactivate else ""
+        query = f"""
+            UPDATE t_target_databases SET
+                display_name = :display_name,
+                db_host = :db_host,
+                port = :port,
+                service_name = :service_name,
+                username = :username,
+                description = :description,
+                environment = :environment,
+                platform_type = :platform_type,
+                connection_mode = :connection_mode,
+                oracle_version = NVL(:oracle_version, oracle_version),
+                {password_sql}
+                {reactivate_sql}
+                modified_date = SYSDATE,
+                modified_by = USER
+            WHERE database_id = :database_id
+        """
+
         if not CentralQueries.ensure_connection_mode_column():
             return False, _CONNECTION_MODE_PATCH_MSG
 
-        # If password_encrypted is provided, update it separately
-        if 'password_encrypted' in db_data and db_data['password_encrypted']:
-            password_query = """
-                UPDATE t_target_databases
-                SET password_encrypted = :password_encrypted,
-                    modified_date = SYSDATE,
-                    modified_by = USER
-                WHERE database_id = :database_id
-            """
-            try:
-                # Strict mode: otherwise a failed password UPDATE returns 0 and
-                # the edit below still reports success
-                CentralConnector.execute_dml(password_query, {
-                    'password_encrypted': db_data['password_encrypted'],
-                    'database_id': database_id
-                }, raise_on_error=True)
-            except Exception as e:
-                log_error(e, "update_target_database (password)", {'database_id': database_id})
-                return False, f"Failed to update password: {e}"
-
         try:
-            rows_affected = CentralConnector.execute_dml(query, params)
+            # Strict mode so the database error reaches the caller's message
+            # instead of a generic failure
+            rows_affected = CentralConnector.execute_dml(query, params, raise_on_error=True)
             if rows_affected:
                 log_info(f"Target database updated: ID {database_id}")
                 CentralQueries.invalidate_target_databases_cache()
                 _close_target_pool(database_id)
                 return True, "Target database updated successfully"
-            return False, "Failed to update target database"
+            return False, f"Target database ID {database_id} not found"
         except Exception as e:
             log_error(e, "update_target_database", {'database_id': database_id})
-            return False, str(e)
+            return False, f"Failed to update target database: {e}"
 
     @staticmethod
     def delete_target_database(database_id: int) -> Tuple[bool, str]:

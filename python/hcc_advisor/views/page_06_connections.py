@@ -4,10 +4,11 @@ Register and manage target Oracle databases for analysis
 """
 
 import html
+import math
 
 import streamlit as st
 import oracledb
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.target_connector import TargetConnector, build_connect_kwargs, parse_target_login
@@ -102,6 +103,213 @@ def test_target_connection(conn_details: Dict) -> Tuple[bool, str, Optional[str]
         return False, f"Connection failed: {str(e)}", None
 
 
+ENVIRONMENTS = ['PRODUCTION', 'DEV', 'TEST', 'UAT', 'STAGING']
+PLATFORMS = ['STANDARD', 'EXADATA']
+CONNECTION_MODES = ['NORMAL', 'SYSDBA']
+
+# Session-state keys: the target whose edit form is open, and a message shown
+# once at the top of the list after a rerun (e.g. "... updated").
+_EDIT_TARGET_KEY = 'edit_target_id'
+_FLASH_KEY = 'target_registry_flash'
+
+
+def _text(value: Any, default: str = '') -> str:
+    """A registry cell as text; `default` for NULL (None, or NaN from pandas)."""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return default
+    return str(value)
+
+
+def _edit_key(db_id: Any, field: str) -> str:
+    return f"edit_target_{field}_{db_id}"
+
+
+def _edit_defaults(db) -> Dict[str, Any]:
+    """Edit-form values for a target's current registration (a registry row)."""
+    try:
+        port = int(db.get('port'))
+    except (TypeError, ValueError):
+        port = 1521
+    if not 1 <= port <= 65535:
+        port = 1521
+    mode = _text(db.get('connection_mode'), 'NORMAL').upper()
+    return {
+        'display_name': _text(db.get('display_name')),
+        'host': _text(db.get('db_host')),
+        'port': port,
+        'service': _text(db.get('service_name')),
+        'username': _text(db.get('username')),
+        'mode': mode if mode in CONNECTION_MODES else 'NORMAL',
+        'environment': _text(db.get('environment')) or ENVIRONMENTS[0],
+        'platform_type': _text(db.get('platform_type')) or PLATFORMS[0],
+        'description': _text(db.get('description')),
+        'new_password': '',
+    }
+
+
+def _with_current(options: List[str], current: str) -> List[str]:
+    """Selectbox options that also offer a stored value outside the standard
+    list, so opening the edit form never silently changes it."""
+    return options if current in options else options + [current]
+
+
+def _close_edit_form(db_id: Any) -> None:
+    """Close a target's edit form. Its field values need no explicit clearing:
+    Streamlit drops the state of widgets that a run doesn't render, so the next
+    Edit starts again from the registry."""
+    if st.session_state.get(_EDIT_TARGET_KEY) == db_id:
+        st.session_state.pop(_EDIT_TARGET_KEY, None)
+
+
+def save_target_edit(
+    database_id: int, stored_password_encrypted: Optional[str], values: Dict[str, Any]
+) -> Tuple[bool, str]:
+    """
+    Validate, test and save an edit of a registered target database.
+
+    The connection is tested with the edited details first, using the new
+    password when one is given and otherwise the stored one (decrypted; fails
+    closed if it can't be). The registry is only updated after a successful
+    test, together with the Oracle version the test reported.
+
+    Args:
+        database_id: Target database ID
+        stored_password_encrypted: The target's current PASSWORD_ENCRYPTED
+        values: Edit-form values: display_name, host, port, service, username,
+            mode, environment, platform_type, description and new_password
+            (blank = keep the current password)
+
+    Returns:
+        Tuple of (success, message)
+    """
+    display_name = (values.get('display_name') or '').strip()
+    host = (values.get('host') or '').strip()
+    service = (values.get('service') or '').strip()
+    username = (values.get('username') or '').strip()
+    missing = [label for label, value in (
+        ('Display Name', display_name), ('Host', host),
+        ('Service Name', service), ('Username', username)) if not value]
+    if missing:
+        return False, f"Please fill in the required fields: {', '.join(missing)}"
+    port = int(values.get('port') or 1521)
+
+    # Accept "SYS AS SYSDBA" typed as the username (SYS always logs on AS SYSDBA)
+    try:
+        username, mode = parse_target_login(username, values.get('mode'))
+    except ValueError as exc:
+        return False, str(exc)
+
+    new_password = values.get('new_password') or ''
+    password_encrypted = None
+    if new_password:
+        # Encrypt before testing: no point testing a password that can't be stored
+        try:
+            password_encrypted = encrypt_password(new_password)
+        except CredentialEncryptionError as exc:
+            return False, f"Cannot save the new password: {exc}"
+        password = new_password
+    else:
+        try:
+            password = decrypt_password(stored_password_encrypted or '')
+        except CredentialEncryptionError as exc:
+            return False, (f"Cannot test the connection with the stored password: {exc} "
+                           f"Enter a new password to replace it.")
+
+    ok, msg, version = test_target_connection({
+        'host': host, 'port': port, 'service': service,
+        'username': username, 'password': password, 'mode': mode,
+    })
+    if not ok:
+        return False, f"Connection test failed, nothing was saved. {msg}"
+
+    db_data = {
+        'display_name': display_name,
+        'db_host': host,
+        'port': port,
+        'service_name': service,
+        'username': username,
+        'connection_mode': mode,
+        'description': (values.get('description') or '').strip(),
+        'environment': values.get('environment'),
+        'platform_type': values.get('platform_type'),
+        'oracle_version': version,
+    }
+    if password_encrypted:
+        db_data['password_encrypted'] = password_encrypted
+    ok, msg = CentralQueries.update_target_database(database_id, db_data)
+    if not ok:
+        return False, f"Connection test passed but saving failed: {msg}"
+    CentralQueries.update_target_last_connected(database_id)
+    log_info(f"Target database edited: {display_name} (ID: {database_id})")
+    return True, f"'{display_name}' updated." + (f" {version}" if version else "")
+
+
+def _render_edit_form(db, db_id: int) -> None:
+    """Edit form for one registered target, shown inside its expander."""
+    current = _edit_defaults(db)
+    # Seed the fields from the registry when the form opens; while it stays open
+    # the widgets keep what was typed (e.g. across a failed save).
+    for field, value in current.items():
+        key = _edit_key(db_id, field)
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+    st.markdown("#### Edit Connection")
+    with st.form(f"edit_target_form_{db_id}"):
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.text_input("Database Name", value=_text(db.get('database_name')), disabled=True,
+                          key=_edit_key(db_id, 'database_name'),
+                          help="The registry's unique key; it can't be changed.")
+            display_name = st.text_input("Display Name *", key=_edit_key(db_id, 'display_name'))
+            host = st.text_input("Host *", key=_edit_key(db_id, 'host'))
+            service = st.text_input("Service Name *", key=_edit_key(db_id, 'service'))
+            new_password = st.text_input("New Password", type="password",
+                                         key=_edit_key(db_id, 'new_password'),
+                                         help="Leave blank to keep the current password")
+
+        with col2:
+            environment = st.selectbox("Environment", _with_current(ENVIRONMENTS, current['environment']),
+                                       key=_edit_key(db_id, 'environment'))
+            platform_type = st.selectbox("Platform", _with_current(PLATFORMS, current['platform_type']),
+                                         key=_edit_key(db_id, 'platform_type'))
+            port = st.number_input("Port *", min_value=1, max_value=65535, key=_edit_key(db_id, 'port'))
+            username = st.text_input("Username *", key=_edit_key(db_id, 'username'),
+                                     help="For SYS use Connection Mode SYSDBA ('SYS AS SYSDBA' is also accepted)")
+            mode = st.selectbox("Connection Mode", CONNECTION_MODES, key=_edit_key(db_id, 'mode'),
+                                help="Use SYSDBA for SYS user connections")
+            description = st.text_input("Description", key=_edit_key(db_id, 'description'))
+
+        st.caption("The connection is tested with these details before anything is saved.")
+        save_col, cancel_col = st.columns(2)
+        with save_col:
+            save = st.form_submit_button("Test & Save", type="primary", use_container_width=True)
+        with cancel_col:
+            cancel = st.form_submit_button("Cancel", use_container_width=True)
+
+    if cancel:
+        _close_edit_form(db_id)
+        st.rerun()
+
+    if save:
+        values = {
+            'display_name': display_name, 'host': host, 'port': port, 'service': service,
+            'username': username, 'mode': mode, 'environment': environment,
+            'platform_type': platform_type, 'description': description,
+            'new_password': new_password,
+        }
+        with st.spinner("Testing connection..."):
+            ok, msg = save_target_edit(int(db_id), _text(db.get('password_encrypted')), values)
+        if ok:
+            # The database ID doesn't change, so an edited active target stays active.
+            _close_edit_form(db_id)
+            st.session_state[_FLASH_KEY] = msg
+            st.rerun()
+        else:
+            st.error(msg)
+
+
 def show_connections_page():
     """Display the target database manager page"""
 
@@ -151,6 +359,10 @@ def show_connections_page():
     with tab1:
         st.markdown("### Registered Target Databases")
 
+        flash = st.session_state.pop(_FLASH_KEY, None)
+        if flash:
+            st.success(flash)
+
         if targets_df.empty:
             st.info("No target databases registered. Add one in the 'Add New Database' tab.")
         else:
@@ -161,12 +373,13 @@ def show_connections_page():
                 db_id = db.get('database_id')
                 db_name = db.get('display_name', db.get('database_name', 'Unknown'))
                 is_active = db_id == active_db_id
+                is_editing = st.session_state.get(_EDIT_TARGET_KEY) == db_id
                 env = db.get('environment', 'N/A')
 
                 icon = "●" if is_active else "○"
                 badge = " (Active)" if is_active else ""
 
-                with st.expander(f"{icon} {db_name}{badge} - {env}", expanded=is_active):
+                with st.expander(f"{icon} {db_name}{badge} - {env}", expanded=is_active or is_editing):
                     col1, col2 = st.columns([3, 1])
 
                     with col1:
@@ -212,6 +425,11 @@ def show_connections_page():
                                 else:
                                     st.error(msg)
 
+                        if st.button("Edit", key=f"edit_{db_id}", use_container_width=True,
+                                     disabled=is_editing):
+                            st.session_state[_EDIT_TARGET_KEY] = db_id
+                            st.rerun()
+
                         if not is_active:
                             if st.button("Set Active", key=f"activate_{db_id}", use_container_width=True, type="primary"):
                                 st.session_state.active_database_id = db_id
@@ -223,10 +441,14 @@ def show_connections_page():
                             if success:
                                 if active_db_id == db_id:
                                     st.session_state.active_database_id = None
+                                _close_edit_form(db_id)
                                 st.success(msg)
                                 st.rerun()
                             else:
                                 st.error(msg)
+
+                    if is_editing:
+                        _render_edit_form(db, db_id)
 
     # Tab 2: Add new database
     with tab2:
@@ -268,8 +490,8 @@ def show_connections_page():
                 password = st.text_input("Password *", type="password")
 
             with col2:
-                environment = st.selectbox("Environment", options=['PRODUCTION', 'DEV', 'TEST', 'UAT', 'STAGING'])
-                platform_type = st.selectbox("Platform", options=['STANDARD', 'EXADATA'])
+                environment = st.selectbox("Environment", options=ENVIRONMENTS)
+                platform_type = st.selectbox("Platform", options=PLATFORMS)
                 port = st.number_input("Port *", min_value=1, max_value=65535, value=1521)
                 username = st.text_input("Username *", placeholder="e.g., COMPRESSION_MGR",
                                          help="For SYS use Connection Mode SYSDBA ('SYS AS SYSDBA' is also accepted)")
