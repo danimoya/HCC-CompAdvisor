@@ -445,6 +445,80 @@ class CentralConnector:
                 log_error(e, "CentralConnector.close_pool")
             cls._pool = None
 
+    @classmethod
+    def execute_dml_returning(
+        cls,
+        statement: str,
+        params: Optional[Dict[str, Any]] = None,
+        out_bind: str = 'new_id',
+        commit: bool = True
+    ) -> Optional[Any]:
+        """
+        Execute a single-row DML statement with a RETURNING ... INTO clause on
+        the central database and return the returned value (typically the
+        generated identity key of an INSERT).
+
+        Use this instead of re-selecting the key afterwards (SELECT MAX(id) ...),
+        which races with concurrent inserts.
+
+        Args:
+            statement: DML ending in "RETURNING <column> INTO :<out_bind>"
+            params: Input bind parameters (must not contain out_bind)
+            out_bind: Name of the RETURNING INTO bind variable
+            commit: Whether to commit transaction
+
+        Returns:
+            The returned value (int for integral numbers), or None if no row
+            was affected or the statement failed
+
+        Example:
+            new_id = CentralConnector.execute_dml_returning(
+                "INSERT INTO t_foo (name) VALUES (:name) RETURNING foo_id INTO :new_id",
+                {'name': 'x'}
+            )
+        """
+        _t0 = time.perf_counter() if is_debug_enabled() else None
+        try:
+            log_debug("[Central] Executing DML returning", statement_preview=statement[:200])
+            with cls.get_connection() as conn:
+                cursor = conn.cursor()
+
+                out_var = cursor.var(oracledb.NUMBER)
+                all_params = dict(params or {})
+                all_params[out_bind] = out_var
+
+                cursor.execute(statement, all_params)
+                rows_affected = cursor.rowcount
+
+                if commit:
+                    conn.commit()
+
+                # For DML returning, getvalue() is a list with one entry per
+                # affected row.
+                values = out_var.getvalue()
+                cursor.close()
+
+                if isinstance(values, list):
+                    value = values[0] if values else None
+                else:
+                    value = values
+                if isinstance(value, float) and value.is_integer():
+                    value = int(value)
+
+                log_debug(f"[Central] DML affected {rows_affected} rows, returned {out_bind}={value}")
+                if _t0 is not None:
+                    capture_sql('central', 'DML', statement, params,
+                                rows_affected=rows_affected, duration_ms=(time.perf_counter() - _t0) * 1000)
+                return value
+
+        except oracledb.Error as e:
+            if _t0 is not None:
+                capture_sql('central', 'DML', statement, params,
+                            status='ERROR', error=str(e), duration_ms=(time.perf_counter() - _t0) * 1000)
+            log_db_error(e, statement, params)
+            st.error(f"Central database DML error: {e}")
+            return None
+
 
 @st.cache_resource
 def get_central_connector():
