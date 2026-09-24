@@ -15,6 +15,7 @@ from hcc_advisor.utils.hotness import (
     compute_hotness, index_dml_rows, index_segment_rows, lookup_dml, lookup_segment,
     SOURCE_DML, SOURCE_SEGSTATS, SOURCE_AWR,
 )
+from hcc_advisor.utils.leaf_segments import leaf_segments
 
 
 # SECURITY (CWE-89): Oracle DDL is built by interpolating identifiers into
@@ -1323,19 +1324,25 @@ class TargetQueries:
         results: list,
         start_time: float
     ):
-        """Update advisor run record as completed in central DB"""
+        """Update advisor run record as completed in central DB.
+
+        Size/savings totals and recommendation counts cover leaf segments only:
+        a table analysed with its partitions counts through its partition (or
+        subpartition) rows, not the TABLE row as well. objects_analyzed/failed
+        stay counts of the analyses performed."""
         import time
         from hcc_advisor.utils.central_connector import CentralConnector
 
         elapsed = time.time() - start_time
-        total_size = sum(r.get('SIZE_BYTES', 0) or 0 for r in results) / 1024 / 1024 if results else 0
-        total_savings = sum(r.get('PROJECTED_SAVINGS_BYTES', 0) or 0 for r in results) / 1024 / 1024 if results else 0
+        leaves = leaf_segments(results or [])
+        total_size = sum(r.get('SIZE_BYTES', 0) or 0 for r in leaves) / 1024 / 1024
+        total_savings = sum(r.get('PROJECTED_SAVINGS_BYTES', 0) or 0 for r in leaves) / 1024 / 1024
         savings_pct = round((total_savings / total_size) * 100, 2) if total_size > 0 else 0
 
         rec_counts = {'NONE': 0, 'BASIC': 0, 'OLTP': 0}
         hcc_low_count = 0  # QUERY LOW + ARCHIVE LOW
         hcc_high_count = 0  # QUERY HIGH + ARCHIVE HIGH
-        for r in (results or []):
+        for r in leaves:
             rec = r.get('ADVISABLE_COMPRESSION', 'NONE')
             if rec in rec_counts:
                 rec_counts[rec] += 1

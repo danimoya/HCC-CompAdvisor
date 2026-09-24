@@ -12,6 +12,7 @@ import requests
 from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.target_queries import TargetQueries
 from hcc_advisor.utils.central_connector import CentralConnector
+from hcc_advisor.utils.leaf_segments import leaf_segments
 
 
 def show_ai_advisor_page():
@@ -243,6 +244,8 @@ def _gather_context(db_id, schema_filter=None, table_filter=None) -> dict:
         if table_filter and '.' in table_filter:
             tbl = table_filter.split('.')[1].upper()
             recs = recs[recs['table_name'] == tbl]
+        # Leaf segments only, so the model never adds a table to its own partitions
+        recs = leaf_segments(recs)
         context['candidates'] = recs.to_dict('records')
     else:
         context['candidates'] = []
@@ -275,7 +278,7 @@ def _build_prompt(context: dict, scope: str) -> str:
     prompt = f"""You are an Oracle DBA compression advisor. Analyze this compression estate data and provide actionable recommendations.
 
 ESTATE SUMMARY:
-- Total objects analyzed: {p.get('total', 0)}
+- Total objects analyzed: {p.get('total', 0)} (partitioned tables count per partition/subpartition)
 - Already compressed: {p.get('compressed', 0)} (saved {p.get('saved_mb', 0) / 1024:.2f} GB)
 - Pending candidates: {p.get('pending', 0)} ({p.get('uncompressed_mb', 0) / 1024:.2f} GB uncompressed)
 - Skipped (not recommended): {p.get('skipped', 0)}
@@ -292,10 +295,12 @@ FORECAST:
     candidates = context.get('candidates', [])
     if candidates:
         prompt += "TOP CANDIDATES (by size):\n"
-        prompt += "| Owner | Table | Size MB | Hotness | Current | Advised | Status |\n"
-        prompt += "|-------|-------|---------|---------|---------|---------|--------|\n"
+        prompt += "| Owner | Table | Partition | Size MB | Hotness | Current | Advised | Status |\n"
+        prompt += "|-------|-------|-----------|---------|---------|---------|---------|--------|\n"
         for c in candidates[:50]:
-            prompt += (f"| {c.get('table_owner', '')} | {c.get('table_name', '')} "
+            segment = '.'.join(str(c[k]) for k in ('partition_name', 'subpartition_name')
+                               if pd.notna(c.get(k)) and c.get(k)) or '-'
+            prompt += (f"| {c.get('table_owner', '')} | {c.get('table_name', '')} | {segment} "
                       f"| {c.get('current_size_mb', 0):.0f} | {c.get('hotness_score', 0):.0f} "
                       f"| {c.get('current_compression', '')} | {c.get('recommended_strategy', '')} "
                       f"| {c.get('execution_status', '')} |\n")

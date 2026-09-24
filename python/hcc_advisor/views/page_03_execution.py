@@ -9,6 +9,7 @@ import pandas as pd
 import time
 from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.target_queries import TargetQueries
+from hcc_advisor.utils.leaf_segments import leaf_segments
 from hcc_advisor.utils.sql_builder import (
     build_compression_script,
     gather_dependent_indexes,
@@ -281,10 +282,11 @@ def show_batch_execution():
     # Normalize column names to lowercase
     df.columns = [col.lower() for col in df.columns]
 
-    # Show schema summary with totals
+    # Show schema summary with totals (each segment once — see leaf_segments)
     if schema_val:
-        total_current = df['current_size_mb'].sum() if 'current_size_mb' in df.columns else 0
-        total_est = df['estimated_size_mb'].sum() if 'estimated_size_mb' in df.columns else 0
+        leaves = leaf_segments(df)
+        total_current = leaves['current_size_mb'].sum() if 'current_size_mb' in df.columns else 0
+        total_est = leaves['estimated_size_mb'].sum() if 'estimated_size_mb' in df.columns else 0
         c1, c2, c3 = st.columns(3)
         with c1:
             st.metric("Tables", len(df))

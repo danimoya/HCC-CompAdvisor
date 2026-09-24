@@ -10,6 +10,7 @@ import plotly.graph_objects as go
 import io
 from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.target_queries import TargetQueries
+from hcc_advisor.utils.leaf_segments import leaf_segments
 from hcc_advisor.config import config
 
 
@@ -139,7 +140,9 @@ def show_recommendations_page():
 def show_overview_tab(df: pd.DataFrame):
     """Display overview metrics and charts"""
 
-    # Summary metrics
+    # Summary metrics — size totals count each segment once: a table listed with
+    # its partitions contributes through the partition rows (see leaf_segments)
+    leaves = leaf_segments(df)
     col1, col2, col3, col4 = st.columns(4)
 
     with col1:
@@ -149,14 +152,14 @@ def show_overview_tab(df: pd.DataFrame):
         )
 
     with col2:
-        total_current = df['current_size_mb'].sum() / 1024 if 'current_size_mb' in df.columns else 0
+        total_current = leaves['current_size_mb'].sum() / 1024 if 'current_size_mb' in df.columns else 0
         st.metric(
             label="Total Current Size",
             value=f"{total_current:.2f} GB"
         )
 
     with col3:
-        total_compressed = df['estimated_size_mb'].sum() / 1024 if 'estimated_size_mb' in df.columns else 0
+        total_compressed = leaves['estimated_size_mb'].sum() / 1024 if 'estimated_size_mb' in df.columns else 0
         st.metric(
             label="Total After Compression",
             value=f"{total_compressed:.2f} GB"

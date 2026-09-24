@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from hcc_advisor.utils.central_connector import CentralConnector
 from hcc_advisor.utils.logger import log_error, log_info, log_debug, log_warning
 from hcc_advisor.utils.target_connector import TargetConnector, parse_target_login
+from hcc_advisor.utils.leaf_segments import leaf_analysis_sql
 
 
 # Target-database registry changes rarely but is read on every Streamlit rerun
@@ -29,6 +30,11 @@ _CONNECTION_MODE_PATCH_MSG = (
     "could not be added automatically. Apply SQL patch '20260331-connection-mode-column' "
     "in Admin → SQL Patches, then retry."
 )
+
+# Totals select from this leaf-segment view of T_COMPRESSION_ANALYSIS instead of
+# the table, so a table analysed with its partitions is not summed twice (see
+# leaf_segments.py). Object-level lists keep reading the table itself.
+_LEAF_ANALYSIS = leaf_analysis_sql()
 
 
 @st.cache_data(ttl=_TARGET_DATABASES_TTL_SECONDS, show_spinner=False)
@@ -72,6 +78,7 @@ class CentralQueries:
 
         Returns:
             dict: Summary with total_tables, total_size_mb, potential_savings_mb, avg_savings_pct
+            (leaf segments only: a partitioned table counts through its partitions)
         """
         db_filter = "AND database_id = :database_id" if database_id else ""
         query = f"""
@@ -82,7 +89,7 @@ class CentralQueries:
                 COALESCE(AVG(projected_savings_pct), 0) as avg_savings_pct,
                 COUNT(CASE WHEN advisable_compression IS NOT NULL
                           AND advisable_compression != 'NONE' THEN 1 END) as candidates_count
-            FROM t_compression_analysis
+            FROM {_LEAF_ANALYSIS} a
             WHERE 1=1
             {db_filter}
         """
@@ -250,7 +257,7 @@ class CentralQueries:
 
     @staticmethod
     def get_forecast_data(database_id: Optional[int] = None) -> Dict[str, Any]:
-        """Get data for the space savings forecast report."""
+        """Get data for the space savings forecast report (leaf segments only)."""
         db_filter = "AND database_id = :database_id" if database_id else ""
         query = f"""
             SELECT
@@ -258,7 +265,7 @@ class CentralQueries:
                 ROUND(SUM(NVL(a.original_size_bytes, a.size_bytes)) / 1048576, 1) as pending_current_mb,
                 ROUND(SUM(NVL(a.original_size_bytes, a.size_bytes) - NVL(a.projected_savings_bytes, 0)) / 1048576, 1) as pending_projected_mb,
                 ROUND(SUM(NVL(a.projected_savings_bytes, 0)) / 1048576, 1) as pending_savings_mb
-            FROM t_compression_analysis a
+            FROM {_LEAF_ANALYSIS} a
             LEFT JOIN (
                 SELECT h2.database_id as h_db_id, h2.owner as h_owner,
                        h2.object_name as h_obj, NVL(h2.partition_name, '~') as h_pn,
@@ -330,8 +337,9 @@ class CentralQueries:
         except Exception:
             return pd.DataFrame()
 
+    @staticmethod
     def get_compression_progress(database_id: Optional[int] = None) -> Dict[str, Any]:
-        """Get compressed/pending/skipped breakdown for the dashboard."""
+        """Get compressed/pending/skipped breakdown for the dashboard (leaf segments only)."""
         db_filter = "AND a.database_id = :database_id" if database_id else ""
         hist_db_filter = "AND database_id = :database_id" if database_id else ""
         query = f"""
@@ -365,7 +373,7 @@ class CentralQueries:
                            AND (h.operation_status IS NULL OR h.operation_status != 'SUCCESS')
                            THEN NVL(a.original_size_bytes, a.size_bytes) / 1048576
                            ELSE 0 END), 0) as uncompressed_mb
-            FROM t_compression_analysis a
+            FROM {_LEAF_ANALYSIS} a
             LEFT JOIN (
                 SELECT database_id, owner, object_name,
                        NVL(partition_name, '~') as pn,
@@ -415,6 +423,7 @@ class CentralQueries:
 
         Returns:
             DataFrame with strategy, count, avg_savings_pct, total_size_mb, total_savings_mb
+            (leaf segments only)
         """
         db_filter = "AND database_id = :database_id" if database_id else ""
         query = f"""
@@ -425,7 +434,7 @@ class CentralQueries:
                 COALESCE(AVG(best_ratio), 0) as avg_compression_ratio,
                 COALESCE(SUM(size_mb), 0) / 1024 as total_size_gb,
                 COALESCE(SUM(projected_savings_mb), 0) / 1024 as total_savings_gb
-            FROM t_compression_analysis
+            FROM {_LEAF_ANALYSIS} a
             WHERE advisable_compression IS NOT NULL
               AND advisable_compression != 'NONE'
               {db_filter}
@@ -746,6 +755,7 @@ class CentralQueries:
                 a.hotness_score,
                 a.hotness_category,
                 a.recommendation_reason,
+                a.analysis_timestamp,
                 CASE WHEN h.operation_status = 'SUCCESS' THEN 'Compressed'
                      WHEN h.operation_status IS NOT NULL THEN h.operation_status
                      ELSE 'Pending' END as execution_status
@@ -2661,9 +2671,9 @@ class CentralQueries:
         Get savings breakdown grouped by target database
 
         Returns:
-            DataFrame with per-database savings summary
+            DataFrame with per-database savings summary (leaf segments only)
         """
-        query = """
+        query = f"""
             SELECT
                 a.database_id,
                 t.display_name as database_name,
@@ -2675,7 +2685,7 @@ class CentralQueries:
                 COALESCE(AVG(a.projected_savings_pct), 0) as avg_savings_pct,
                 COUNT(CASE WHEN a.advisable_compression IS NOT NULL
                           AND a.advisable_compression != 'NONE' THEN 1 END) as candidates_count
-            FROM t_compression_analysis a
+            FROM {_LEAF_ANALYSIS} a
             JOIN t_target_databases t ON a.database_id = t.database_id
             WHERE t.is_active = 'Y'
             GROUP BY a.database_id, t.display_name, t.environment, t.platform_type
@@ -2696,9 +2706,9 @@ class CentralQueries:
 
         Returns:
             DataFrame with per-database comparison: total_tables, total_size,
-            potential_savings, avg_savings_pct
+            potential_savings, avg_savings_pct (analysis stats over leaf segments only)
         """
-        query = """
+        query = f"""
             SELECT
                 t.database_id,
                 t.display_name as database_name,
@@ -2725,7 +2735,7 @@ class CentralQueries:
                     COALESCE(AVG(projected_savings_pct), 0) as avg_savings_pct,
                     COUNT(CASE WHEN advisable_compression IS NOT NULL
                               AND advisable_compression != 'NONE' THEN 1 END) as candidates_count
-                FROM t_compression_analysis
+                FROM {_LEAF_ANALYSIS} a
                 GROUP BY database_id
             ) stats ON t.database_id = stats.database_id
             LEFT JOIN (
