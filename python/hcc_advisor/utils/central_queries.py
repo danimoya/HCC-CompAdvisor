@@ -2326,6 +2326,7 @@ class CentralQueries:
                 :sample_size, :parallel_degree, :analysis_mode,
                 SYSTIMESTAMP, 'RUNNING', USER
             )
+            RETURNING run_id INTO :new_run_id
         """
 
         params = dict(run_data)
@@ -2346,16 +2347,13 @@ class CentralQueries:
         params.setdefault('analysis_mode', 'FULL')
 
         try:
-            rows_affected = CentralConnector.execute_dml(insert_query, params)
-            if rows_affected:
-                # Get the newly created run_id
-                id_query = """
-                    SELECT MAX(run_id) as run_id
-                    FROM t_advisor_run
-                    WHERE database_id = :database_id
-                """
-                df = CentralConnector.execute_query(id_query, {'database_id': database_id})
-                new_run_id = int(df.iloc[0]['RUN_ID']) if not df.empty else None
+            # RETURNING yields this insert's own run_id; re-selecting MAX(run_id)
+            # could hand two concurrent analyses on one target the same id.
+            new_run_id = CentralConnector.execute_dml_returning(
+                insert_query, params, out_bind='new_run_id'
+            )
+            if new_run_id is not None:
+                new_run_id = int(new_run_id)
                 log_info(f"Advisor run stored: database_id={database_id}, run_id={new_run_id}")
                 return True, new_run_id
             return False, None
@@ -2554,7 +2552,7 @@ class CentralQueries:
             return False
 
     @staticmethod
-    def store_compression_history(database_id: int, record: Dict[str, Any]) -> bool:
+    def store_compression_history(database_id: int, record: Dict[str, Any]) -> Optional[int]:
         """
         Store a compression history record in the central database
 
@@ -2570,7 +2568,9 @@ class CentralQueries:
                   error_code, error_message, analysis_id, executed_by
 
         Returns:
-            bool: True if successful
+            Optional[int]: history_id of the new row, or None on failure.
+            Later updates of the row should match on this id rather than on
+            owner/object_name, so concurrent runs don't touch each other's rows.
         """
         insert_query = """
             INSERT INTO t_compression_history (
@@ -2596,6 +2596,7 @@ class CentralQueries:
                 :operation_status, :error_code, :error_message,
                 :analysis_id, :executed_by
             )
+            RETURNING history_id INTO :new_id
         """
 
         params = dict(record)
@@ -2625,19 +2626,21 @@ class CentralQueries:
         params.setdefault('executed_by', None)
 
         try:
-            rows_affected = CentralConnector.execute_dml(insert_query, params)
-            if rows_affected:
+            new_id = CentralConnector.execute_dml_returning(insert_query, params, out_bind='new_id')
+            if new_id is not None:
+                new_id = int(new_id)
                 log_info(f"Compression history stored: database_id={database_id}, "
-                         f"object={params.get('owner')}.{params.get('object_name')}")
-                return True
-            return False
+                         f"object={params.get('owner')}.{params.get('object_name')}, "
+                         f"history_id={new_id}")
+                return new_id
+            return None
         except Exception as e:
             log_error(e, "store_compression_history", {
                 'database_id': database_id,
                 'object': f"{params.get('owner')}.{params.get('object_name')}"
             })
             st.error(f"Failed to store compression history: {e}")
-            return False
+            return None
 
     # ============================================================================
     # CROSS-DATABASE METHODS

@@ -1582,7 +1582,31 @@ class TargetQueries:
             'start_time': start_dt,
             'executed_by': _acting_user(),
         }
-        CentralQueries.store_compression_history(database_id, history_record)
+        history_id = CentralQueries.store_compression_history(database_id, history_record)
+
+        # Status/size updates below must hit exactly the row inserted above.
+        # Matching on owner+table alone could land on another target's row (a
+        # clone sharing the schema name), a sibling partition's row running in
+        # the same batch, or a scheduler job's row. Without an id, fall back to
+        # the most specific match: this target, this partition, this DDL.
+        if history_id:
+            hist_where = "WHERE history_id = :hist_id"
+            hist_binds = {'hist_id': history_id}
+        else:
+            log_warning(f"No history_id for {owner}.{table_name}"
+                        f"{'.' + partition_name if partition_name else ''}; "
+                        f"history updates will match by object")
+            hist_where = """
+                WHERE database_id = :hist_db AND owner = :hist_owner
+                  AND object_name = :hist_tbl
+                  AND NVL(partition_name, '~') = NVL(:hist_part, '~')
+                  AND subpartition_name IS NULL
+                  AND compression_clause = :hist_clause
+                  AND operation_status = 'IN_PROGRESS' AND ROWNUM = 1
+            """
+            hist_binds = {'hist_db': database_id, 'hist_owner': owner,
+                          'hist_tbl': table_name, 'hist_part': partition_name,
+                          'hist_clause': ddl_exec}
 
         try:
             t0 = _time.perf_counter()
@@ -1646,7 +1670,7 @@ class TargetQueries:
                 total_elapsed = round(elapsed + idx_time, 1)
 
                 # Update history to SUCCESS
-                CentralConnector.execute_dml("""
+                CentralConnector.execute_dml(f"""
                     UPDATE t_compression_history
                     SET operation_status = 'SUCCESS',
                         end_time = SYSTIMESTAMP,
@@ -1655,13 +1679,11 @@ class TargetQueries:
                         compression_ratio_achieved = :ratio,
                         indexes_rebuilt_count = :idx_cnt,
                         index_rebuild_time_sec = :idx_time
-                    WHERE owner = :owner AND object_name = :tbl
-                      AND operation_status = 'IN_PROGRESS'
-                      AND ROWNUM = 1
+                    {hist_where}
                 """, {
                     'dur': total_elapsed, 'comp_size': comp_size,
-                    'ratio': ratio, 'owner': owner, 'tbl': table_name,
-                    'idx_cnt': idx_rebuilt, 'idx_time': idx_time
+                    'ratio': ratio, 'idx_cnt': idx_rebuilt, 'idx_time': idx_time,
+                    **hist_binds
                 })
 
                 # Update analysis row to reflect new compression state
@@ -1689,24 +1711,22 @@ class TargetQueries:
                 }
 
             # DDL returned False — unknown failure
-            CentralConnector.execute_dml("""
+            CentralConnector.execute_dml(f"""
                 UPDATE t_compression_history
                 SET operation_status = 'FAILED', end_time = SYSTIMESTAMP,
                     duration_seconds = :dur, error_message = 'DDL execution returned failure'
-                WHERE owner = :owner AND object_name = :tbl
-                  AND operation_status = 'IN_PROGRESS' AND ROWNUM = 1
-            """, {'dur': round(elapsed, 1), 'owner': owner, 'tbl': table_name})
+                {hist_where}
+            """, {'dur': round(elapsed, 1), **hist_binds})
 
         except Exception as e:
             # Update history to FAILED
             try:
-                CentralConnector.execute_dml("""
+                CentralConnector.execute_dml(f"""
                     UPDATE t_compression_history
                     SET operation_status = 'FAILED', end_time = SYSTIMESTAMP,
                         error_message = :err
-                    WHERE owner = :owner AND object_name = :tbl
-                      AND operation_status = 'IN_PROGRESS' AND ROWNUM = 1
-                """, {'err': str(e)[:4000], 'owner': owner, 'tbl': table_name})
+                    {hist_where}
+                """, {'err': str(e)[:4000], **hist_binds})
             except Exception:
                 pass
             log_error(e, "TargetQueries.execute_compression", {
