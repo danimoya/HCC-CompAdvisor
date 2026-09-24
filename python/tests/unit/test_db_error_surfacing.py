@@ -22,6 +22,7 @@ from hcc_advisor.utils import target_connector as tc_module
 from hcc_advisor.utils.central_connector import CentralConnector
 from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.target_connector import TargetConnector
+from hcc_advisor.utils import sql_patches
 from hcc_advisor.views import page_09_admin, page_10_tablespaces
 
 
@@ -71,6 +72,9 @@ class FakeCursor:
 
     def fetchall(self):
         return self._rows
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
 
     def close(self):
         pass
@@ -309,13 +313,15 @@ class TestPatchApplier:
 
     def test_check_sql_error_reads_as_not_applied_without_st_error(self, central_db):
         central_db.fail_on('original_size_bytes', "ORA-00904: invalid identifier")
-        assert page_09_admin._check_patch_applied(
+        # check.sql detection lives in the shared sql_patches module (also used
+        # by the deployment page's Upgrade).
+        assert sql_patches.check_patch_applied(
             "SELECT COUNT(*) as result FROM t WHERE original_size_bytes > 0") is False
         central_db.st.error.assert_not_called()
 
     def test_check_sql_detects_applied(self, central_db):
         central_db.handler = lambda sql, params: {'rows': [(1,)], 'columns': ['RESULT']}
-        assert page_09_admin._check_patch_applied("SELECT 1 as result FROM dual") is True
+        assert sql_patches.check_patch_applied("SELECT 1 as result FROM dual") is True
 
 
 # ============================================================================
