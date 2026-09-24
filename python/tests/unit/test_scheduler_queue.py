@@ -836,8 +836,8 @@ class TestOpenSegmentIndexSql:
         assert "index_name = 'UNQ_HISTORY_OPEN_SEGMENT'" in block and 'RETURN;' in block
         # Duplicate IN_PROGRESS rows: fail with the list, before any change.
         assert block.index('RAISE_APPLICATION_ERROR') < block.index('UPDATE t_compression_history')
-        # Extra QUEUED copies: closed as FAILED with the reason (the SET line
-        # must survive the SQL*Plus-aware split, which drops lines starting SET).
+        # Extra QUEUED copies: closed as FAILED with the reason (the UPDATE's
+        # SET clause stays on the UPDATE line, as the patch is written).
         assert ("UPDATE t_compression_history SET operation_status = 'FAILED', "
                 "end_time = SYSTIMESTAMP,") in block
         assert "AND operation_status = 'QUEUED'" in block
