@@ -267,6 +267,7 @@ def show_history_page():
         'table_owner': 'Owner',
         'table_name': 'Table',
         'partition_name': 'Partition',
+        'subpartition_name': 'Subpartition',   # siblings' rows differ only here
         'strategy': 'Strategy',
         'status': 'Status',
         'rollback_status': 'Rollback',

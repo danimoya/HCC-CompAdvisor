@@ -3,10 +3,11 @@ Scheduler Page - HCC Compression Advisor
 Cross-database job queue monitor with auto-refresh and pending queue drain
 """
 
+import re
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
-from hcc_advisor.utils.central_queries import CentralQueries
+from hcc_advisor.utils.central_queries import CentralQueries, target_selector_labels
 from hcc_advisor.utils.target_queries import (
     TargetQueries,
     is_supported_compression_type,
@@ -159,29 +160,19 @@ def _render_export_section(current_db_id):
                 "outside HCC Advisor) or as a **CSV manifest** that can be "
                 "re-imported into another target database below.")
 
-    # Database filter
-    dbs_df = CentralQueries.get_target_databases()
-    if not dbs_df.empty:
-        dbs_df.columns = [c.lower() for c in dbs_df.columns]
-        db_options = {'All Databases': None}
-        for _, db in dbs_df.iterrows():
-            label = db.get('display_name') or db.get('database_name', f"db_{db.get('database_id')}")
-            db_options[label] = int(db.get('database_id'))
-    else:
-        db_options = {'All Databases': None}
+    # Database filter, keyed on database_id like the sidebar selector: two
+    # targets may share a display name (a name-keyed filter merged them).
+    db_labels = target_selector_labels(CentralQueries.get_target_databases())
+    db_options = [None] + list(db_labels)   # None = All Databases
 
     col1, col2 = st.columns(2)
     with col1:
-        default_label = 'All Databases'
-        if current_db_id:
-            for label, did in db_options.items():
-                if did == current_db_id:
-                    default_label = label
-                    break
-        default_idx = list(db_options.keys()).index(default_label)
-        selected_db = st.selectbox("Database Filter", list(db_options.keys()),
-                                    index=default_idx, key="export_db")
-        export_db_id = db_options[selected_db]
+        export_db_id = st.selectbox(
+            "Database Filter", db_options,
+            index=db_options.index(current_db_id) if current_db_id in db_labels else 0,
+            format_func=lambda did: 'All Databases' if did is None else db_labels[did],
+            key="export_db")
+        selected_db = 'All Databases' if export_db_id is None else db_labels[export_db_id]
     with col2:
         status_map = {
             'All': None,
@@ -224,7 +215,10 @@ def _render_export_section(current_db_id):
              "CSV = portable manifest re-importable into another database.",
     )
 
-    base_name = f"hcc_export_{selected_db.replace(' ', '_').lower()}_{export_status or 'all'}"
+    # A disambiguated label carries "(host/service)" or "[ID n]": keep the file
+    # name to word characters.
+    db_slug = re.sub(r'[^\w.-]+', '_', selected_db).strip('_').lower()
+    base_name = f"hcc_export_{db_slug}_{export_status or 'all'}"
 
     if export_format == "SQL script":
         include_indexes = st.checkbox(
@@ -305,26 +299,18 @@ def _render_import_section(current_db_id):
         "database for existence and current compression before it can be queued."
     )
 
-    dbs_df = CentralQueries.get_target_databases()
-    if dbs_df.empty:
+    # Keyed on database_id: with a name-keyed picker, a target sharing another
+    # one's display name could not be chosen (the plan went to the other one).
+    db_labels = target_selector_labels(CentralQueries.get_target_databases())
+    if not db_labels:
         st.info("No target databases registered. Add one in DB Connections first.")
         return
-    dbs_df.columns = [c.lower() for c in dbs_df.columns]
-    db_options = {}
-    for _, db in dbs_df.iterrows():
-        label = db.get('display_name') or db.get('database_name', f"db_{db.get('database_id')}")
-        db_options[label] = int(db.get('database_id'))
-
-    labels = list(db_options.keys())
-    default_idx = 0
-    if current_db_id:
-        for i, did in enumerate(db_options.values()):
-            if did == current_db_id:
-                default_idx = i
-                break
-    target_label = st.selectbox("Target Database for Import", labels,
-                                index=default_idx, key="import_target_db")
-    target_db_id = db_options[target_label]
+    db_ids = list(db_labels)
+    target_db_id = st.selectbox(
+        "Target Database for Import", db_ids,
+        index=db_ids.index(current_db_id) if current_db_id in db_labels else 0,
+        format_func=lambda did: db_labels[did], key="import_target_db")
+    target_label = db_labels[target_db_id]
 
     uploaded = st.file_uploader("CSV manifest", type=['csv'], key="import_csv_file")
     if uploaded is None:

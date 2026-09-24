@@ -270,6 +270,19 @@ def _gather_context(db_id, schema_filter=None, table_filter=None) -> dict:
     return context
 
 
+def _segment(row: dict) -> str:
+    """'P1' / 'P1.P1_S1' for a partition / subpartition row, '' for a table:
+    statuses, failures and growth are per segment, so siblings must differ."""
+    return '.'.join(str(row[k]) for k in ('partition_name', 'subpartition_name')
+                    if pd.notna(row.get(k)) and row.get(k))
+
+
+def _object_label(owner, name, row: dict) -> str:
+    """OWNER.TABLE, plus the partition / subpartition when the row has one."""
+    segment = _segment(row)
+    return f"{owner}.{name}" + (f" [{segment}]" if segment else '')
+
+
 def _build_prompt(context: dict, scope: str) -> str:
     """Build the analysis prompt from gathered data."""
     p = context.get('progress', {})
@@ -298,8 +311,7 @@ FORECAST:
         prompt += "| Owner | Table | Partition | Size MB | Hotness | Current | Advised | Status |\n"
         prompt += "|-------|-------|-----------|---------|---------|---------|---------|--------|\n"
         for c in candidates[:50]:
-            segment = '.'.join(str(c[k]) for k in ('partition_name', 'subpartition_name')
-                               if pd.notna(c.get(k)) and c.get(k)) or '-'
+            segment = _segment(c) or '-'
             prompt += (f"| {c.get('table_owner', '')} | {c.get('table_name', '')} | {segment} "
                       f"| {c.get('current_size_mb', 0):.0f} | {c.get('hotness_score', 0):.0f} "
                       f"| {c.get('current_compression', '')} | {c.get('recommended_strategy', '')} "
@@ -311,15 +323,17 @@ FORECAST:
     if failures:
         prompt += "RECENT FAILURES:\n"
         for fl in failures[:10]:
-            prompt += f"- {fl.get('table_owner', '')}.{fl.get('table_name', '')}: {fl.get('error_message', 'unknown')}\n"
+            label = _object_label(fl.get('table_owner', ''), fl.get('table_name', ''), fl)
+            prompt += f"- {label}: {fl.get('error_message', 'unknown')}\n"
         prompt += "\n"
 
     # Growth alerts
     growth = context.get('growth_alerts', [])
     if growth:
-        prompt += "GROWTH ALERTS (tables that grew >20% since compression):\n"
+        prompt += "GROWTH ALERTS (segments that grew >20% since compression):\n"
         for g in growth:
-            prompt += f"- {g.get('owner', '')}.{g.get('object_name', '')}: was {g.get('compressed_mb', 0)} MB, now {g.get('current_mb', 0)} MB (+{g.get('growth_pct', 0)}%)\n"
+            label = _object_label(g.get('owner', ''), g.get('object_name', ''), g)
+            prompt += f"- {label}: was {g.get('compressed_mb', 0)} MB, now {g.get('current_mb', 0)} MB (+{g.get('growth_pct', 0)}%)\n"
         prompt += "\n"
 
     prompt += """Provide your analysis in this format:
