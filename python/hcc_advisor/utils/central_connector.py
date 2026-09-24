@@ -534,9 +534,3 @@ class CentralConnector:
             log_db_error(e, statement, params)
             st.error(f"Central database DML error: {describe_db_error(e)}")
             return None
-
-
-@st.cache_resource
-def get_central_connector():
-    """Get cached central database connector"""
-    return CentralConnector()

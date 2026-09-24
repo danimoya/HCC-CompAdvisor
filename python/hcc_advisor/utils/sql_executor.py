@@ -113,8 +113,11 @@ def parse_sql_text(content: str) -> List[Tuple[str, str]]:
                 current_lines.append(line)
             continue
 
-        # Skip SQL*Plus directives
-        if _SQLPLUS_DIRECTIVES.match(line):
+        # Skip SQL*Plus directives. They only stand between statements: inside
+        # a PL/SQL block or a statement still being read, a line starting with
+        # SET / EXIT / HOST ... is SQL (MERGE/UPDATE ... SET, EXIT WHEN, a
+        # column name) and must be kept.
+        if not in_plsql and not current_lines and _SQLPLUS_DIRECTIVES.match(line):
             continue
 
         # Skip empty lines (unless in PL/SQL)
@@ -138,8 +141,10 @@ def parse_sql_text(content: str) -> List[Tuple[str, str]]:
             current_lines.append(line)
             continue
 
-        # Handle standalone slash (shouldn't happen outside PL/SQL but skip)
+        # A standalone slash outside PL/SQL runs the SQL buffer in SQL*Plus:
+        # it ends a statement written without a trailing semicolon.
         if _SLASH_LINE.match(line):
+            _flush_sql()
             continue
 
         # Regular SQL line

@@ -312,15 +312,14 @@ ORDS is optional and not required for the core dashboard or multi-database manag
 - [ ] No errors or warnings in test output
 
 ### Python Tests (if applicable)
-- [ ] Test dependencies installed:
+- [ ] Test dependencies installed (in `python/`):
   ```bash
-  pip install -r requirements-test.txt
+  pip install -r requirements.txt -r requirements-test.txt
   ```
-- [ ] All tests passing:
+- [ ] All tests passing and the coverage floor in `pytest.ini` met:
   ```bash
-  pytest -v
+  python -m pytest
   ```
-- [ ] Code coverage >= 80%
 
 ## Production Readiness
 
