@@ -4,7 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hcc-advisor"
-version = "2.0.0"
+# Single source of truth: hcc_advisor.__version__ (see [tool.hatch.version])
+dynamic = ["version"]
 description = "Oracle HCC Compression Analysis and Management Dashboard"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -32,8 +33,13 @@ ords = ["requests>=2.31.0", "urllib3>=2.1.0"]
 [project.scripts]
 hcc-advisor = "hcc_advisor.cli:main"
 
+[tool.hatch.version]
+path = "python/hcc_advisor/__init__.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["python/hcc_advisor"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "sql/central" = "hcc_advisor/sql/central"
+# SQL patches applied by Admin > SQL Patches and the deployment page's Upgrade
+"sql/patches" = "hcc_advisor/sql/patches"

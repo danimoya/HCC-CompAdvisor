@@ -137,6 +137,11 @@ class Config:
     # API Timeout
     API_TIMEOUT: int = 30  # seconds
 
+    # TCP connect timeout (seconds) for the direct central-DB connections of the
+    # startup schema check and the deployment page, so an unreachable host
+    # fails fast instead of blocking page loads for the driver's 60s default.
+    CENTRAL_CONNECT_TIMEOUT: int = int(os.getenv('CENTRAL_CONNECT_TIMEOUT', '10'))
+
     # Compression Strategies (Oracle 23c Free + HCC for Exadata)
     COMPRESSION_STRATEGIES: list = [
         'BASIC',
@@ -230,40 +235,61 @@ class Config:
         return _active_env_path is None and not os.getenv('CENTRAL_DB_PASSWORD')
 
     @classmethod
+    def connect_central(cls):
+        """Open a direct (unpooled) central-DB connection with a connect timeout."""
+        import oracledb
+        return oracledb.connect(
+            user=cls.CENTRAL_DB_USER, password=cls.CENTRAL_DB_PASSWORD,
+            dsn=cls.get_central_db_dsn(),
+            tcp_connect_timeout=cls.CENTRAL_CONNECT_TIMEOUT,
+        )
+
+    @classmethod
+    def get_schema_info(cls) -> dict:
+        """
+        Inspect the central schema over a single connection.
+
+        Returns {'deployed': bool, 'version': Optional[str]}. 'deployed' means
+        T_TARGET_DATABASES exists with the DB_HOST column (renamed from HOST in
+        2.0.0); 'version' is T_SCHEMA_METADATA.schema_version (None if absent).
+        Never raises: an unreachable DB reads as not deployed.
+        """
+        from hcc_advisor.utils.schema_version import DEPLOYED_CHECK_SQL
+
+        info = {'deployed': False, 'version': None}
+        try:
+            conn = cls.connect_central()
+        except Exception:
+            return info
+        try:
+            cur = conn.cursor()
+            cur.execute(DEPLOYED_CHECK_SQL)
+            info['deployed'] = cur.fetchone()[0] > 0
+            try:
+                cur.execute("SELECT value FROM t_schema_metadata WHERE key = 'schema_version'")
+                row = cur.fetchone()
+                info['version'] = row[0] if row else None
+            except Exception:
+                pass  # T_SCHEMA_METADATA missing: version unknown
+            cur.close()
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return info
+
+    @classmethod
     def is_schema_deployed(cls) -> bool:
         """Check if the central schema is deployed and has correct structure."""
-        try:
-            import oracledb
-            dsn = cls.get_central_db_dsn()
-            conn = oracledb.connect(user=cls.CENTRAL_DB_USER, password=cls.CENTRAL_DB_PASSWORD, dsn=dsn)
-            cur = conn.cursor()
-            # Verify table exists AND has the DB_HOST column (renamed from HOST in 2.0.0)
-            cur.execute("""
-                SELECT COUNT(*) FROM user_tab_columns
-                WHERE table_name = 'T_TARGET_DATABASES' AND column_name = 'DB_HOST'
-            """)
-            count = cur.fetchone()[0]
-            cur.close()
-            conn.close()
-            return count > 0
-        except Exception:
-            return False
+        return cls.get_schema_info()['deployed']
 
     @classmethod
     def get_schema_version(cls) -> Optional[str]:
         """Read schema version from T_SCHEMA_METADATA (returns None if not found)."""
-        try:
-            import oracledb
-            dsn = cls.get_central_db_dsn()
-            conn = oracledb.connect(user=cls.CENTRAL_DB_USER, password=cls.CENTRAL_DB_PASSWORD, dsn=dsn)
-            cur = conn.cursor()
-            cur.execute("SELECT value FROM t_schema_metadata WHERE key = 'schema_version'")
-            row = cur.fetchone()
-            cur.close()
-            conn.close()
-            return row[0] if row else None
-        except Exception:
-            return None
+        return cls.get_schema_info()['version']
 
     @classmethod
     def write_env_file(cls, settings: dict) -> Path:

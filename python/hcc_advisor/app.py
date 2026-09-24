@@ -10,6 +10,9 @@ import streamlit as st
 from hcc_advisor.config import config, Config
 from hcc_advisor import __version__
 from hcc_advisor.auth import AuthManager, render_logout_button
+from hcc_advisor.utils.schema_version import (
+    STATUS_NEWER, needs_upgrade, schema_status, version_notice,
+)
 
 # Page configuration MUST be the first Streamlit command, so it runs before any
 # auth/login widgets or the deployment wizard render.
@@ -28,10 +31,19 @@ st.set_page_config(
 _needs_setup = config.is_first_run()
 _needs_upgrade = False
 if not _needs_setup and config.CENTRAL_DB_PASSWORD:
-    if not st.session_state.get('setup_complete'):
-        _schema_ver = config.get_schema_version()
-        _schema_deployed = config.is_schema_deployed()
-        _needs_upgrade = (not _schema_deployed) or (_schema_ver is None) or (_schema_ver != __version__)
+    # The check opens a direct DB connection, so it runs until it passes once
+    # per session instead of on every rerun (i.e. every widget click).
+    if not st.session_state.get('setup_complete') and not st.session_state.get('schema_check_passed'):
+        _schema = config.get_schema_info()
+        _schema_status = schema_status(_schema['deployed'], _schema['version'], __version__)
+        # Only a missing schema, an unknown version or an older MAJOR.MINOR goes
+        # to the deployment page; a newer schema or a patch-level difference
+        # is only noted in the sidebar.
+        _needs_upgrade = needs_upgrade(_schema_status)
+        if not _needs_upgrade:
+            st.session_state['schema_check_passed'] = True
+            st.session_state['schema_version_notice'] = (
+                _schema_status, version_notice(_schema_status, _schema['version'], __version__))
 
 if (_needs_setup or _needs_upgrade) and not st.session_state.get('setup_complete'):
     # Gate the destructive deployment wizard behind authentication.
@@ -351,6 +363,13 @@ def main():
             st.success("Central DB Connected")
         else:
             st.error("Central DB Disconnected")
+
+        _status, _notice = st.session_state.get('schema_version_notice') or (None, None)
+        if _notice:
+            if _status == STATUS_NEWER:
+                st.warning(_notice)
+            else:
+                st.caption(_notice)
 
         # Toggles
         st.markdown("---")
