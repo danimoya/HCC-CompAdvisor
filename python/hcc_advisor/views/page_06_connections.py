@@ -86,6 +86,10 @@ def test_target_connection(conn_details: Dict) -> Tuple[bool, str, Optional[str]
         connect_kwargs = build_connect_kwargs(conn_details)
     except ValueError as e:
         return False, f"Connection failed: {e}", None
+    # Fail fast on an unreachable host instead of hanging the page
+    if config.TARGET_CONNECT_TIMEOUT > 0:
+        connect_kwargs['tcp_connect_timeout'] = config.TARGET_CONNECT_TIMEOUT
+    connection = None
     try:
         connection = oracledb.connect(**connect_kwargs)
         cursor = connection.cursor()
@@ -97,10 +101,15 @@ def test_target_connection(conn_details: Dict) -> Tuple[bool, str, Optional[str]
         cursor.execute("SELECT banner FROM v$version WHERE ROWNUM = 1")
         version = cursor.fetchone()[0]
         cursor.close()
-        connection.close()
         return True, "Connected successfully!", version
     except oracledb.Error as e:
         return False, f"Connection failed: {str(e)}", None
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except oracledb.Error:
+                pass
 
 
 ENVIRONMENTS = ['PRODUCTION', 'DEV', 'TEST', 'UAT', 'STAGING']

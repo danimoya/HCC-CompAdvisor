@@ -8,7 +8,7 @@ import streamlit as st
 import pandas as pd
 import time
 from hcc_advisor.utils.central_queries import CentralQueries
-from hcc_advisor.utils.target_queries import TargetQueries
+from hcc_advisor.utils.target_queries import TargetQueries, target_ddl_info
 from hcc_advisor.utils.target_connector import max_batch_concurrency
 from hcc_advisor.utils.leaf_segments import leaf_segments
 from hcc_advisor.utils.ui_refresh import schedule_rerun
@@ -259,11 +259,17 @@ def show_single_execution():
     table_name = selected_row['table_name']
     partition_name = selected_row.get('partition_name')
 
-    ddl = TargetQueries.generate_ddl(
-        owner, table_name, recommended_strategy, partition_name,
-        parallel_degree=parallel_degree
-    )
-    st.code(ddl, language="sql")
+    # Same version/platform rules as execution (ONLINE only where supported,
+    # no HCC on STANDARD targets), so the preview matches what would run.
+    try:
+        ddl = TargetQueries.generate_ddl(
+            owner, table_name, recommended_strategy, partition_name,
+            parallel_degree=parallel_degree,
+            **target_ddl_info(db_id)
+        )
+        st.code(ddl, language="sql")
+    except ValueError as e:
+        st.error(f"Cannot build DDL for this object: {e}")
 
     # Execute button
     st.markdown("---")

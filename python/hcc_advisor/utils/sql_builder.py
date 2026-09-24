@@ -256,6 +256,8 @@ def build_compression_script(
             MOVE is built for its target's version (ONLINE, UPDATE INDEXES or
             a plain MOVE) and HCC rows for a non-Exadata target are skipped.
     """
+    from hcc_advisor.utils.target_queries import canonical_compression
+
     if index_map is None:
         index_map = {}
     if targets is None:
@@ -326,7 +328,9 @@ def build_compression_script(
             lines.append(f"-- SKIPPED (invalid identifier): {segment}")
             lines.append("")
             continue
-        clause = _CLAUSE_MAP.get(str(comp_type).upper())
+        # Normalize spellings the rest of the app accepts (QUERY_HIGH, ADV_LOW,
+        # ADVANCED, ...) the same way generate_ddl does before the lookup.
+        clause = _CLAUSE_MAP.get(canonical_compression(comp_type))
         if clause is None:
             lines.append(f"-- SKIPPED (unsupported compression type {comp_type!r}): {owner}.{obj}")
             lines.append("")
