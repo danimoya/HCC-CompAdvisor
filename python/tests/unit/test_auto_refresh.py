@@ -1,13 +1,20 @@
 """
 Unit tests for in-session auto-refresh: the shared helper
 ``utils/ui_refresh.schedule_rerun`` and the four pages that use it
-(Run Analysis, Compress Tables, Session Browser, Scheduler).
+(Run Analysis, Compress Tables, Session Browser, Scheduler), plus the deferred
+mode app.py uses (``defer_reruns`` / ``run_deferred_rerun``), which moves the
+wait after the SQL Debug Console.
 
 Each page runs under ``streamlit.testing.v1.AppTest`` with the central/target
 query layers mocked, so no database is needed. The helper's ``time`` module and
 ``st.rerun`` are mocked, so an auto-refresh run ends instead of looping, and
 every data-source call, sleep and rerun is logged in one ordered event list:
 that is how the tests check that a page renders BEFORE it waits.
+
+The page tests call the page functions directly, without app.py, so there the
+page's own ``schedule_rerun`` call still waits in place (no ``defer_reruns``
+in the run). ``TestDeferredRerun`` and ``TestAppShellAutoRefresh`` cover the
+deferred path, the latter through the real app.py.
 """
 from contextlib import ExitStack
 from unittest.mock import MagicMock, call, patch
@@ -17,7 +24,7 @@ import pytest
 import streamlit as st
 from streamlit.testing.v1 import AppTest
 
-from hcc_advisor.utils import ui_refresh
+from hcc_advisor.utils import sql_debug, ui_refresh
 from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.target_queries import TargetQueries
 from hcc_advisor.views import (
@@ -26,6 +33,8 @@ from hcc_advisor.views import (
     page_07_sessions,
     page_12_scheduler,
 )
+
+from tests.unit.app_harness import app_shell, new_app
 
 TIMEOUT = 15  # seconds per AppTest run; generous for slow CI machines
 
@@ -186,6 +195,137 @@ class TestScheduleRerun:
     ])
     def test_countdown_format(self, seconds, text):
         assert ui_refresh._format_remaining(seconds) == text
+
+
+# ============================================================================
+# Deferred mode (what app.py does around the page)
+# ============================================================================
+
+DEFERRED_SCRIPT = """
+import streamlit as st
+from hcc_advisor.utils import ui_refresh
+from hcc_advisor.utils.ui_refresh import defer_reruns, run_deferred_rerun, schedule_rerun
+ss = st.session_state
+ss["runs"] = ss.get("runs", 0) + 1
+defer_reruns()
+st.markdown("page content")
+if not ss.get("skip_schedule"):
+    ss["result"] = schedule_rerun("toggle", ss["interval"])
+    if ss.get("second_key"):
+        schedule_rerun(ss["second_key"], 60)
+ss["sleeps_when_page_done"] = ui_refresh.time.sleep.call_count
+st.markdown("after the page")
+if ss.get("stop_before_end"):
+    st.stop()
+ss["deferred_result"] = run_deferred_rerun()
+"""
+
+
+def _deferred_app(toggle, interval, **state):
+    at = AppTest.from_string(DEFERRED_SCRIPT, default_timeout=TIMEOUT)
+    at.session_state["toggle"] = toggle
+    at.session_state["interval"] = interval
+    for key, value in state.items():
+        at.session_state[key] = value
+    return at
+
+
+class TestDeferredRerun:
+
+    def test_page_returns_at_once_and_the_wait_comes_last(self, rec):
+        at = _deferred_app(True, 5).run()
+        assert not at.exception
+        # schedule_rerun only recorded the refresh...
+        assert at.session_state["result"] is True
+        assert at.session_state["sleeps_when_page_done"] == 0
+        assert "after the page" in _texts(at.markdown)
+        # ...and run_deferred_rerun waited exactly as schedule_rerun would.
+        assert at.session_state["deferred_result"] is True
+        assert rec.time.sleep.call_args_list == [call(1.0)] * 5
+        rec.rerun.assert_called_once_with()
+        assert any(c.startswith("Auto-refresh on") for c in _texts(at.caption))
+        # The deferral ends with the run.
+        assert ui_refresh._PENDING_KEY not in at.session_state
+
+    def test_off_never_sleeps(self, rec):
+        at = _deferred_app(False, 5).run()
+        assert at.session_state["result"] is False
+        assert at.session_state["deferred_result"] is False
+        rec.time.sleep.assert_not_called()
+        rec.rerun.assert_not_called()
+
+    @pytest.mark.parametrize("interval, expected", [(0, 2), (0.5, 2), (2.5, 2.5), (30, 30)])
+    def test_interval_is_clamped_to_minimum(self, rec, interval, expected):
+        _deferred_app(True, interval).run()
+        assert rec.slept == pytest.approx(expected)
+        rec.rerun.assert_called_once_with()
+
+    def test_first_scheduled_refresh_wins(self, rec):
+        at = _deferred_app(True, 3, second_key="toggle2", toggle2=True).run()
+        assert rec.slept == 3
+        rec.rerun.assert_called_once_with()
+        assert at.session_state["deferred_result"] is True
+
+    def test_early_stop_never_reruns_and_leaves_nothing_behind(self, rec):
+        at = _deferred_app(True, 5, stop_before_end=True).run()
+        assert not at.exception
+        rec.time.sleep.assert_not_called()
+        rec.rerun.assert_not_called()
+        # Next run: the page (still toggled on) does not schedule this time.
+        # The refresh recorded by the stopped run must not fire now.
+        at.session_state["stop_before_end"] = False
+        at.session_state["skip_schedule"] = True
+        at.run()
+        assert at.session_state["deferred_result"] is False
+        rec.time.sleep.assert_not_called()
+        rec.rerun.assert_not_called()
+
+    def test_without_defer_the_page_still_waits_in_place(self, rec):
+        """A page rendered outside app.py (no defer_reruns in the run)."""
+        at = _helper_app(True, 3).run()
+        assert at.session_state["result"] is True
+        assert rec.slept == 3
+        assert ui_refresh._PENDING_KEY not in at.session_state
+
+
+# ============================================================================
+# app.py: the wait comes after the SQL Debug Console
+# ============================================================================
+
+class TestAppShellAutoRefresh:
+
+    def _run(self, rec, auto_refresh):
+        console = MagicMock(name="get_sql_log",
+                            side_effect=lambda: rec.events.append(("console",)) or [])
+        extra = [*_page_07_sources(rec), (sql_debug, "get_sql_log", console)]
+        with app_shell("Session Browser", extra=extra):
+            at = new_app()
+            at.session_state["sql_debug_enabled"] = True
+            at.session_state["session_auto_refresh"] = auto_refresh
+            at.run()
+        return at
+
+    def test_console_renders_before_the_wait(self, rec):
+        at = self._run(rec, auto_refresh=True)
+
+        assert not at.exception
+        assert "SQL Debug Console" in _texts(at.subheader)
+        assert len(at.tabs) == 3  # the Session Browser page itself
+        kinds = [e[0] for e in rec.events]
+        assert "console" in kinds and "sleep" in kinds, rec.events
+        # Page queries, then the console, then the whole wait, then the rerun.
+        assert kinds.index("console") < kinds.index("sleep")
+        assert "query" not in kinds[kinds.index("console"):]
+        rec.assert_rendered_before_waiting()
+        assert rec.slept == 5  # the page's default interval
+        rec.rerun.assert_called_once_with()
+
+    def test_off_renders_console_without_waiting(self, rec):
+        at = self._run(rec, auto_refresh=False)
+        assert not at.exception
+        assert "SQL Debug Console" in _texts(at.subheader)
+        rec.time.sleep.assert_not_called()
+        rec.rerun.assert_not_called()
 
 
 # ============================================================================
