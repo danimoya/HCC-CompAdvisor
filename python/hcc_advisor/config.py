@@ -132,7 +132,14 @@ class Config:
 
     # Target Database Connection Pool (per-target defaults)
     TARGET_POOL_MIN: int = 1
-    TARGET_POOL_MAX: int = 5
+    TARGET_POOL_MAX: int = int(os.getenv('TARGET_POOL_MAX', '5'))
+    # Connections of each target pool kept free for UI reads while a synchronous
+    # batch runs: batch_execute holds one connection per concurrent table for
+    # the whole MOVE, so its concurrency is capped at TARGET_POOL_MAX minus this.
+    # 2 = one for the page that started the batch (other tabs / reruns of the
+    # same session: monitor, schema lists) plus one for another session or the
+    # Scheduler page's drain/reconcile on the same target.
+    TARGET_POOL_UI_HEADROOM: int = 2
 
     # API Timeout
     API_TIMEOUT: int = 30  # seconds
@@ -140,7 +147,20 @@ class Config:
     # TCP connect timeout (seconds) for the direct central-DB connections of the
     # startup schema check and the deployment page, so an unreachable host
     # fails fast instead of blocking page loads for the driver's 60s default.
+    # Also used for the connections of the central connection pool.
     CENTRAL_CONNECT_TIMEOUT: int = int(os.getenv('CENTRAL_CONNECT_TIMEOUT', '10'))
+    # TCP connect timeout (seconds) for target-database pool connections and the
+    # direct connection test. 0 = driver default (60s).
+    TARGET_CONNECT_TIMEOUT: int = int(os.getenv('TARGET_CONNECT_TIMEOUT', '10'))
+    # Seconds a caller waits for a free connection of an exhausted pool (central
+    # or target) before failing with DPY-4005 instead of blocking forever.
+    # 0 = wait indefinitely (the driver's POOL_GETMODE_WAIT).
+    POOL_WAIT_TIMEOUT: int = int(os.getenv('POOL_WAIT_TIMEOUT', '30'))
+    # Per-round-trip limit (seconds) for interactive reads: the SELECT helpers
+    # (CentralConnector/TargetConnector.execute_query). DDL, PL/SQL, DML,
+    # DBMS_SCHEDULER calls and the analysis / compression paths run without it
+    # (see utils/db_timeouts.py). 0 = no limit.
+    DB_CALL_TIMEOUT: int = int(os.getenv('DB_CALL_TIMEOUT', '120'))
 
     # Compression Strategies (Oracle 23c Free + HCC for Exadata)
     COMPRESSION_STRATEGIES: list = [

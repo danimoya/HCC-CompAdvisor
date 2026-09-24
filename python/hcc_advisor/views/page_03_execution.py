@@ -9,6 +9,7 @@ import pandas as pd
 import time
 from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.target_queries import TargetQueries
+from hcc_advisor.utils.target_connector import max_batch_concurrency
 from hcc_advisor.utils.leaf_segments import leaf_segments
 from hcc_advisor.utils.ui_refresh import schedule_rerun
 from hcc_advisor.utils.sql_builder import (
@@ -17,6 +18,16 @@ from hcc_advisor.utils.sql_builder import (
 )
 from hcc_advisor.config import config
 from hcc_advisor.auth import AuthManager, ROLE_OPERATOR
+from hcc_advisor.views.page_08_quick_scan import _bulk_submit
+
+BACKGROUND_LABEL = "Run as background jobs (DBMS_SCHEDULER) — recommended"
+BACKGROUND_HELP = (
+    "Queue each table as a DBMS_SCHEDULER job on the target and return at once: the "
+    "ALTER TABLE ... MOVE runs inside the database, not in this browser session, "
+    "throttled by the target's DOP budget (CPU_COUNT/2). Follow it on the Scheduler page. "
+    "Untick to run the MOVE synchronously here; the page then stays busy until it "
+    "finishes (fine for a single small table)."
+)
 
 
 def _db_label_for(db_id):
@@ -54,6 +65,47 @@ def _render_dry_run(operations_df: pd.DataFrame, db_label: str,
         mime="text/plain",
         key=download_key,
     )
+
+
+def submit_background_compression(items, db_id, parallel_degree):
+    """Queue items as DBMS_SCHEDULER jobs and show the outcome.
+
+    Every item becomes a QUEUED history row (segments already queued or
+    running are skipped as duplicates); the target's queue is then drained in
+    FIFO order within its DOP budget, and whatever does not fit stays QUEUED
+    for the Scheduler page. Returns once the jobs are queued / created: the
+    MOVEs run inside the target database, not in this script thread.
+
+    Args:
+        items: dicts with owner, table_name, compression_type and optional
+            partition_name / subpartition_name
+        db_id: target database id
+        parallel_degree: DOP of each job
+    """
+    items = [{**item, 'database_id': db_id, 'dop': parallel_degree} for item in items]
+    with st.spinner(f"Queueing {len(items)} compression job(s)..."):
+        result = _bulk_submit(items, db_id, None, parallel_degree)
+
+    summary = (f"Queued: {result.get('added', 0)} · "
+               f"Submitted to DBMS_SCHEDULER: {result['submitted']} · "
+               f"Waiting in queue: {result['queued']} · "
+               f"Already queued/running: {result['duplicates']} · "
+               f"Failed: {result['failed']}")
+    if result['failed']:
+        st.warning(summary)
+    else:
+        st.success(summary)
+    errors = result.get('errors') or []
+    if errors:
+        with st.expander(f"Details ({len(errors)})", expanded=bool(result['failed'])):
+            for err in errors:
+                st.text(err)
+    st.info(
+        "The jobs run on the target database, independent of this page. Track them on "
+        "the **Scheduler** page (sidebar); items still waiting are submitted there as "
+        "DOP budget frees up. Submitted/waiting counts cover this target's whole queue."
+    )
+    return result
 
 
 def show_execution_page():
@@ -158,6 +210,13 @@ def show_single_execution():
             disabled=dry_run,
             help="Required to run the real DDL. Ignored in dry-run mode."
         )
+        single_background = st.checkbox(
+            BACKGROUND_LABEL,
+            value=True,
+            key="single_background",
+            disabled=dry_run,
+            help=BACKGROUND_HELP
+        )
 
     # Display details
     selected_row = df.iloc[selected_index]
@@ -215,7 +274,9 @@ def show_single_execution():
     col1, col2, col3 = st.columns([1, 1, 1])
 
     with col2:
-        button_label = "Preview DDL" if dry_run else "Execute Compression"
+        button_label = ("Preview DDL" if dry_run
+                        else "Submit Background Job" if single_background
+                        else "Execute Compression")
         execute_button = st.button(
             button_label,
             disabled=(not dry_run) and (not confirm_execution),
@@ -243,6 +304,15 @@ def show_single_execution():
             _render_dry_run(op_df, db_label, include_indexes=True,
                             download_key="single_dry_run_download",
                             status_label="Dry Run (single table)")
+        elif not confirm_execution:
+            st.error("Check 'Confirm Execution' to run the compression.")
+        elif single_background:
+            submit_background_compression([{
+                'owner': owner,
+                'table_name': table_name,
+                'compression_type': recommended_strategy,
+                'partition_name': partition_name if partition_name and pd.notna(partition_name) else None,
+            }], db_id, parallel_degree)
         else:
             with st.spinner("Executing compression..."):
                 result = TargetQueries.execute_compression(
@@ -343,6 +413,17 @@ def show_batch_execution():
         if db_id:
             cpu_count_batch = TargetQueries.get_cpu_count(db_id)
             max_parallel_batch = max(1, cpu_count_batch // 2)
+        # A synchronous batch holds one pooled target connection per concurrent
+        # table: cap it so TARGET_POOL_UI_HEADROOM connections stay free for the
+        # page queries of this and other sessions (see max_batch_concurrency).
+        max_concurrency = max(1, min(max_parallel_batch, max_batch_concurrency()))
+
+        batch_background = st.checkbox(
+            BACKGROUND_LABEL,
+            value=True,
+            key="batch_background",
+            help=BACKGROUND_HELP
+        )
 
         col1, col2, col3 = st.columns(3)
 
@@ -360,10 +441,15 @@ def show_batch_execution():
             batch_concurrency = st.slider(
                 "Concurrent Tables",
                 min_value=1,
-                max_value=max_parallel_batch,
+                max_value=max_concurrency,
                 value=1,
                 key="batch_concurrency",
-                help=f"How many tables to compress simultaneously (max CPU_COUNT/2 = {max_parallel_batch})"
+                disabled=batch_background,
+                help=(f"How many tables to compress simultaneously in this page "
+                      f"(max {max_concurrency}: CPU_COUNT/2, and the target pool's "
+                      f"{config.TARGET_POOL_MAX} connections minus "
+                      f"{config.TARGET_POOL_UI_HEADROOM} kept for page queries). "
+                      f"Background jobs are throttled by the Scheduler's DOP budget instead.")
             )
 
         with col3:
@@ -385,7 +471,9 @@ def show_batch_execution():
         col1, col2, col3 = st.columns([1, 1, 1])
 
         with col2:
-            batch_button_label = "Preview DDL" if batch_dry_run else "Execute Batch"
+            batch_button_label = ("Preview DDL" if batch_dry_run
+                                  else "Queue Background Jobs" if batch_background
+                                  else "Execute Batch")
             batch_go = st.button(
                 batch_button_label,
                 use_container_width=True,
@@ -420,6 +508,8 @@ def show_batch_execution():
                 _render_dry_run(op_df, db_label, include_indexes=True,
                                 download_key="batch_dry_run_download",
                                 status_label="Dry Run (batch)")
+            elif not batch_confirm:
+                st.error("Check 'Confirm Batch Execution' to run the compressions.")
             else:
                 # Build proper items list from selected recommendation IDs
                 items = []
@@ -435,17 +525,20 @@ def show_batch_execution():
                             'partition_name': pn if pd.notna(pn) else None
                         })
 
-                with st.spinner(f"Executing {len(items)} compressions..."):
-                    result = TargetQueries.batch_execute(
-                        db_id, items,
-                        dry_run=False,
-                        parallel_degree=batch_parallel,
-                        concurrency=batch_concurrency
-                    )
+                if batch_background:
+                    submit_background_compression(items, db_id, batch_parallel)
+                else:
+                    with st.spinner(f"Executing {len(items)} compressions..."):
+                        result = TargetQueries.batch_execute(
+                            db_id, items,
+                            dry_run=False,
+                            parallel_degree=batch_parallel,
+                            concurrency=batch_concurrency
+                        )
 
-                    if result.get('errors', 0) > 0:
-                        st.warning(f"Batch completed with {result.get('errors')} errors")
-                    st.success(f"Batch execution: {result.get('success', 0)} success, {result.get('errors', 0)} errors")
+                        if result.get('errors', 0) > 0:
+                            st.warning(f"Batch completed with {result.get('errors')} errors")
+                        st.success(f"Batch execution: {result.get('success', 0)} success, {result.get('errors', 0)} errors")
 
 
 def show_execution_monitor():

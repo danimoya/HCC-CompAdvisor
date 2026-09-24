@@ -5,6 +5,7 @@ Supports multiple simultaneous connections keyed by database_id.
 """
 
 import re
+import threading
 import oracledb
 import pandas as pd
 import time
@@ -14,6 +15,9 @@ import streamlit as st
 from hcc_advisor.config import config
 from hcc_advisor.utils.logger import log_db_error, log_info, log_debug, log_error
 from hcc_advisor.utils.sql_debug import capture_sql, is_debug_enabled
+from hcc_advisor.utils.db_timeouts import (
+    connection_call_timeout, describe_db_error, pool_timeout_kwargs, read_call_timeout_ms,
+)
 
 
 # Values of T_TARGET_DATABASES.CONNECTION_MODE. SYSOPER is deliberately not
@@ -75,11 +79,32 @@ def build_connect_kwargs(conn_config: Dict[str, Any]) -> Dict[str, Any]:
     return connect_kwargs
 
 
+def max_batch_concurrency() -> int:
+    """Most tables a synchronous batch (TargetQueries.batch_execute) may compress
+    at once on one target: each worker holds one pooled connection for its whole
+    MOVE, so TARGET_POOL_UI_HEADROOM connections stay free for UI reads."""
+    return max(1, config.TARGET_POOL_MAX - config.TARGET_POOL_UI_HEADROOM)
+
+
 class TargetConnector:
     """Oracle connection pool manager for target databases"""
 
     _pools: Dict[int, oracledb.ConnectionPool] = {}
     _pool_configs: Dict[int, Dict[str, Any]] = {}
+    # One lock per database_id serializes creating / replacing / closing that
+    # target's pool, so concurrent callers (batch workers, several sessions)
+    # share one pool instead of each creating one and leaking the others.
+    # _locks_guard only protects the lock registry itself.
+    _pool_locks: Dict[int, threading.RLock] = {}
+    _locks_guard = threading.Lock()
+
+    @classmethod
+    def _pool_lock(cls, database_id: int) -> threading.RLock:
+        with cls._locks_guard:
+            lock = cls._pool_locks.get(database_id)
+            if lock is None:
+                lock = cls._pool_locks[database_id] = threading.RLock()
+            return lock
 
     @classmethod
     def get_pool(cls, database_id: int, conn_config: Dict[str, Any]) -> oracledb.ConnectionPool:
@@ -96,29 +121,31 @@ class TargetConnector:
             oracledb.ConnectionPool: Connection pool for the target database
         """
         connect_kwargs = build_connect_kwargs(conn_config)
-        if database_id in cls._pools:
-            # Reuse the pool only while it was built from the same login. A target
-            # re-registered with another user/password/mode (e.g. switched to
-            # SYS AS SYSDBA) must not keep using a pool authenticated the old way.
-            if cls._pool_configs.get(database_id) == connect_kwargs:
-                return cls._pools[database_id]
-            log_info(f"Target pool for database_id={database_id} has a stale login; recreating")
-            cls.close_pool(database_id)
+        with cls._pool_lock(database_id):
+            if database_id in cls._pools:
+                # Reuse the pool only while it was built from the same login. A target
+                # re-registered with another user/password/mode (e.g. switched to
+                # SYS AS SYSDBA) must not keep using a pool authenticated the old way.
+                if cls._pool_configs.get(database_id) == connect_kwargs:
+                    return cls._pools[database_id]
+                log_info(f"Target pool for database_id={database_id} has a stale login; recreating")
+                cls.close_pool(database_id)
 
-        try:
-            pool = oracledb.create_pool(
-                **connect_kwargs,
-                min=config.TARGET_POOL_MIN,
-                max=config.TARGET_POOL_MAX,
-                increment=1,
-            )
-            cls._pools[database_id] = pool
-            cls._pool_configs[database_id] = connect_kwargs
-            log_info(f"Target pool created for database_id={database_id}")
-            return pool
-        except oracledb.Error as e:
-            log_error(e, f"TargetConnector.get_pool(database_id={database_id})")
-            raise
+            try:
+                pool = oracledb.create_pool(
+                    **connect_kwargs,
+                    min=config.TARGET_POOL_MIN,
+                    max=config.TARGET_POOL_MAX,
+                    increment=1,
+                    **pool_timeout_kwargs(config.TARGET_CONNECT_TIMEOUT),
+                )
+                cls._pools[database_id] = pool
+                cls._pool_configs[database_id] = connect_kwargs
+                log_info(f"Target pool created for database_id={database_id}")
+                return pool
+            except oracledb.Error as e:
+                log_error(e, f"TargetConnector.get_pool(database_id={database_id})")
+                raise
 
     @classmethod
     @contextmanager
@@ -162,7 +189,8 @@ class TargetConnector:
         query: str,
         params: Optional[Dict[str, Any]] = None,
         conn_config: Optional[Dict[str, Any]] = None,
-        raise_on_error: bool = False
+        raise_on_error: bool = False,
+        call_timeout: Optional[float] = None
     ) -> pd.DataFrame:
         """
         Execute SELECT query on a target database and return results as DataFrame
@@ -174,6 +202,8 @@ class TargetConnector:
             conn_config: Optional connection configuration dict
             raise_on_error: Re-raise database errors to the caller instead of
                 showing st.error and returning an empty DataFrame
+            call_timeout: Per-round-trip limit in seconds (0 = none); None =
+                DB_CALL_TIMEOUT, or none inside db_timeouts.long_operation()
 
         Returns:
             pd.DataFrame: Query results
@@ -181,7 +211,8 @@ class TargetConnector:
         _t0 = time.perf_counter() if is_debug_enabled() else None
         try:
             log_debug(f"[Target db_id={database_id}] Executing query", query_preview=query[:200])
-            with cls.get_connection(database_id, conn_config) as conn:
+            with cls.get_connection(database_id, conn_config) as conn, \
+                    connection_call_timeout(conn, read_call_timeout_ms(call_timeout)):
                 cursor = conn.cursor()
 
                 if params:
@@ -207,7 +238,7 @@ class TargetConnector:
             log_db_error(e, query, params)
             if raise_on_error:
                 raise
-            st.error(f"Target database (id={database_id}) query error: {e}")
+            st.error(f"Target database (id={database_id}) query error: {describe_db_error(e)}")
             return pd.DataFrame()
 
     @classmethod
@@ -265,7 +296,7 @@ class TargetConnector:
             log_db_error(e, statement, params)
             if raise_on_error:
                 raise
-            st.error(f"Target database (id={database_id}) DML error: {e}")
+            st.error(f"Target database (id={database_id}) DML error: {describe_db_error(e)}")
             return 0
 
     @classmethod
@@ -321,7 +352,7 @@ class TargetConnector:
             log_db_error(e, plsql_block, params)
             if raise_on_error:
                 raise
-            st.error(f"Target database (id={database_id}) PL/SQL execution error: {e}")
+            st.error(f"Target database (id={database_id}) PL/SQL execution error: {describe_db_error(e)}")
             return False
 
     @classmethod
@@ -369,7 +400,7 @@ class TargetConnector:
                 capture_sql(f'target(id={database_id})', 'PROCEDURE', f"CALL {procedure_name}",
                             status='ERROR', error=str(e), duration_ms=(time.perf_counter() - _t0) * 1000)
             log_error(e, f"TargetConnector.execute_procedure(db_id={database_id}, proc={procedure_name})")
-            st.error(f"Target database (id={database_id}) procedure execution error: {e}")
+            st.error(f"Target database (id={database_id}) procedure execution error: {describe_db_error(e)}")
             return None
 
     @classmethod
@@ -464,7 +495,7 @@ class TargetConnector:
                 capture_sql(f'target(id={database_id})', 'PLSQL', plsql_block, in_params,
                             status='ERROR', error=str(e), duration_ms=(time.perf_counter() - _t0) * 1000)
             log_db_error(e, plsql_block, in_params)
-            st.error(f"Target database (id={database_id}) PL/SQL execution error: {e}")
+            st.error(f"Target database (id={database_id}) PL/SQL execution error: {describe_db_error(e)}")
             raise
 
     @classmethod
@@ -537,7 +568,7 @@ class TargetConnector:
                 capture_sql(f'target(id={database_id})', 'FUNCTION', f"CURSOR: {function_call}", params,
                             status='ERROR', error=str(e), duration_ms=(time.perf_counter() - _t0) * 1000)
             log_error(e, f"TargetConnector.call_function_cursor(db_id={database_id}, func={function_call})")
-            st.error(f"Target database (id={database_id}) function cursor execution error: {e}")
+            st.error(f"Target database (id={database_id}) function cursor execution error: {describe_db_error(e)}")
             return pd.DataFrame()
 
     @classmethod
@@ -562,7 +593,7 @@ class TargetConnector:
                 return True
         except Exception as e:
             log_error(e, f"TargetConnector.test_connection_by_id(db_id={database_id})")
-            st.error(f"Target database (id={database_id}) connection test failed: {e}")
+            st.error(f"Target database (id={database_id}) connection test failed: {describe_db_error(e)}")
             return False
 
     @classmethod
@@ -583,7 +614,10 @@ class TargetConnector:
         """
         connection = None
         try:
-            connection = oracledb.connect(**build_connect_kwargs(conn_config))
+            connect_kwargs = build_connect_kwargs(conn_config)
+            if config.TARGET_CONNECT_TIMEOUT > 0:
+                connect_kwargs['tcp_connect_timeout'] = config.TARGET_CONNECT_TIMEOUT
+            connection = oracledb.connect(**connect_kwargs)
             cursor = connection.cursor()
             cursor.execute("SELECT 1 FROM DUAL")
             cursor.fetchone()
@@ -592,7 +626,7 @@ class TargetConnector:
             return True
         except (oracledb.Error, ValueError) as e:
             log_error(e, f"TargetConnector.test_connection_direct(host={conn_config.get('host', '?')})")
-            st.error(f"Target database connection test failed: {e}")
+            st.error(f"Target database connection test failed: {describe_db_error(e)}")
             return False
         finally:
             if connection:
@@ -609,14 +643,15 @@ class TargetConnector:
         Args:
             database_id: Unique identifier for the target database
         """
-        if database_id in cls._pools:
-            try:
-                cls._pools[database_id].close()
-                log_info(f"[Target db_id={database_id}] Connection pool closed")
-            except oracledb.Error as e:
-                log_error(e, f"TargetConnector.close_pool(db_id={database_id})")
-            del cls._pools[database_id]
-            cls._pool_configs.pop(database_id, None)
+        with cls._pool_lock(database_id):
+            if database_id in cls._pools:
+                try:
+                    cls._pools[database_id].close()
+                    log_info(f"[Target db_id={database_id}] Connection pool closed")
+                except oracledb.Error as e:
+                    log_error(e, f"TargetConnector.close_pool(db_id={database_id})")
+                del cls._pools[database_id]
+                cls._pool_configs.pop(database_id, None)
 
     @classmethod
     def close_all_pools(cls):

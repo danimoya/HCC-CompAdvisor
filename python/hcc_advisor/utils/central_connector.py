@@ -6,6 +6,7 @@ all analysis results, strategies, and target database registrations.
 
 import oracledb
 import pandas as pd
+import threading
 import time
 from typing import Optional, Dict, Any, List
 from contextlib import contextmanager
@@ -13,40 +14,48 @@ import streamlit as st
 from hcc_advisor.config import config
 from hcc_advisor.utils.logger import log_db_error, log_info, log_debug, log_error
 from hcc_advisor.utils.sql_debug import capture_sql, is_debug_enabled
+from hcc_advisor.utils.db_timeouts import (
+    connection_call_timeout, describe_db_error, pool_timeout_kwargs, read_call_timeout_ms,
+)
 
 
 class CentralConnector:
     """Oracle connection pool manager for the central metadata database"""
 
     _pool: Optional[oracledb.ConnectionPool] = None
+    # Serializes pool creation/replacement: concurrent first callers (several
+    # sessions, worker threads) share one pool instead of each creating one.
+    _pool_lock = threading.RLock()
 
     @classmethod
     def initialize_pool(cls, force_reinit: bool = False):
         """Initialize connection pool to central database"""
-        if cls._pool is not None and not force_reinit:
-            return
+        with cls._pool_lock:
+            if cls._pool is not None and not force_reinit:
+                return
 
-        if cls._pool is not None:
+            if cls._pool is not None:
+                try:
+                    cls._pool.close()
+                except:
+                    pass
+                cls._pool = None
+
             try:
-                cls._pool.close()
-            except:
-                pass
-            cls._pool = None
-
-        try:
-            cls._pool = oracledb.create_pool(
-                user=config.CENTRAL_DB_USER,
-                password=config.CENTRAL_DB_PASSWORD,
-                dsn=f"{config.CENTRAL_DB_HOST}:{config.CENTRAL_DB_PORT}/{config.CENTRAL_DB_SERVICE}",
-                min=config.CENTRAL_POOL_MIN,
-                max=config.CENTRAL_POOL_MAX,
-                increment=1
-            )
-            log_info("Central database connection pool initialized")
-        except oracledb.Error as e:
-            log_error(e, "CentralConnector.initialize_pool")
-            st.error(f"Failed to create central DB connection pool: {e}")
-            raise
+                cls._pool = oracledb.create_pool(
+                    user=config.CENTRAL_DB_USER,
+                    password=config.CENTRAL_DB_PASSWORD,
+                    dsn=f"{config.CENTRAL_DB_HOST}:{config.CENTRAL_DB_PORT}/{config.CENTRAL_DB_SERVICE}",
+                    min=config.CENTRAL_POOL_MIN,
+                    max=config.CENTRAL_POOL_MAX,
+                    increment=1,
+                    **pool_timeout_kwargs(config.CENTRAL_CONNECT_TIMEOUT),
+                )
+                log_info("Central database connection pool initialized")
+            except oracledb.Error as e:
+                log_error(e, "CentralConnector.initialize_pool")
+                st.error(f"Failed to create central DB connection pool: {describe_db_error(e)}")
+                raise
 
     @classmethod
     @contextmanager
@@ -57,12 +66,14 @@ class CentralConnector:
         Yields:
             oracledb.Connection: Database connection to central database
         """
-        if cls._pool is None:
+        pool = cls._pool
+        if pool is None:
             cls.initialize_pool()
+            pool = cls._pool
 
         connection = None
         try:
-            connection = cls._pool.acquire()
+            connection = pool.acquire()
             yield connection
         except oracledb.Error as e:
             log_error(e, "CentralConnector.get_connection")
@@ -70,15 +81,16 @@ class CentralConnector:
             # caller's statements are the caller's to report (execute_* show
             # their own st.error unless raise_on_error=True).
             if connection is None:
-                st.error(f"Central database connection error: {e}")
+                st.error(f"Central database connection error: {describe_db_error(e)}")
             raise
         finally:
             if connection:
-                cls._pool.release(connection)
+                pool.release(connection)
 
     @classmethod
     def execute_query(cls, query: str, params: Optional[Dict[str, Any]] = None,
-                      raise_on_error: bool = False) -> pd.DataFrame:
+                      raise_on_error: bool = False,
+                      call_timeout: Optional[float] = None) -> pd.DataFrame:
         """
         Execute SELECT query on central database and return results as DataFrame
 
@@ -87,6 +99,8 @@ class CentralConnector:
             params: Query parameters
             raise_on_error: Re-raise database errors to the caller instead of
                 showing st.error and returning an empty DataFrame
+            call_timeout: Per-round-trip limit in seconds (0 = none); None =
+                DB_CALL_TIMEOUT, or none inside db_timeouts.long_operation()
 
         Returns:
             pd.DataFrame: Query results
@@ -94,7 +108,8 @@ class CentralConnector:
         _t0 = time.perf_counter() if is_debug_enabled() else None
         try:
             log_debug(f"[Central] Executing query", query_preview=query[:200])
-            with cls.get_connection() as conn:
+            with cls.get_connection() as conn, \
+                    connection_call_timeout(conn, read_call_timeout_ms(call_timeout)):
                 cursor = conn.cursor()
 
                 if params:
@@ -120,7 +135,7 @@ class CentralConnector:
             log_db_error(e, query, params)
             if raise_on_error:
                 raise
-            st.error(f"Central database query error: {e}")
+            st.error(f"Central database query error: {describe_db_error(e)}")
             return pd.DataFrame()
 
     @classmethod
@@ -169,7 +184,7 @@ class CentralConnector:
             log_db_error(e, statement, params)
             if raise_on_error:
                 raise
-            st.error(f"Central database DML error: {e}")
+            st.error(f"Central database DML error: {describe_db_error(e)}")
             return 0
 
     @classmethod
@@ -216,7 +231,7 @@ class CentralConnector:
             log_db_error(e, plsql_block, params)
             if raise_on_error:
                 raise
-            st.error(f"Central database PL/SQL execution error: {e}")
+            st.error(f"Central database PL/SQL execution error: {describe_db_error(e)}")
             return False
 
     @classmethod
@@ -256,7 +271,7 @@ class CentralConnector:
                 capture_sql('central', 'PROCEDURE', f"CALL {procedure_name}",
                             status='ERROR', error=str(e), duration_ms=(time.perf_counter() - _t0) * 1000)
             log_error(e, f"CentralConnector.execute_procedure({procedure_name})")
-            st.error(f"Central database procedure execution error: {e}")
+            st.error(f"Central database procedure execution error: {describe_db_error(e)}")
             return None
 
     @classmethod
@@ -346,7 +361,7 @@ class CentralConnector:
                 capture_sql('central', 'PLSQL', plsql_block, in_params,
                             status='ERROR', error=str(e), duration_ms=(time.perf_counter() - _t0) * 1000)
             log_db_error(e, plsql_block, in_params)
-            st.error(f"Central database PL/SQL execution error: {e}")
+            st.error(f"Central database PL/SQL execution error: {describe_db_error(e)}")
             raise
 
     @classmethod
@@ -410,7 +425,7 @@ class CentralConnector:
                 capture_sql('central', 'FUNCTION', f"CURSOR: {function_call}", params,
                             status='ERROR', error=str(e), duration_ms=(time.perf_counter() - _t0) * 1000)
             log_error(e, f"CentralConnector.call_function_cursor({function_call})")
-            st.error(f"Central database function cursor execution error: {e}")
+            st.error(f"Central database function cursor execution error: {describe_db_error(e)}")
             return pd.DataFrame()
 
     @classmethod
@@ -431,19 +446,20 @@ class CentralConnector:
                 return True
         except oracledb.Error as e:
             log_error(e, "CentralConnector.test_connection")
-            st.error(f"Central database connection test failed: {e}")
+            st.error(f"Central database connection test failed: {describe_db_error(e)}")
             return False
 
     @classmethod
     def close_pool(cls):
         """Close central database connection pool"""
-        if cls._pool:
-            try:
-                cls._pool.close()
-                log_info("[Central] Connection pool closed")
-            except oracledb.Error as e:
-                log_error(e, "CentralConnector.close_pool")
-            cls._pool = None
+        with cls._pool_lock:
+            if cls._pool:
+                try:
+                    cls._pool.close()
+                    log_info("[Central] Connection pool closed")
+                except oracledb.Error as e:
+                    log_error(e, "CentralConnector.close_pool")
+                cls._pool = None
 
     @classmethod
     def execute_dml_returning(
@@ -516,7 +532,7 @@ class CentralConnector:
                 capture_sql('central', 'DML', statement, params,
                             status='ERROR', error=str(e), duration_ms=(time.perf_counter() - _t0) * 1000)
             log_db_error(e, statement, params)
-            st.error(f"Central database DML error: {e}")
+            st.error(f"Central database DML error: {describe_db_error(e)}")
             return None
 
 
