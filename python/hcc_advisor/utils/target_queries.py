@@ -246,6 +246,26 @@ def segments_overlap(part_a, sub_a, part_b, sub_b) -> bool:
     return str(sub_a).upper() == str(sub_b).upper()
 
 
+# Function-based unique index on T_COMPRESSION_HISTORY (01_central_schema.sql,
+# patch 20260924-history-unique-open-segment): at most one QUEUED / IN_PROGRESS
+# row per (database, owner, table, partition, subpartition). Without the patch
+# the same rule is only checked by a query, which two sessions can race.
+OPEN_SEGMENT_INDEX = 'UNQ_HISTORY_OPEN_SEGMENT'
+
+
+def _is_open_segment_conflict(error) -> bool:
+    """True for ORA-00001 raised by UNQ_HISTORY_OPEN_SEGMENT (an exception or an
+    executemany batch error): the segment already has a queued or running row."""
+    text = str(getattr(error, 'message', None) or error).upper()
+    return 'ORA-00001' in text and OPEN_SEGMENT_INDEX in text
+
+
+def _already_open_error(label: str, open_row: Dict[str, Any], outcome: str) -> str:
+    """Refusal message for a segment that has an open row (see _open_segment_row)."""
+    return (f"{label} is already queued or running (history_id {open_row['history_id']}, "
+            f"{open_row['status']}): {outcome} - see the Scheduler page")
+
+
 def _history_compression_type(value) -> str:
     """Compression type as stored in T_COMPRESSION_HISTORY: CHK_HISTORY_COMPRESSION_TYPE
     accepts 'QUERY HIGH' but not the 'QUERY_HIGH' spelling generate_ddl also takes."""
@@ -1699,6 +1719,11 @@ class TargetQueries:
         Returns:
             dict with execution result. An invalid name/type/DOP (generate_ddl
             ValueError) is returned as {'success': False, 'error': ...}.
+            Nothing is run without an IN_PROGRESS history row:
+            {'success': False, 'duplicate': True, 'error'} when the segment is
+            already queued or running (its open row, or the unique index
+            rejecting the insert); {'success': False, 'error'} when the row
+            could not be checked or written.
         """
         # Handle None/NaN partition name
         if partition_name is not None and pd.isna(partition_name):
@@ -1752,6 +1777,20 @@ class TargetQueries:
         except Exception:
             pass
 
+        # One open history row per segment: a segment that is already queued
+        # or running is not moved a second time. UNQ_HISTORY_OPEN_SEGMENT makes
+        # this race-free (the insert below is then rejected); without the
+        # patch this check is the only guard.
+        label = _segment_label(owner, table_name, partition_name)
+        try:
+            open_row = TargetQueries._open_segment_row(database_id, owner, table_name, partition_name)
+        except Exception as e:
+            return {'success': False,
+                    'error': f"Could not check the history of {label}, not compressed: {e}"}
+        if open_row:
+            return {'success': False, 'duplicate': True,
+                    'error': _already_open_error(label, open_row, "not compressed again")}
+
         # Insert IN_PROGRESS history record
         start_dt = datetime.now()
         history_record = {
@@ -1770,18 +1809,35 @@ class TargetQueries:
             'executed_by': executed_by or _acting_user(),
         }
         history_id = CentralQueries.store_compression_history(database_id, history_record)
+        if not history_id:
+            # No IN_PROGRESS row, no MOVE. The usual cause is the unique index:
+            # another session queued or started this segment since the check
+            # above. Any other failure blocks the run too: an untracked MOVE is
+            # invisible to the scheduler's overlap check and DOP budget, to
+            # reconcile, to the savings reports and to rollback.
+            try:
+                open_row = TargetQueries._open_segment_row(database_id, owner, table_name,
+                                                           partition_name)
+            except Exception:
+                open_row = None
+            if open_row:
+                return {'success': False, 'duplicate': True,
+                        'error': _already_open_error(label, open_row, "not compressed again")}
+            return {'success': False,
+                    'error': f"Could not record {label} in the compression history, "
+                             f"so it was not compressed"}
         # The reconciler must not reap this row while this call is running.
         _set_active(_ACTIVE_HISTORY_IDS, history_id, True)
         try:
             return TargetQueries._run_compression_ddl(
                 database_id, owner, table_name, compression_type, partition_name,
-                parallel_degree, ddl_exec, clause, orig_size, history_id, seg_q, seg_params)
+                parallel_degree, ddl_exec, orig_size, history_id, seg_q, seg_params)
         finally:
             _set_active(_ACTIVE_HISTORY_IDS, history_id, False)
 
     @staticmethod
     def _run_compression_ddl(database_id, owner, table_name, compression_type, partition_name,
-                             parallel_degree, ddl_exec, clause, orig_size, history_id,
+                             parallel_degree, ddl_exec, orig_size, history_id,
                              seg_q, seg_params) -> Dict[str, Any]:
         """execute_compression after its IN_PROGRESS history row is written:
         run the MOVE, rebuild unusable indexes, record the outcome on the row."""
@@ -1791,26 +1847,10 @@ class TargetQueries:
         # Status/size updates below must hit exactly the row inserted above.
         # Matching on owner+table alone could land on another target's row (a
         # clone sharing the schema name), a sibling partition's row running in
-        # the same batch, or a scheduler job's row. Without an id, fall back to
-        # the most specific match: this target, this partition, this DDL.
-        if history_id:
-            hist_where = "WHERE history_id = :hist_id"
-            hist_binds = {'hist_id': history_id}
-        else:
-            log_warning(f"No history_id for {owner}.{table_name}"
-                        f"{'.' + partition_name if partition_name else ''}; "
-                        f"history updates will match by object")
-            hist_where = """
-                WHERE database_id = :hist_db AND owner = :hist_owner
-                  AND object_name = :hist_tbl
-                  AND NVL(partition_name, '~') = NVL(:hist_part, '~')
-                  AND subpartition_name IS NULL
-                  AND compression_clause = :hist_clause
-                  AND operation_status = 'IN_PROGRESS' AND ROWNUM = 1
-            """
-            hist_binds = {'hist_db': database_id, 'hist_owner': owner,
-                          'hist_tbl': table_name, 'hist_part': partition_name,
-                          'hist_clause': clause}
+        # the same batch, or a scheduler job's row. execute_compression never
+        # runs the MOVE without this row's id.
+        hist_where = "WHERE history_id = :hist_id"
+        hist_binds = {'hist_id': history_id}
 
         try:
             t0 = _time.perf_counter()
@@ -3541,6 +3581,10 @@ ONLINE PARALLEL {parallel_degree};"""
     #   SUCCESS / FAILED  set by reconcile_operations from the target's
     #                scheduler views.
     # Every statement is scoped by DATABASE_ID (and HISTORY_ID for one row).
+    # A segment has at most one open (QUEUED / IN_PROGRESS) row, enforced by
+    # UNQ_HISTORY_OPEN_SEGMENT once its patch is applied: claiming and
+    # requeueing update that same row (same key), and SUCCESS / FAILED /
+    # ROLLED_BACK take the row out of the index, which frees the segment.
 
     # A claimed job may be missing from the target's scheduler views this long
     # (claim -> CREATE_JOB commit) before it is declared lost.
@@ -3624,6 +3668,8 @@ ONLINE PARALLEL {parallel_degree};"""
 
         Returns:
             {'added': n, 'duplicates': n, 'rejected': n, 'errors': [reason, ...]}
+            'duplicates' also counts rows that UNQ_HISTORY_OPEN_SEGMENT rejected
+            (ORA-00001): another session added the segment at the same instant.
         """
         from hcc_advisor.utils.central_connector import CentralConnector
 
@@ -3672,14 +3718,24 @@ ONLINE PARALLEL {parallel_degree};"""
                 with CentralConnector.get_connection() as conn:
                     cur = conn.cursor()
                     try:
-                        cur.executemany(TargetQueries._QUEUE_INSERT_SQL, rows)
+                        # A row UNQ_HISTORY_OPEN_SEGMENT rejects was queued or
+                        # started by another session since the check above: a
+                        # duplicate, and the other rows are still added. Any
+                        # other row error rolls back the whole call.
+                        cur.executemany(TargetQueries._QUEUE_INSERT_SQL, rows, batcherrors=True)
+                        conflicts = 0
+                        for row_error in cur.getbatcherrors():
+                            if not _is_open_segment_conflict(row_error):
+                                raise oracledb.DatabaseError(row_error)
+                            conflicts += 1
                         conn.commit()
                     except Exception:
                         conn.rollback()
                         raise
                     finally:
                         cur.close()
-                out['added'] = len(rows)
+                out['added'] = len(rows) - conflicts
+                out['duplicates'] += conflicts
             except Exception as e:
                 log_error(e, "TargetQueries.enqueue_compression_jobs", {'rows': len(rows)})
                 out['rejected'] += len(rows)
@@ -3714,6 +3770,30 @@ ONLINE PARALLEL {parallel_degree};"""
                 'start_time': _py_datetime(r['START_TIME']),
             })
         return items
+
+    @staticmethod
+    def _open_segment_row(database_id: int, owner: str, table_name: str,
+                          partition_name: Optional[str] = None,
+                          subpartition_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """{'history_id', 'status'} of the QUEUED / IN_PROGRESS row of exactly
+        this segment (the UNQ_HISTORY_OPEN_SEGMENT key), or None. Raises on a
+        database error."""
+        from hcc_advisor.utils.central_connector import CentralConnector
+
+        df = CentralConnector.execute_query("""
+            SELECT history_id, operation_status
+            FROM t_compression_history
+            WHERE database_id = :db AND owner = :o AND object_name = :t
+              AND NVL(partition_name, '~') = NVL(:p, '~')
+              AND NVL(subpartition_name, '~') = NVL(:sp, '~')
+              AND operation_status IN ('QUEUED', 'IN_PROGRESS')
+              AND ROWNUM = 1
+        """, {'db': database_id, 'o': owner, 't': table_name,
+              'p': partition_name, 'sp': subpartition_name}, raise_on_error=True)
+        if df.empty:
+            return None
+        row = df.iloc[0]
+        return {'history_id': int(row['HISTORY_ID']), 'status': row['OPERATION_STATUS']}
 
     @staticmethod
     def _requeue_job_row(database_id: int, history_id: int, start_time, message: str) -> int:
@@ -3951,25 +4031,27 @@ ONLINE PARALLEL {parallel_degree};"""
         if err:
             return {'success': False, 'error': err}
         label = _segment_label(row['owner'], row['tbl'], row['part'], row['sub'])
+        segment = (row['db'], row['owner'], row['tbl'], row['part'], row['sub'])
         try:
-            dup = CentralConnector.execute_query("""
-                SELECT 1 FROM t_compression_history
-                WHERE database_id = :db AND owner = :o AND object_name = :t
-                  AND NVL(partition_name, '~') = NVL(:p, '~')
-                  AND NVL(subpartition_name, '~') = NVL(:sp, '~')
-                  AND operation_status IN ('QUEUED', 'IN_PROGRESS')
-                  AND ROWNUM = 1
-            """, {'db': row['db'], 'o': row['owner'], 't': row['tbl'],
-                  'p': row['part'], 'sp': row['sub']}, raise_on_error=True)
+            open_row = TargetQueries._open_segment_row(*segment)
         except Exception as e:
             return {'success': False, 'error': f"Could not check the queue for {label}: {e}"}
-        if not dup.empty:
+        if open_row:
             return {'success': False, 'duplicate': True,
-                    'error': f'{label} already has a queued or running job'}
+                    'error': _already_open_error(label, open_row, "not submitted again")}
 
         history_id = CentralConnector.execute_dml_returning(
             TargetQueries._QUEUE_INSERT_SQL + "\n        RETURNING history_id INTO :new_id", row)
         if not history_id:
+            # Most likely UNQ_HISTORY_OPEN_SEGMENT: another session queued or
+            # started this segment since the check above.
+            try:
+                open_row = TargetQueries._open_segment_row(*segment)
+            except Exception:
+                open_row = None
+            if open_row:
+                return {'success': False, 'duplicate': True,
+                        'error': _already_open_error(label, open_row, "not submitted again")}
             return {'success': False, 'error': f"Could not record {label} in the queue"}
 
         res = TargetQueries.submit_queued_job({

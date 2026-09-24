@@ -5,7 +5,7 @@ Unit tests for generated-id handling of central history / run rows:
 - store_compression_history / store_advisor_run return the id of the row they
   inserted (RETURNING ... INTO) instead of re-selecting MAX(id).
 - execute_compression (and batch_execute) update the history row by its
-  history_id, never by owner+table alone.
+  history_id, never by owner+table alone, and run no MOVE without that id.
 
 The central DB is replaced by fakes that record every statement and bind.
 """
@@ -242,12 +242,15 @@ class TestExecuteCompressionHistoryUpdates:
         dml = MagicMock(return_value=1)
         with patch.object(CentralQueries, 'store_compression_history',
                           return_value=store_return) as store, \
+                patch.object(CentralConnector, 'execute_query',       # no open row for it
+                             return_value=pd.DataFrame(columns=['HISTORY_ID', 'OPERATION_STATUS'])), \
                 patch.object(CentralConnector, 'execute_dml', dml), \
                 patch.object(TargetConnector, 'execute_query', side_effect=_size_query(sizes)), \
-                patch.object(TargetConnector, 'execute_plsql', **plsql):
+                patch.object(TargetConnector, 'execute_plsql', **plsql) as run:
             res = TargetQueries.execute_compression(
                 7, 'APP', 'ORDERS', 'QUERY HIGH',
                 partition_name=partition_name, dry_run=False)
+        self.plsql = run
         return res, store, _history_updates(dml)
 
     def test_success_updates_by_history_id(self):
@@ -286,21 +289,16 @@ class TestExecuteCompressionHistoryUpdates:
         assert sql.endswith('WHERE history_id = :hist_id')
         assert binds == {'err': 'ORA-01652 boom', 'hist_id': 557}
 
-    def test_without_history_id_falls_back_to_database_and_partition(self):
-        res, _, updates = self._run(None, {'return_value': True}, partition_name='P1')
+    def test_without_history_id_nothing_is_run(self):
+        """A failed history insert used to run the MOVE untracked (updates
+        matched by object). Now nothing runs without the row's id."""
+        res, store, updates = self._run(None, {'return_value': True}, partition_name='P1')
 
-        assert res['success'] is True
-        sql, binds = updates[0]
-        where = sql.split('WHERE', 1)[1]
-        assert 'history_id' not in where
-        assert 'database_id = :hist_db' in where
-        assert "NVL(partition_name, '~') = NVL(:hist_part, '~')" in where
-        assert 'subpartition_name IS NULL' in where
-        assert 'compression_clause = :hist_clause' in where    # not a scheduler job row
-        assert binds['hist_db'] == 7 and binds['hist_part'] == 'P1'
-        assert binds['hist_owner'] == 'APP' and binds['hist_tbl'] == 'ORDERS'
-        assert binds['hist_clause'].startswith('ALTER TABLE APP.ORDERS')
-        _assert_bound_exactly(sql, binds)
+        store.assert_called_once()
+        assert res['success'] is False and 'duplicate' not in res
+        assert 'Could not record APP.ORDERS partition P1' in res['error']
+        self.plsql.assert_not_called()                          # no MOVE
+        assert updates == []
 
     def test_batch_partitions_of_one_table_update_their_own_rows(self):
         """Concurrent partitions of the same table used to race for the first
@@ -310,6 +308,8 @@ class TestExecuteCompressionHistoryUpdates:
         dml = MagicMock(return_value=1)
         with patch.object(CentralQueries, 'store_compression_history',
                           side_effect=lambda db, rec: ids[rec['partition_name']]), \
+                patch.object(CentralConnector, 'execute_query',
+                             return_value=pd.DataFrame(columns=['HISTORY_ID', 'OPERATION_STATUS'])), \
                 patch.object(CentralConnector, 'execute_dml', dml), \
                 patch.object(TargetConnector, 'execute_query', side_effect=_size_query(sizes)), \
                 patch.object(TargetConnector, 'execute_plsql', return_value=True):

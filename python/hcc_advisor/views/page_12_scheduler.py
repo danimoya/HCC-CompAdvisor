@@ -43,10 +43,7 @@ def show_scheduler_page():
         else:
             st.caption("Showing jobs across ALL registered databases")
     with col2:
-        if st.button("Refresh Now", key="sched_refresh", use_container_width=True):
-            _do_refresh(db_id)
-            st.session_state['scheduler_last_refresh'] = datetime.now()
-            st.rerun()
+        refresh_clicked = st.button("Refresh Now", key="sched_refresh", use_container_width=True)
     with col3:
         interval = st.selectbox("Interval", [1, 2, 5, 10], index=2,
                                 format_func=lambda x: f"{x} min",
@@ -63,6 +60,14 @@ def show_scheduler_page():
                 st.rerun()
 
     st.markdown("---")
+
+    # Refresh (Refresh Now, or every render while auto-refresh is on) BEFORE
+    # the metrics and job table are read, so they already show the jobs this
+    # refresh reconciled or submitted instead of lagging one interval behind.
+    if refresh_clicked or st.session_state.scheduler_auto_refresh:
+        with st.spinner("Refreshing job status..."):
+            _do_refresh(db_id)
+        st.session_state['scheduler_last_refresh'] = datetime.now()
 
     # Metrics
     summary = CentralQueries.get_scheduler_job_summary(database_id=db_id)
@@ -127,14 +132,11 @@ def show_scheduler_page():
         with st.expander("Recurring Stats Refresh Jobs"):
             _render_recurring_jobs(db_id)
 
-    # Auto-refresh logic: runs _do_refresh on the current render, then (below)
-    # waits the chosen interval and reruns in the same session. No browser
-    # reload (meta http-equiv refresh): that starts a new Streamlit session,
-    # which logs the user out and resets this toggle and the selected page.
+    # Auto-refresh: _do_refresh ran above, before the metrics; below, wait the
+    # chosen interval and rerun in the same session. No browser reload (meta
+    # http-equiv refresh): that starts a new Streamlit session, which logs the
+    # user out and resets this toggle and the selected page.
     if st.session_state.scheduler_auto_refresh:
-        _do_refresh(db_id)
-        st.session_state['scheduler_last_refresh'] = datetime.now()
-
         last = st.session_state['scheduler_last_refresh']
         next_at = last + timedelta(minutes=interval)
         st.caption(

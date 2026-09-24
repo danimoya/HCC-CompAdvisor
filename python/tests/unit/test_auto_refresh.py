@@ -530,6 +530,39 @@ class TestSchedulerPageAutoRefresh:
         assert at.session_state["authenticated"] is True
         assert at.session_state["scheduler_auto_refresh"] is True
 
+    def test_auto_refresh_cycle_refreshes_before_reading_metrics(self, rec):
+        """The reconcile/drain of a cycle must precede the metrics and job
+        table, or they show the jobs it closed or submitted one cycle late."""
+        with ExitStack() as stack:
+            _patch_all(stack, _page_12_sources(rec))
+            at = _page_12_app(auto_refresh=True).run()
+
+        assert not at.exception
+        assert rec.queries() == ["do_refresh", "job_summary", "job_details"]
+        assert any(c.startswith("Last refresh:") for c in _texts(at.caption))
+        rec.assert_rendered_before_waiting()
+
+    def test_refresh_now_refreshes_before_reading_metrics(self, rec):
+        with ExitStack() as stack:
+            mocks = _patch_all(stack, _page_12_sources(rec))
+            spy = _spy_helper(stack, page_12_scheduler)
+            at = _page_12_app(auto_refresh=False).run()
+            rec.reset()
+            spy.reset_mock()
+            # AppTest 1.31 cannot re-serialize an untouched selectbox that has
+            # a format_func, so set the interval explicitly (5 min).
+            at.selectbox(key="sched_interval").select_index(2)
+            at.button(key="sched_refresh").click().run()
+
+        assert not at.exception
+        mocks["_do_refresh"].assert_called_once_with(1)
+        assert rec.queries() == ["do_refresh", "job_summary", "job_details"]
+        # This run already shows the refreshed data: no extra rerun, no wait.
+        rec.rerun.assert_not_called()
+        rec.time.sleep.assert_not_called()
+        spy.assert_called_once_with("scheduler_auto_refresh", 300)
+        assert at.session_state["scheduler_last_refresh"] is not None
+
     def test_stop_button_turns_waiting_off(self, rec):
         with ExitStack() as stack:
             _patch_all(stack, _page_12_sources(rec))
