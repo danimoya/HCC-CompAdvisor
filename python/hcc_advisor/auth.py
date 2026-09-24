@@ -4,13 +4,17 @@ Handles user authentication and session management
 """
 
 import streamlit as st
+from collections import deque
 from datetime import datetime, timedelta
 from typing import Optional, List, Tuple
 import hashlib
 import hmac
+import ipaddress
+import secrets
+import sys
 import threading
 import time
-from hcc_advisor.config import config
+from hcc_advisor.config import config, env_value_problem
 
 
 # Role hierarchy (ascending privilege). A role grants its own capabilities plus
@@ -25,6 +29,10 @@ ROLE_LEVELS = {ROLE_VIEWER: 0, ROLE_OPERATOR: 1, ROLE_ADMIN: 2}
 # (Historical built-in defaults that were shipped in templates/examples.)
 _FORBIDDEN_PASSWORDS = frozenset({"admin123", "Dashboard123!", "Dashboard123"})
 
+# Minimum length for a dashboard password chosen in the setup wizard (matches
+# the "minimum 12 characters" guidance in the README).
+MIN_PASSWORD_LENGTH = 12
+
 
 # ---------------------------------------------------------------------------
 # Server-side brute-force lockout (CWE-307)
@@ -32,9 +40,8 @@ _FORBIDDEN_PASSWORDS = frozenset({"admin123", "Dashboard123!", "Dashboard123"})
 # The per-session st.session_state counter is trivially bypassed by starting a
 # fresh session (cleared cookie / scripted requests). This module-level store
 # lives in the SERVER process, so it persists ACROSS sessions and cannot be reset
-# by the client. It is keyed by client IP when the IP is available (read from the
-# X-Forwarded-For header set by the TLS reverse proxy), and otherwise falls back
-# to a single global bucket so the limiter still applies.
+# by the client. It is keyed by client IP (see _derive_client_ip), and a global
+# ceiling across all keys stops an attacker who rotates identities.
 _LOCKOUT_LOCK = threading.Lock()
 # key -> {"fails": int, "locked_until": float_epoch}
 _LOCKOUT_STATE: dict = {}
@@ -44,27 +51,110 @@ _LOCKOUT_THRESHOLD = 5
 _LOCKOUT_BASE_SECONDS = 30
 _LOCKOUT_MAX_SECONDS = 3600  # 1 hour cap
 
+# Global ceiling: this many failures across ALL keys within the window pauses
+# every login for a while (legitimate users rarely fail more than a few times),
+# so spreading guesses over many IPs gains little. Repeated triggers double the
+# pause up to the cap; a quiet period resets it. A restart also clears it.
+_GLOBAL_FAIL_THRESHOLD = 20
+_GLOBAL_FAIL_WINDOW_SECONDS = 300
+_GLOBAL_LOCK_BASE_SECONDS = 60
+_GLOBAL_LOCK_MAX_SECONDS = 900
+_GLOBAL_STATE: dict = {"fails": deque(), "locked_until": 0.0, "level": 0, "last_trigger": 0.0}
 
-def _client_key() -> str:
-    """Best-effort client identifier for rate-limiting (IP from XFF, else global).
+_GLOBAL_KEY = "__global__"
 
-    Uses the internal websocket-headers accessor available in this Streamlit
-    version; if it is unavailable (API drift), degrade to a single global bucket
-    so the limiter still throttles brute force, just less granularly.
+
+def _header(headers: Optional[dict], name: str) -> Optional[str]:
+    """Case-insensitive header lookup."""
+    for key, value in (headers or {}).items():
+        if key.lower() == name.lower():
+            return value
+    return None
+
+
+def _normalize_ip(value: Optional[str]) -> Optional[str]:
+    """Canonical IP for a header hop or peer address ('[v6]:port' and 'v4:port'
+    accepted), or None when it is not an IP address."""
+    if not value:
+        return None
+    candidate = value.strip()
+    if candidate.startswith('['):
+        candidate = candidate[1:].split(']', 1)[0]
+    elif candidate.count(':') == 1:
+        candidate = candidate.split(':', 1)[0]
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError:
+        return None
+
+
+def _derive_client_ip(headers: Optional[dict], peer_ip: Optional[str],
+                      trusted_proxies: int) -> Optional[str]:
+    """Client IP for the login lockout, trusting only our own proxies' hops.
+
+    Each proxy APPENDS the address it received the request from to
+    X-Forwarded-For, so every entry left of the hops our proxies added is
+    client-supplied (a client can send any X-Forwarded-For it likes). With N
+    trusted proxies the client is therefore the N-th entry from the right: the
+    right-most hop that is not one of our own proxies. With a single proxy,
+    X-Real-IP (which nginx/NPM overwrite with the TCP peer) is used when there
+    is no usable X-Forwarded-For. With no proxy (N=0) the headers are ignored and
+    the TCP peer is used. Returns None when no address can be determined.
     """
+    if trusted_proxies > 0:
+        xff = _header(headers, 'X-Forwarded-For')
+        if xff:
+            hops = [hop.strip() for hop in xff.split(',') if hop.strip()]
+            if len(hops) >= trusted_proxies:
+                ip = _normalize_ip(hops[-trusted_proxies])
+                if ip:
+                    return ip
+        if trusted_proxies == 1:
+            ip = _normalize_ip(_header(headers, 'X-Real-IP'))
+            if ip:
+                return ip
+    # No proxy, or no forwarding headers: the (unspoofable) TCP peer. Behind a
+    # proxy that did not forward the client, this is the proxy's own address.
+    return _normalize_ip(peer_ip)
+
+
+def _request_meta() -> Tuple[dict, Optional[str]]:
+    """(headers, peer_ip) of the current session's websocket request.
+
+    Uses the internal accessors available in this Streamlit version (1.31 has no
+    st.context); on API drift either part degrades to empty/None.
+    """
+    headers: dict = {}
+    peer_ip: Optional[str] = None
     try:
         from streamlit.web.server.websocket_headers import _get_websocket_headers
         headers = _get_websocket_headers() or {}
-        xff = headers.get("X-Forwarded-For") or headers.get("x-forwarded-for")
-        if xff:
-            # First hop is the original client.
-            return xff.split(",")[0].strip()
-        real = headers.get("X-Real-Ip") or headers.get("x-real-ip")
-        if real:
-            return real.strip()
     except Exception:
         pass
-    return "__global__"
+    try:
+        from streamlit import runtime
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        ctx = get_script_run_ctx()
+        client = runtime.get_instance().get_client(ctx.session_id) if ctx else None
+        # Streamlit's HTTPServer runs without xheaders, so this is the TCP peer.
+        peer_ip = getattr(getattr(client, 'request', None), 'remote_ip', None)
+    except Exception:
+        pass
+    return headers, peer_ip
+
+
+def _trusted_proxy_count() -> int:
+    try:
+        return max(0, int(getattr(config, 'TRUSTED_PROXY_COUNT', 1)))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _client_key() -> str:
+    """Client identifier for rate-limiting: the derived client IP, else a single
+    global bucket so the limiter still applies (just less granularly)."""
+    headers, peer_ip = _request_meta()
+    return _derive_client_ip(headers, peer_ip, _trusted_proxy_count()) or _GLOBAL_KEY
 
 
 def _lockout_remaining(key: str) -> float:
@@ -77,15 +167,43 @@ def _lockout_remaining(key: str) -> float:
         return remaining if remaining > 0 else 0.0
 
 
-def _record_failure(key: str) -> float:
-    """Record a failed attempt; return seconds locked (0 if under threshold)."""
+def _global_lockout_remaining() -> float:
+    """Seconds remaining on the global (all clients) lockout, or 0."""
     with _LOCKOUT_LOCK:
+        remaining = _GLOBAL_STATE["locked_until"] - time.time()
+        return remaining if remaining > 0 else 0.0
+
+
+def _record_global_failure_locked(now: float) -> None:
+    """Count a failure toward the global ceiling. Caller holds _LOCKOUT_LOCK."""
+    fails = _GLOBAL_STATE["fails"]
+    fails.append(now)
+    while fails and fails[0] <= now - _GLOBAL_FAIL_WINDOW_SECONDS:
+        fails.popleft()
+    if len(fails) < _GLOBAL_FAIL_THRESHOLD:
+        return
+    if now - _GLOBAL_STATE["last_trigger"] > _GLOBAL_LOCK_MAX_SECONDS + _GLOBAL_FAIL_WINDOW_SECONDS:
+        _GLOBAL_STATE["level"] = 0  # quiet since the last trigger: start over
+    window = min(_GLOBAL_LOCK_BASE_SECONDS * (2 ** _GLOBAL_STATE["level"]),
+                 _GLOBAL_LOCK_MAX_SECONDS)
+    _GLOBAL_STATE["level"] += 1
+    _GLOBAL_STATE["locked_until"] = now + window
+    _GLOBAL_STATE["last_trigger"] = now
+    fails.clear()
+
+
+def _record_failure(key: str) -> float:
+    """Record a failed attempt; return seconds the key is locked (0 if under
+    threshold). Also counts toward the global ceiling (_global_lockout_remaining)."""
+    now = time.time()
+    with _LOCKOUT_LOCK:
+        _record_global_failure_locked(now)
         rec = _LOCKOUT_STATE.setdefault(key, {"fails": 0, "locked_until": 0.0})
         rec["fails"] += 1
         if rec["fails"] >= _LOCKOUT_THRESHOLD:
             over = rec["fails"] - _LOCKOUT_THRESHOLD
             window = min(_LOCKOUT_BASE_SECONDS * (2 ** over), _LOCKOUT_MAX_SECONDS)
-            rec["locked_until"] = time.time() + window
+            rec["locked_until"] = now + window
             return window
         return 0.0
 
@@ -94,6 +212,84 @@ def _record_success(key: str) -> None:
     """Clear a key's failure record on successful login."""
     with _LOCKOUT_LOCK:
         _LOCKOUT_STATE.pop(key, None)
+
+
+# ---------------------------------------------------------------------------
+# First-run bootstrap token
+# ---------------------------------------------------------------------------
+# A fresh pip install has no .env and no DASHBOARD_PASSWORD, so nobody could
+# sign in to reach the admin-only setup wizard. In exactly that state a random
+# one-time token is generated in server memory, printed to the server console
+# (never to the app log or disk), and accepted by the login form as an admin
+# login for the first-run wizard only. Once setup writes DASHBOARD_PASSWORD the
+# token is retired for the life of the process and bootstrap sessions are
+# signed out (require_authentication), so the new password must be used.
+_BOOTSTRAP_LOCK = threading.Lock()
+_BOOTSTRAP: dict = {"token": None, "retired": False}
+BOOTSTRAP_SESSION_KEY = 'auth_bootstrap'
+BOOTSTRAP_TOKEN_LABEL = 'HCC ADVISOR FIRST-RUN SETUP TOKEN'
+
+
+def _bootstrap_active_locked() -> bool:
+    """Caller holds _BOOTSTRAP_LOCK."""
+    if _BOOTSTRAP["retired"]:
+        return False
+    if config.DASHBOARD_PASSWORD or not config.is_first_run():
+        if _BOOTSTRAP["token"] is not None:
+            # Setup finished (or a password appeared): never accept it again.
+            _BOOTSTRAP["token"] = None
+            _BOOTSTRAP["retired"] = True
+        return False
+    return True
+
+
+def bootstrap_active() -> bool:
+    """True while first-run setup is pending and no admin password is configured."""
+    with _BOOTSTRAP_LOCK:
+        return _bootstrap_active_locked()
+
+
+def ensure_bootstrap_token() -> bool:
+    """Issue the first-run token once per process and print it to the console.
+
+    Returns True when bootstrap mode is active (a token is available), False
+    otherwise. The token itself is never returned or shown in the UI.
+    """
+    with _BOOTSTRAP_LOCK:
+        if not _bootstrap_active_locked():
+            return False
+        if _BOOTSTRAP["token"] is None:
+            _BOOTSTRAP["token"] = secrets.token_urlsafe(24)
+            bar = "=" * 72
+            print(f"\n{bar}\n{BOOTSTRAP_TOKEN_LABEL}: {_BOOTSTRAP['token']}\n"
+                  "No DASHBOARD_PASSWORD is configured. Enter this one-time token on the\n"
+                  "dashboard login page to open the setup wizard. It is held in memory\n"
+                  "only and stops working once setup saves DASHBOARD_PASSWORD.\n"
+                  f"{bar}\n", file=sys.stderr, flush=True)
+        return True
+
+
+def _check_bootstrap_token(candidate: str) -> bool:
+    """Constant-time check of a login attempt against the live bootstrap token."""
+    with _BOOTSTRAP_LOCK:
+        token = _BOOTSTRAP["token"] if _bootstrap_active_locked() else None
+    if not token or not candidate:
+        return False
+    return hmac.compare_digest(str(candidate).encode('utf-8'), token.encode('utf-8'))
+
+
+def validate_new_password(password: str) -> Optional[str]:
+    """Why `password` can't be used as a new dashboard password, or None if it can."""
+    if not password:
+        return "Dashboard password is required."
+    if len(password) < MIN_PASSWORD_LENGTH:
+        return f"Dashboard password must be at least {MIN_PASSWORD_LENGTH} characters."
+    if password in _FORBIDDEN_PASSWORDS:
+        return "That password is a known default and is not allowed."
+    problem = env_value_problem(password)
+    if problem:
+        return f"Dashboard password {problem}; choose another."
+    return None
 
 
 class AuthManager:
@@ -135,8 +331,10 @@ class AuthManager:
             if not configured or configured in _FORBIDDEN_PASSWORDS:
                 continue
             # SECURITY: constant-time comparison to avoid leaking the password via
-            # timing; do not short-circuit on the first differing byte.
-            if hmac.compare_digest(str(password), str(configured)):
+            # timing; do not short-circuit on the first differing byte. Compare
+            # bytes: compare_digest rejects non-ASCII str arguments.
+            if hmac.compare_digest(str(password).encode('utf-8'),
+                                   str(configured).encode('utf-8')):
                 if matched is None or ROLE_LEVELS[role] >= ROLE_LEVELS[matched]:
                     matched = role
         return matched
@@ -186,8 +384,16 @@ class AuthManager:
             bool: True if authentication successful
         """
         # SECURITY (CWE-307): server-side, cross-session lockout keyed by client
-        # IP. Unlike the per-session counter below, this cannot be reset by
-        # clearing cookies / starting a new Streamlit session.
+        # IP, plus a global ceiling across all clients. Unlike the per-session
+        # counter below, neither can be reset by clearing cookies / starting a
+        # new Streamlit session or by rotating X-Forwarded-For values.
+        global_remaining = _global_lockout_remaining()
+        if global_remaining > 0:
+            st.error(
+                "Too many failed login attempts on this server. Sign-in is paused "
+                f"for {int(global_remaining) + 1}s. Try again later."
+            )
+            return False
         key = _client_key()
         remaining = _lockout_remaining(key)
         if remaining > 0:
@@ -203,9 +409,11 @@ class AuthManager:
 
         # SECURITY: fail closed if no usable dashboard password is configured. An
         # unset or known-weak admin password must never grant access. (Operator/
-        # viewer roles, if configured, are still evaluated by _resolve_role.)
+        # viewer roles, if configured, are still evaluated by _resolve_role, and
+        # on a first run the one-time bootstrap token opens the setup wizard.)
+        bootstrap = bootstrap_active()
         configured_admin = config.DASHBOARD_PASSWORD or ""
-        if not configured_admin or configured_admin in _FORBIDDEN_PASSWORDS:
+        if (not configured_admin or configured_admin in _FORBIDDEN_PASSWORDS) and not bootstrap:
             if not (config.OPERATOR_PASSWORD or config.VIEWER_PASSWORD):
                 st.error(
                     "Dashboard authentication is misconfigured (DASHBOARD_PASSWORD is unset "
@@ -216,17 +424,23 @@ class AuthManager:
         # SECURITY: resolve the submitted password to a role using constant-time
         # comparison against every configured (non-weak) credential.
         role = AuthManager._resolve_role(password)
+        via_bootstrap = False
+        if role is None and bootstrap and _check_bootstrap_token(password):
+            # First run only: admin for the setup wizard; signed out once setup
+            # saves DASHBOARD_PASSWORD (see require_authentication).
+            role, via_bootstrap = ROLE_ADMIN, True
         if role is not None:
             _record_success(key)
             st.session_state.authenticated = True
             st.session_state.role = role
+            st.session_state[BOOTSTRAP_SESSION_KEY] = via_bootstrap
             # Username reflects the role so the audit trail records who acted.
             st.session_state.username = role
             st.session_state.login_attempts = 0
             st.session_state.last_activity = datetime.now()
             return True
         else:
-            locked_for = _record_failure(key)
+            locked_for = max(_record_failure(key), _global_lockout_remaining())
             st.session_state.login_attempts += 1
             if locked_for > 0:
                 st.error(
@@ -248,6 +462,7 @@ class AuthManager:
         st.session_state.authenticated = False
         st.session_state.username = None
         st.session_state.role = None
+        st.session_state[BOOTSTRAP_SESSION_KEY] = False
         st.session_state.last_activity = datetime.now()
 
     @staticmethod
@@ -315,6 +530,14 @@ class AuthManager:
         if AuthManager.check_session_timeout():
             st.warning("Session timed out. Please login again.")
 
+        # A bootstrap-token session is only good for the first-run wizard: once
+        # setup has saved DASHBOARD_PASSWORD, sign it out so the new password
+        # (not the retired token) is what grants access from here on.
+        if (AuthManager.is_authenticated() and st.session_state.get(BOOTSTRAP_SESSION_KEY)
+                and not bootstrap_active()):
+            AuthManager.logout()
+            st.info("Initial setup is complete. Sign in with the new dashboard password.")
+
         if not AuthManager.is_authenticated():
             AuthManager.show_login_page()
             st.stop()
@@ -328,6 +551,10 @@ class AuthManager:
         st.title(f"{config.APP_ICON} {config.APP_TITLE}")
         st.markdown("---")
 
+        # First run with no admin password: make sure the one-time setup token
+        # has been issued (printed to the server console, never shown here).
+        bootstrap = ensure_bootstrap_token()
+
         # Center login form
         col1, col2, col3 = st.columns([1, 2, 1])
 
@@ -336,9 +563,9 @@ class AuthManager:
 
             with st.form("login_form"):
                 password = st.text_input(
-                    "Password",
+                    "Setup token" if bootstrap else "Password",
                     type="password",
-                    placeholder="Enter your password"
+                    placeholder="Enter the setup token" if bootstrap else "Enter your password"
                 )
 
                 submit_button = st.form_submit_button("Login", use_container_width=True)
@@ -359,11 +586,19 @@ class AuthManager:
 
             # SECURITY: never disclose the password (or any default) on the
             # unauthenticated login page. Only show non-sensitive session info.
-            st.info(
-                "The dashboard password is configured by the administrator via the "
-                "`DASHBOARD_PASSWORD` environment variable.\n\n"
-                f"- Session timeout: {config.SESSION_TIMEOUT_MINUTES} minutes"
-            )
+            if bootstrap:
+                st.info(
+                    "**First-run setup.** No dashboard password is configured yet. Enter "
+                    "the one-time setup token printed in the server console (look for "
+                    f"`{BOOTSTRAP_TOKEN_LABEL}`) to open the setup wizard, where you "
+                    "choose the admin password."
+                )
+            else:
+                st.info(
+                    "The dashboard password is configured by the administrator via the "
+                    "`DASHBOARD_PASSWORD` environment variable.\n\n"
+                    f"- Session timeout: {config.SESSION_TIMEOUT_MINUTES} minutes"
+                )
 
 
 def render_logout_button():

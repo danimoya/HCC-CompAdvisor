@@ -227,8 +227,8 @@ http://localhost:8501
 3. Accept the security exception
 
 **Login:**
-- Enter the password you set in `.env` file
-- Default: `admin123` (CHANGE THIS!)
+- Enter the `DASHBOARD_PASSWORD` you set in the `.env` file. There is no default password.
+- Installed with pip and started without a `.env`? Use the one-time setup token printed in the server console to open the setup wizard. See "First Run Without a `.env`" in [QUICKSTART.md](QUICKSTART.md).
 
 ## 🔧 Configuration Details
 
@@ -300,6 +300,8 @@ streamlit run app.py \
   --server.sslCertFile=ssl/cert.pem \
   --server.sslKeyFile=ssl/key.pem
 ```
+
+When browsers reach Streamlit directly like this, with no reverse proxy, set `TRUSTED_PROXY_COUNT=0` in `.env`. The login lockout then keys on the connection's address instead of `X-Forwarded-For` headers, which a client could forge.
 
 ## 🐳 Docker Installation (Alternative)
 
@@ -463,6 +465,8 @@ server {
     }
 }
 ```
+
+This is one reverse proxy, which matches the default `TRUSTED_PROXY_COUNT=1`. If another proxy or CDN sits in front of nginx, raise `TRUSTED_PROXY_COUNT` to match. The login lockout uses the `X-Forwarded-For` entry added by the outermost proxy you trust.
 
 ## 🔍 Verification
 

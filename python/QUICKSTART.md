@@ -79,7 +79,31 @@ Open your browser:
 - **HTTP:** http://localhost:8501
 
 **Login with:**
-- Password: The value you set in `.env` (default: `admin123`)
+- Password: the `DASHBOARD_PASSWORD` value you set in `.env`. There is no default password.
+
+## 🧙 First Run Without a `.env` (Setup Wizard)
+
+When the package is installed with pip (`pip install .` from the repository root) and started with `hcc-advisor`, you can skip Step 2. With no `.env` file and no `CENTRAL_DB_PASSWORD` in the environment, the dashboard opens a setup wizard that deploys the central schema and writes the configuration for you.
+
+The wizard is admin-only, and on a fresh install no admin password exists yet. So when no `DASHBOARD_PASSWORD` is configured, the server prints a **one-time setup token** to its console at startup:
+
+```
+========================================================================
+HCC ADVISOR FIRST-RUN SETUP TOKEN: <random token>
+No DASHBOARD_PASSWORD is configured. Enter this one-time token on the
+dashboard login page to open the setup wizard. ...
+========================================================================
+```
+
+1. Start the dashboard with `hcc-advisor`. If you start it with `streamlit run` instead, the token is printed when the first browser opens the login page.
+2. Open the dashboard, enter the token on the login page, and follow the wizard.
+3. In the **Security** step, choose the dashboard (admin) password: at least 12 characters, entered twice. There is no default.
+4. **Save & Launch Dashboard** writes `~/.config/hcc-advisor/.env` (or `$HCC_ADVISOR_CONFIG_DIR/.env`) with owner-only permissions (`0600`). The token stops working at that moment, and you are asked to sign in with the new password.
+
+Notes:
+- The token exists only in the server's memory. It is never written to disk or the application log, and a restart before setup finishes prints a new one.
+- The token is accepted only while no `DASHBOARD_PASSWORD` is configured and first-run setup is pending. The Docker deployment always sets `DASHBOARD_PASSWORD` (compose requires it), so it never uses the token.
+- The wizard single-quotes the values it writes to `.env`, so passwords with spaces, `#`, quotes, `$` or backslashes are read back exactly. A value with a line break or `${...}` cannot be stored and is rejected with an error.
 
 ## 📋 Detailed Setup
 
@@ -190,7 +214,7 @@ If it shows disconnected (red), check your `CENTRAL_DB_*` configuration in `.env
 
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
-| `DASHBOARD_PASSWORD` | Login password | `admin123` | Yes |
+| `DASHBOARD_PASSWORD` | Admin login password (no default; see the first-run wizard above) | - | Yes |
 | `CENTRAL_DB_HOST` | Central database host | `localhost` | Yes |
 | `CENTRAL_DB_PORT` | Central database port | `1521` | Yes |
 | `CENTRAL_DB_SERVICE` | Central database service | `FREEPDB1` | Yes |
@@ -200,6 +224,7 @@ If it shows disconnected (red), check your `CENTRAL_DB_*` configuration in `.env
 | `SSL_ENABLED` | Enable SSL | `true` | No |
 | `SESSION_TIMEOUT_MINUTES` | Session timeout | `30` | No |
 | `MAX_LOGIN_ATTEMPTS` | Max login tries | `3` | No |
+| `TRUSTED_PROXY_COUNT` | Reverse proxies in front of Streamlit, used to find the client IP for the login lockout (`0` = direct access) | `1` | No |
 
 ### Streamlit Configuration
 
@@ -254,6 +279,14 @@ streamlit run app.py --server.address=192.168.1.100
 # Allow only specific IPs
 sudo ufw allow from 192.168.1.0/24 to any port 8501
 ```
+
+### 5. Set the Number of Reverse Proxies
+
+Failed logins are rate-limited per client IP, plus a server-wide limit: 20 failures within 5 minutes pause all logins for 1 minute, and the pause doubles on repeat, up to 15 minutes. To find the client IP, the dashboard reads the `X-Forwarded-For` entry added by your own proxy, and ignores entries the client could have added itself. Set `TRUSTED_PROXY_COUNT` to the number of reverse proxies in front of Streamlit:
+
+- `1` (default): one proxy, such as nginx or Nginx Proxy Manager (the Docker deployment).
+- `0`: browsers connect to Streamlit directly, for example `./start.sh` on `0.0.0.0`. Forwarding headers are then ignored, and the connection's address is used instead.
+- `2` or more: chained proxies, for example a CDN in front of nginx.
 
 ## 📊 Common Tasks
 
@@ -333,8 +366,8 @@ nano .env
 
 **Locked out:**
 ```bash
-# Wait for session timeout (default 30 minutes)
-# Or restart the application to reset sessions
+# Wait for the lockout shown on the login page to expire
+# Or restart the application to reset sessions and login lockouts
 ./stop.sh
 ./start.sh
 ```
