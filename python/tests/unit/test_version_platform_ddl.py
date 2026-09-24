@@ -259,8 +259,8 @@ class TestExecutionByVersion:
         monkeypatch.setattr(CentralQueries, 'store_compression_history', store)
         monkeypatch.setattr(CentralConnector, 'execute_dml', MagicMock(return_value=1))
         monkeypatch.setattr(TargetConnector, 'execute_query', MagicMock(return_value=pd.DataFrame()))
-        # No other open row for the segment (see TargetQueries._open_segment_row)
-        monkeypatch.setattr(TargetQueries, '_open_segment_row',
+        # No open row overlaps the segment (see TargetQueries._overlapping_open_row)
+        monkeypatch.setattr(TargetQueries, '_overlapping_open_row',
                             staticmethod(lambda *a, **k: None))
         plsql = MagicMock(return_value=True)
         monkeypatch.setattr(TargetConnector, 'execute_plsql', plsql)
@@ -281,12 +281,16 @@ class TestExecutionByVersion:
         monkeypatch.setattr(TargetConnector, 'execute_plsql', plsql)
         monkeypatch.setattr(TargetConnector, 'execute_query', MagicMock(return_value=pd.DataFrame()))
         monkeypatch.setattr(CentralConnector, 'execute_dml', MagicMock(return_value=1))
+        # The rollback's own IN_PROGRESS history row
+        own_row = MagicMock(return_value=900)
+        monkeypatch.setattr(CentralConnector, 'execute_dml_returning', own_row)
         # No queued / running job overlaps the segment (see _overlapping_open_row)
         monkeypatch.setattr(TargetQueries, '_overlapping_open_row',
                             staticmethod(lambda *a, **k: None))
         res = TargetQueries.rollback_compression(7, 'SCOTT', 'SALES', part)
         assert res['success'] is True
         assert expected in plsql.call_args_list[0].args[1]
+        assert own_row.call_args.args[1]['mode'] == ('ONLINE' if 'ONLINE' in expected else 'OFFLINE')
 
 
 # ============================================================================

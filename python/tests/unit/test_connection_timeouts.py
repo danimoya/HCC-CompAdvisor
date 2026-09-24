@@ -329,9 +329,9 @@ class TestCallTimeout:
         monkeypatch.setattr(CentralQueries, 'store_compression_history', lambda db, rec: 101)
         monkeypatch.setattr(CentralConnector, 'execute_dml', MagicMock(return_value=1))
         monkeypatch.setattr(tq, '_acting_user', lambda: 'alice')
-        # No other open (QUEUED/IN_PROGRESS) row for the segment, so the run
-        # is allowed (see TargetQueries._open_segment_row).
-        monkeypatch.setattr(TargetQueries, '_open_segment_row',
+        # No open (QUEUED/IN_PROGRESS) row overlaps the segment, so the run
+        # is allowed (see TargetQueries._overlapping_open_row).
+        monkeypatch.setattr(TargetQueries, '_overlapping_open_row',
                             staticmethod(lambda *a, **k: None))
 
     def test_compression_runs_without_call_timeout(self, target_pool, monkeypatch):

@@ -58,6 +58,8 @@ HISTORY_COLUMNS = [
     'subpartition_name', 'operation_status', 'start_time', 'error_message',
     'original_size_bytes', 'compressed_size_bytes', 'original_size_mb', 'compressed_size_mb',
     'duration_seconds',
+    # Marks a rollback's own row (ROLLBACK_ROW_STATUS); history reads skip those.
+    'rollback_status',
 ]
 PERMANENT = 'ORA-14808: table does not support ONLINE MOVE'
 LEGACY_14257 = 'ORA-14257: cannot move partition other than a Range, List, System, or Hash partition'
@@ -102,7 +104,7 @@ class SqliteCentral:
 
     def _insert(self, table, columns, row):
         self.con.execute(f"INSERT INTO {table} VALUES ({', '.join('?' * len(columns))})",
-                         [row[c] for c in columns])
+                         [row.get(c) for c in columns])
 
     def query(self, sql, params=None, raise_on_error=False, **kw):
         self.statements.append((sql, params))

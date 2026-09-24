@@ -86,6 +86,31 @@ def _scheduler_window(alias: str = '') -> str:
             f" OR {p}operation_status IN ('QUEUED', 'IN_PROGRESS'))")
 
 
+# TargetQueries.rollback_compression holds a T_COMPRESSION_HISTORY row of its
+# own for the NOCOMPRESS MOVE it runs (IN_PROGRESS, then SUCCESS / FAILED), so
+# the scheduler, the unique open-segment index and reconcile see the segment
+# as busy. That row is marked ROLLBACK_STATUS = ROLLBACK_ROW_STATUS (with
+# COMPRESSION_TYPE_APPLIED 'NONE', ROLLBACK_POSSIBLE 'N', no sizes and
+# COMPRESSION_CLAUSE 'ROLLBACK of history_id <n>'). It is not a compression:
+# savings / effectiveness totals and "latest compression of a segment" lookups
+# skip it (not_rollback_row_sql), the history and monitor lists label it.
+# The compression it undid keeps its own row, which moves to ROLLED_BACK.
+ROLLBACK_ROW_STATUS = 'ROLLBACK_OPERATION'
+
+
+def rollback_row_sql(alias: str = '') -> str:
+    """SQL condition: the history row is a rollback operation's own row."""
+    p = f"{alias}." if alias else ''
+    return f"{p}rollback_status = '{ROLLBACK_ROW_STATUS}'"
+
+
+def not_rollback_row_sql(alias: str = '') -> str:
+    """SQL condition: the history row is not a rollback operation's own row
+    (a compression, queued, running or finished; NULL-safe)."""
+    p = f"{alias}." if alias else ''
+    return f"NVL({p}rollback_status, '~') <> '{ROLLBACK_ROW_STATUS}'"
+
+
 @st.cache_data(ttl=_TARGET_DATABASES_TTL_SECONDS, show_spinner=False)
 def _cached_target_databases() -> pd.DataFrame:
     """Cached read of the active target-database registry (see TTL above)."""
@@ -247,7 +272,8 @@ class CentralQueries:
 
         Rows carry partition_name and subpartition_name, so the script builder
         emits MOVE SUBPARTITION for a subpartition job (not MOVE PARTITION of
-        its parent).
+        its parent). Rollback rows are left out: re-applied from a script or
+        manifest they would read as NOCOMPRESS compressions.
 
         Args:
             database_id: Filter by target database. None = all databases.
@@ -274,7 +300,7 @@ class CentralQueries:
                 h.error_message
             FROM t_compression_history h
             LEFT JOIN t_target_databases d ON d.database_id = h.database_id
-            WHERE 1=1 {db_filter} {status_clause}
+            WHERE {not_rollback_row_sql('h')} {db_filter} {status_clause}
             ORDER BY h.database_id, h.start_time DESC
         """
         try:
@@ -285,7 +311,9 @@ class CentralQueries:
 
     @staticmethod
     def get_scheduler_job_details(database_id: Optional[int] = None) -> pd.DataFrame:
-        """Get detailed job list for Scheduler monitor."""
+        """Get detailed job list for Scheduler monitor. A rollback's own row
+        is listed (it holds its segment, so queued jobs may wait for it) with
+        strategy 'ROLLBACK (NOCOMPRESS)' and job_name 'ROLLBACK of history_id n'."""
         db_filter = "AND h.database_id = :database_id" if database_id else ""
         db_col = "" if database_id else "d.display_name as database_name,"
         db_join = "" if database_id else \
@@ -295,7 +323,8 @@ class CentralQueries:
                 {db_col}
                 h.owner, h.object_name as table_name,
                 h.object_type, h.partition_name, h.subpartition_name,
-                h.compression_type_applied as strategy,
+                CASE WHEN {rollback_row_sql('h')} THEN 'ROLLBACK (NOCOMPRESS)'
+                     ELSE h.compression_type_applied END as strategy,
                 h.compression_clause as job_name,
                 h.operation_status as status,
                 h.parallel_degree as dop,
@@ -336,6 +365,7 @@ class CentralQueries:
             FROM t_compression_history
             WHERE operation_status = 'SUCCESS'
               AND original_size_bytes > 0
+              AND {not_rollback_row_sql()}
               {db_filter}
             GROUP BY TRUNC(start_time)
             ORDER BY TRUNC(start_time)
@@ -366,6 +396,7 @@ class CentralQueries:
                                           NVL(h2.partition_name, '~'), NVL(h2.subpartition_name, '~')
                                           ORDER BY h2.start_time DESC) as rn
                 FROM t_compression_history h2
+                WHERE {not_rollback_row_sql('h2')}
             ) h ON h.h_db_id = a.database_id AND h.h_owner = a.owner
                AND h.h_obj = a.object_name AND h.h_pn = NVL(a.partition_name, '~')
                AND h.h_sn = NVL(a.subpartition_name, '~') AND h.rn = 1
@@ -383,7 +414,8 @@ class CentralQueries:
                 dur_q = f"""
                     SELECT ROUND(AVG(duration_seconds), 0) as avg_sec
                     FROM t_compression_history
-                    WHERE operation_status = 'SUCCESS' AND duration_seconds > 0 {db_filter}
+                    WHERE operation_status = 'SUCCESS' AND {not_rollback_row_sql()}
+                      AND duration_seconds > 0 {db_filter}
                 """
                 dur_df = CentralConnector.execute_query(dur_q, params if params else None)
                 avg_sec = int(dur_df.iloc[0]['AVG_SEC'] or 300) if not dur_df.empty else 300
@@ -421,6 +453,7 @@ class CentralQueries:
                                           ORDER BY start_time DESC) as rn
                 FROM t_compression_history
                 WHERE operation_status = 'SUCCESS' AND compressed_size_bytes > 0
+                  AND {not_rollback_row_sql()}
             ) h ON h.database_id = a.database_id AND h.owner = a.owner
                AND h.object_name = a.object_name AND h.pn = NVL(a.partition_name, '~')
                AND h.sn = NVL(a.subpartition_name, '~') AND h.rn = 1
@@ -484,7 +517,7 @@ class CentralQueries:
                            ORDER BY start_time DESC
                        ) as rn
                 FROM t_compression_history
-                WHERE 1=1 {hist_db_filter}
+                WHERE {not_rollback_row_sql()} {hist_db_filter}
             ) h ON h.database_id = a.database_id
                AND h.owner = a.owner AND h.object_name = a.object_name
                AND h.pn = NVL(a.partition_name, '~')
@@ -576,7 +609,8 @@ class CentralQueries:
                 object_name as table_name,
                 object_type,
                 partition_name,
-                compression_type_applied as strategy,
+                CASE WHEN {rollback_row_sql()} THEN 'ROLLBACK (NOCOMPRESS)'
+                     ELSE compression_type_applied END as strategy,
                 original_size_mb,
                 compressed_size_mb as final_size_mb,
                 space_saved_mb as savings_mb,
@@ -877,7 +911,7 @@ class CentralQueries:
                            ORDER BY start_time DESC
                        ) as rn
                 FROM t_compression_history
-                WHERE 1=1 {hist_db_filter}
+                WHERE {not_rollback_row_sql()} {hist_db_filter}
             ) h ON h.database_id = a.database_id
                AND h.owner = a.owner AND h.object_name = a.object_name
                AND h.pn = NVL(a.partition_name, '~')
@@ -1058,10 +1092,13 @@ class CentralQueries:
                 partition_name,
                 subpartition_name,
                 compression_type_applied as strategy,
+                CASE WHEN {rollback_row_sql()} THEN 'ROLLBACK'
+                     ELSE 'COMPRESSION' END as operation_type,
                 original_size_mb,
                 compressed_size_mb as final_size_mb,
                 space_saved_mb as savings_mb,
-                space_saved_pct as savings_pct,
+                CASE WHEN {rollback_row_sql()} THEN NULL
+                     ELSE space_saved_pct END as savings_pct,
                 operation_status as status,
                 rollback_status,
                 start_time as executed_at,
@@ -1169,7 +1206,7 @@ class CentralQueries:
                     SUM(space_saved_mb) as total_savings_mb,
                     COUNT(CASE WHEN operation_status = 'SUCCESS' THEN 1 END) as success_count
                 FROM t_compression_history
-                WHERE operation_status = 'SUCCESS'
+                WHERE operation_status = 'SUCCESS' AND {not_rollback_row_sql()}
                 {db_filter_fb}
                 GROUP BY compression_type_applied
                 ORDER BY total_savings_mb DESC
@@ -1826,7 +1863,8 @@ class CentralQueries:
         query = f"""
             SELECT
                 history_id as operation_id,
-                'COMPRESSION' as operation_type,
+                CASE WHEN {rollback_row_sql()} THEN 'ROLLBACK'
+                     ELSE 'COMPRESSION' END as operation_type,
                 database_id,
                 owner,
                 object_name as table_name,
@@ -1877,13 +1915,13 @@ class CentralQueries:
         Get progress for a specific operation
 
         Args:
-            operation_type: 'COMPRESSION' or 'ANALYSIS'
+            operation_type: 'COMPRESSION', 'ROLLBACK' (both history rows) or 'ANALYSIS'
             operation_id: Operation ID (history_id or run_id)
 
         Returns:
             dict with progress information
         """
-        if operation_type == 'COMPRESSION':
+        if operation_type in ('COMPRESSION', 'ROLLBACK'):
             query = """
                 SELECT
                     history_id as operation_id,
@@ -1959,7 +1997,8 @@ class CentralQueries:
             SELECT * FROM (
                 SELECT
                     history_id as operation_id,
-                    'COMPRESSION' as operation_type,
+                    CASE WHEN {rollback_row_sql()} THEN 'ROLLBACK'
+                         ELSE 'COMPRESSION' END as operation_type,
                     database_id,
                     owner,
                     object_name as name,
@@ -2904,8 +2943,10 @@ class CentralQueries:
                     database_id,
                     COUNT(*) as total_executions,
                     COUNT(CASE WHEN operation_status = 'SUCCESS' THEN 1 END) as successful_executions,
-                    COALESCE(SUM(space_saved_mb), 0) / 1024 as total_space_saved_gb
+                    COALESCE(SUM(CASE WHEN operation_status = 'SUCCESS'
+                                      THEN space_saved_mb END), 0) / 1024 as total_space_saved_gb
                 FROM t_compression_history
+                WHERE {not_rollback_row_sql()}
                 GROUP BY database_id
             ) hist ON t.database_id = hist.database_id
             WHERE t.is_active = 'Y'

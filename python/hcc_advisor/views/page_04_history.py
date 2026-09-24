@@ -9,7 +9,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from typing import Optional
-from hcc_advisor.utils.central_queries import CentralQueries
+from hcc_advisor.utils.central_queries import CentralQueries, ROLLBACK_ROW_STATUS
 from hcc_advisor.utils.target_queries import TargetQueries, _blank_to_none, rollback_block_reason
 from hcc_advisor.config import config
 from hcc_advisor.auth import AuthManager, ROLE_OPERATOR
@@ -25,6 +25,16 @@ def _rollback_object_label(row) -> str:
     elif part:
         label += f" partition {part}"
     return label
+
+
+def _rollback_rows_mask(df: pd.DataFrame) -> pd.Series:
+    """True for the rows rollback_compression wrote for its own NOCOMPRESS move
+    (operation_type ROLLBACK, i.e. ROLLBACK_STATUS = ROLLBACK_ROW_STATUS)."""
+    if 'operation_type' in df.columns:
+        return df['operation_type'].astype(str).str.upper().eq('ROLLBACK')
+    if 'rollback_status' in df.columns:
+        return df['rollback_status'].astype(str).str.upper().eq(ROLLBACK_ROW_STATUS)
+    return pd.Series(False, index=df.index)
 
 
 def _rollback_block_reason(row) -> Optional[str]:
@@ -88,6 +98,11 @@ def show_history_page():
     if 'executed_at' in df.columns:
         df['executed_at'] = pd.to_datetime(df['executed_at'])
 
+    # A rollback's own row (its NOCOMPRESS move) is listed and labelled, but it
+    # is not a compression: savings figures and the rollback picker skip it.
+    is_rollback = _rollback_rows_mask(df)
+    comp_df = df[~is_rollback]
+
     # Summary metrics
     col1, col2, col3, col4 = st.columns(4)
 
@@ -107,7 +122,9 @@ def show_history_page():
         )
 
     with col3:
-        total_savings = df['savings_pct'].mean() if 'savings_pct' in df.columns and not df['savings_pct'].isna().all() else 0
+        total_savings = (comp_df['savings_pct'].mean()
+                         if 'savings_pct' in comp_df.columns and not comp_df['savings_pct'].isna().all()
+                         else 0)
         st.metric(
             label="Avg Savings",
             value=f"{total_savings:.1f}%"
@@ -185,7 +202,8 @@ def show_history_page():
         st.subheader("Executions by Strategy")
 
         if 'strategy' in df.columns and not df['strategy'].isna().all():
-            strategy_counts = df['strategy'].value_counts()
+            # rollbacks get their own bar instead of counting as NONE
+            strategy_counts = df['strategy'].where(~is_rollback, 'ROLLBACK').value_counts()
 
             fig = go.Figure(data=[
                 go.Bar(
@@ -208,9 +226,9 @@ def show_history_page():
     with col2:
         st.subheader("Savings Distribution")
 
-        if 'savings_pct' in df.columns and not df['savings_pct'].isna().all():
+        if 'savings_pct' in comp_df.columns and not comp_df['savings_pct'].isna().all():
             fig = px.histogram(
-                df.dropna(subset=['savings_pct']),
+                comp_df.dropna(subset=['savings_pct']),
                 x='savings_pct',
                 nbins=20,
                 color_discrete_sequence=[config.CHART_COLORS['success']]
@@ -230,8 +248,9 @@ def show_history_page():
     st.markdown("---")
     st.subheader("Top Tables by Savings")
 
-    if 'savings_pct' in df.columns and 'table_name' in df.columns and not df['savings_pct'].isna().all():
-        top_tables = df.dropna(subset=['savings_pct']).nlargest(10, 'savings_pct')
+    if ('savings_pct' in comp_df.columns and 'table_name' in comp_df.columns
+            and not comp_df['savings_pct'].isna().all()):
+        top_tables = comp_df.dropna(subset=['savings_pct']).nlargest(10, 'savings_pct')
 
         if not top_tables.empty:
             fig = go.Figure()
@@ -264,6 +283,7 @@ def show_history_page():
     available_columns = df.columns.tolist()
     display_column_mapping = {
         'execution_id': 'ID',
+        'operation_type': 'Operation',
         'table_owner': 'Owner',
         'table_name': 'Table',
         'partition_name': 'Partition',
@@ -279,6 +299,11 @@ def show_history_page():
     # Filter to available columns
     display_columns = [c for c in display_column_mapping.keys() if c in available_columns]
     display_df = df[display_columns].copy()
+    if 'operation_type' in display_df.columns:
+        display_df['operation_type'] = is_rollback.map({True: 'Rollback', False: 'Compression'})
+    if 'rollback_status' in display_df.columns:
+        # a rollback row's marker is shown as its Operation, not as a rollback state
+        display_df['rollback_status'] = display_df['rollback_status'].where(~is_rollback, None)
     display_df.columns = [display_column_mapping[c] for c in display_columns]
 
     # Format dates
@@ -297,8 +322,10 @@ def show_history_page():
     )
 
     # Rollback section: completed compressions (and ones already rolled back, so
-    # the user sees why the button is disabled rather than the row vanishing)
-    rollback_rows = df[df['status'].isin(['SUCCESS', 'ROLLED_BACK'])] if 'status' in df.columns else pd.DataFrame()
+    # the user sees why the button is disabled rather than the row vanishing).
+    # A rollback's own row is not offered: there is nothing to roll back.
+    rollback_rows = (comp_df[comp_df['status'].isin(['SUCCESS', 'ROLLED_BACK'])]
+                     if 'status' in comp_df.columns else pd.DataFrame())
     if not rollback_rows.empty:
         with st.expander("Rollback Compression"):
             rollback_target = st.selectbox(

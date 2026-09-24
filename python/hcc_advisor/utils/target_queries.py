@@ -176,8 +176,13 @@ def rollback_block_reason(operation_status, rollback_status=None,
     Shared by the History page (disables the button and shows the reason) and
     rollback_compression (refuses a stale or duplicate request server-side).
     """
+    from hcc_advisor.utils.central_queries import ROLLBACK_ROW_STATUS
+
     status = str(_blank_to_none(operation_status) or '').upper()
-    if status == 'ROLLED_BACK' or str(_blank_to_none(rollback_status) or '').upper() == 'ROLLED_BACK':
+    rb_status = str(_blank_to_none(rollback_status) or '').upper()
+    if rb_status == ROLLBACK_ROW_STATUS:
+        return "it is a rollback (a NOCOMPRESS move), not a compression"
+    if status == 'ROLLED_BACK' or rb_status == 'ROLLED_BACK':
         return "it has already been rolled back"
     if status != 'SUCCESS':
         return f"its status is {status or 'unknown'} (only SUCCESS compressions can be rolled back)"
@@ -195,9 +200,10 @@ def rollback_block_reason(operation_status, rollback_status=None,
 # ----------------------------------------------------------------------------
 
 # Work this app process is doing right now: history rows of synchronous
-# execute_compression calls and advisor runs of start_analysis threads. The
-# reconciler never touches these, whatever their age (Streamlit sessions share
-# the process, so this covers every open browser session of this app).
+# execute_compression and rollback_compression calls, and advisor runs of
+# start_analysis threads. The reconciler never touches these, whatever their
+# age (Streamlit sessions share the process, so this covers every open browser
+# session of this app).
 _ACTIVE_LOCK = threading.Lock()
 _ACTIVE_HISTORY_IDS: set = set()
 _ACTIVE_ADVISOR_RUNS: set = set()
@@ -268,6 +274,27 @@ def _already_open_error(label: str, open_row: Dict[str, Any], outcome: str) -> s
     """Refusal message for a segment that has an open row (see _open_segment_row)."""
     return (f"{label} is already queued or running (history_id {open_row['history_id']}, "
             f"{open_row['status']}): {outcome} - see the Scheduler page")
+
+
+def _overlap_error(label: str, blocker: Dict[str, Any], outcome: str) -> str:
+    """Refusal message for a segment an open row overlaps (see
+    TargetQueries._overlapping_open_row): the same segment, or the whole table,
+    its partition or one of its subpartitions."""
+    if str(blocker['label']).upper() == str(label).upper():
+        return _already_open_error(label, blocker, outcome)
+    what = 'rollback' if blocker.get('operation') == 'ROLLBACK' else 'compression'
+    return (f"{label} overlaps {blocker['label']}, which has a queued or running {what} "
+            f"(history_id {blocker['history_id']}, {blocker['status']}): {outcome} "
+            f"- see the Scheduler page")
+
+
+def _rollback_blocked_error(target: str, blocker: Dict[str, Any]) -> str:
+    """rollback_compression's refusal while an overlapping row is open."""
+    state = 'running' if blocker['status'] == 'IN_PROGRESS' else 'queued'
+    what = 'rollback' if blocker.get('operation') == 'ROLLBACK' else 'compression'
+    return (f"Cannot roll back {target}: a {what} of {blocker['label']} is {state} "
+            f"(history_id {blocker['history_id']}) and would overlap it. Roll back once "
+            f"that job has finished (see the Scheduler page).")
 
 
 def _execution_mode(oracle_version, partition_name=None, subpartition_name=None) -> str:
@@ -1806,10 +1833,13 @@ class TargetQueries:
             non-Exadata target (generate_ddl ValueError) is returned as
             {'success': False, 'error': ...}.
             Nothing is run without an IN_PROGRESS history row:
-            {'success': False, 'duplicate': True, 'error'} when the segment is
-            already queued or running (its open row, or the unique index
-            rejecting the insert); {'success': False, 'error'} when the row
-            could not be checked or written.
+            {'success': False, 'duplicate': True, 'error'} when a QUEUED /
+            IN_PROGRESS row overlaps the segment (segments_overlap: the same
+            segment, the whole table, its parent partition or one of its
+            subpartitions), before or after this call's own row is written
+            (then closed FAILED), or the unique index rejects that row;
+            {'success': False, 'error'} when the history could not be checked
+            or written.
         """
         # Handle None/NaN/blank partition and subpartition names
         partition_name = _blank_to_none(partition_name)
@@ -1867,20 +1897,22 @@ class TargetQueries:
         except Exception:
             pass
 
-        # One open history row per segment: a segment that is already queued
-        # or running is not moved a second time. UNQ_HISTORY_OPEN_SEGMENT makes
-        # this race-free (the insert below is then rejected); without the
-        # patch this check is the only guard.
+        # Nothing is moved while a queued or running job, direct run or rollback
+        # overlaps the segment (the same segment, the whole table, its parent
+        # partition or one of its subpartitions; see segments_overlap): the two
+        # MOVEs would collide and measure each other's work. Checked again
+        # after our own IN_PROGRESS row is written (see below);
+        # UNQ_HISTORY_OPEN_SEGMENT also rejects that row for the exact segment.
         label = _segment_label(owner, table_name, partition_name, subpartition_name)
         try:
-            open_row = TargetQueries._open_segment_row(database_id, owner, table_name,
-                                                       partition_name, subpartition_name)
+            open_row = TargetQueries._overlapping_open_row(database_id, owner, table_name,
+                                                           partition_name, subpartition_name)
         except Exception as e:
             return {'success': False,
                     'error': f"Could not check the history of {label}, not compressed: {e}"}
         if open_row:
             return {'success': False, 'duplicate': True,
-                    'error': _already_open_error(label, open_row, "not compressed again")}
+                    'error': _overlap_error(label, open_row, "not compressed")}
 
         # Insert IN_PROGRESS history record
         start_dt = datetime.now()
@@ -1909,19 +1941,41 @@ class TargetQueries:
             # invisible to the scheduler's overlap check and DOP budget, to
             # reconcile, to the savings reports and to rollback.
             try:
-                open_row = TargetQueries._open_segment_row(database_id, owner, table_name,
-                                                           partition_name, subpartition_name)
+                open_row = TargetQueries._overlapping_open_row(database_id, owner, table_name,
+                                                               partition_name, subpartition_name)
             except Exception:
                 open_row = None
             if open_row:
                 return {'success': False, 'duplicate': True,
-                        'error': _already_open_error(label, open_row, "not compressed again")}
+                        'error': _overlap_error(label, open_row, "not compressed")}
             return {'success': False,
                     'error': f"Could not record {label} in the compression history, "
                              f"so it was not compressed"}
         # The reconciler must not reap this row while this call is running.
         _set_active(_ACTIVE_HISTORY_IDS, history_id, True)
         try:
+            # Overlapping rows written since the check above (a claimed job, a
+            # direct run or rollback of the table / a partition of it): the
+            # unique index only covers the exact segment. If two overlapping
+            # runs race, each sees the other's row and neither moves.
+            try:
+                blocker = TargetQueries._overlapping_open_row(
+                    database_id, owner, table_name, partition_name, subpartition_name,
+                    exclude_history_id=history_id)
+            except Exception as e:
+                TargetQueries._close_job_row(
+                    database_id, history_id, 'FAILED',
+                    f"Not run: could not re-check the history for overlapping work ({e})")
+                return {'success': False,
+                        'error': f"Could not check the history of {label}, not compressed: {e}"}
+            if blocker:
+                TargetQueries._close_job_row(
+                    database_id, history_id, 'FAILED',
+                    f"Not run: blocked by {blocker['label']} (history_id "
+                    f"{blocker['history_id']}, {blocker['status']}), which was queued or "
+                    f"started at the same time")
+                return {'success': False, 'duplicate': True,
+                        'error': _overlap_error(label, blocker, "not compressed")}
             return TargetQueries._run_compression_ddl(
                 database_id, owner, table_name, compression_type, partition_name,
                 parallel_degree, ddl_exec, orig_size, history_id, seg_q, seg_params,
@@ -2949,13 +3003,17 @@ MOVE {compression_clause}
     # (sub)partitions, matched by position because system-generated names differ
     # between a table and its local index, plus every unusable GLOBAL index
     # structure (a partition MOVE invalidates those as a whole). For a table-level
-    # MOVE (:p and :sp NULL) only non-partitioned and GLOBAL partitioned
-    # indexes can exist. Binds: :o owner, :t table, :p partition, :sp subpartition.
-    _ROLLBACK_UNUSABLE_INDEXES_SQL = """
+    # MOVE (partition and subpartition NULL) only non-partitioned and GLOBAL
+    # partitioned indexes can exist. LOB and IOT-top indexes are never rebuilt.
+    # Placeholders {o} owner, {t} table, {p} partition, {sp} subpartition: bind
+    # variables in _ROLLBACK_UNUSABLE_INDEXES_SQL (the synchronous paths), PL/SQL
+    # variables in the scheduler job action (_compression_job_action), so both
+    # apply exactly the same rules.
+    _UNUSABLE_INDEXES_TEMPLATE = """
         SELECT i.owner AS index_owner, i.index_name,
                'INDEX' AS rebuild_level, CAST(NULL AS VARCHAR2(128)) AS segment_name
           FROM all_indexes i
-         WHERE i.table_owner = :o AND i.table_name = :t
+         WHERE i.table_owner = {o} AND i.table_name = {t}
            AND i.index_type NOT IN ('LOB', 'IOT - TOP')
            AND i.partitioned = 'NO' AND i.status = 'UNUSABLE'
         UNION ALL
@@ -2965,14 +3023,14 @@ MOVE {compression_clause}
             ON pi.owner = i.owner AND pi.index_name = i.index_name
           JOIN all_ind_partitions ip
             ON ip.index_owner = i.owner AND ip.index_name = i.index_name
-         WHERE i.table_owner = :o AND i.table_name = :t
+         WHERE i.table_owner = {o} AND i.table_name = {t}
            AND i.index_type NOT IN ('LOB', 'IOT - TOP')
            AND ip.status = 'UNUSABLE'
            AND (pi.locality = 'GLOBAL'
                 OR ip.partition_position = (
                     SELECT tp.partition_position FROM all_tab_partitions tp
-                     WHERE tp.table_owner = :o AND tp.table_name = :t
-                       AND tp.partition_name = :p))
+                     WHERE tp.table_owner = {o} AND tp.table_name = {t}
+                       AND tp.partition_name = {p}))
         UNION ALL
         SELECT isp.index_owner, isp.index_name, 'SUBPARTITION', isp.subpartition_name
           FROM all_indexes i
@@ -2981,7 +3039,7 @@ MOVE {compression_clause}
           JOIN all_ind_subpartitions isp
             ON isp.index_owner = ip.index_owner AND isp.index_name = ip.index_name
            AND isp.partition_name = ip.partition_name
-         WHERE i.table_owner = :o AND i.table_name = :t
+         WHERE i.table_owner = {o} AND i.table_name = {t}
            AND i.index_type NOT IN ('LOB', 'IOT - TOP')
            AND isp.status = 'UNUSABLE'
            AND (ip.partition_position, isp.subpartition_position) IN (
@@ -2990,9 +3048,12 @@ MOVE {compression_clause}
                   JOIN all_tab_partitions tp
                     ON tp.table_owner = tsp.table_owner AND tp.table_name = tsp.table_name
                    AND tp.partition_name = tsp.partition_name
-                 WHERE tsp.table_owner = :o AND tsp.table_name = :t
-                   AND tsp.subpartition_name = :sp)
+                 WHERE tsp.table_owner = {o} AND tsp.table_name = {t}
+                   AND tsp.subpartition_name = {sp})
     """
+
+    # Binds: :o owner, :t table, :p partition, :sp subpartition.
+    _ROLLBACK_UNUSABLE_INDEXES_SQL = _UNUSABLE_INDEXES_TEMPLATE.format(o=':o', t=':t', p=':p', sp=':sp')
 
     @staticmethod
     def _index_rebuild_statement(index_row, parallel_degree: int) -> str:
@@ -3055,26 +3116,55 @@ MOVE {compression_clause}
     @staticmethod
     def _overlapping_open_row(database_id: int, owner: str, table_name: str,
                               partition_name: Optional[str] = None,
-                              subpartition_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """{'history_id', 'status', 'label'} of a QUEUED / IN_PROGRESS row of this
-        table whose segment overlaps the given one (segments_overlap: the same
-        segment, the whole table, or a partition and its subpartitions), or
-        None. Raises on a database error."""
+                              subpartition_name: Optional[str] = None,
+                              exclude_history_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """{'history_id', 'status', 'label', 'operation'} of a QUEUED /
+        IN_PROGRESS row of this table whose segment overlaps the given one
+        (segments_overlap: the same segment, the whole table, or a partition and
+        its subpartitions), or None. 'operation' is ROLLBACK for a rollback's
+        own row, else COMPRESSION. exclude_history_id: the caller's own open row,
+        which is never reported. Raises on a database error."""
         from hcc_advisor.utils.central_connector import CentralConnector
+        from hcc_advisor.utils.central_queries import ROLLBACK_ROW_STATUS
 
         df = CentralConnector.execute_query("""
-            SELECT history_id, operation_status, partition_name, subpartition_name
+            SELECT history_id, operation_status, partition_name, subpartition_name, rollback_status
             FROM t_compression_history
             WHERE database_id = :db AND owner = :o AND object_name = :t
               AND operation_status IN ('QUEUED', 'IN_PROGRESS')
             ORDER BY history_id
         """, {'db': database_id, 'o': owner, 't': table_name}, raise_on_error=True)
         for r in df.to_dict('records'):
+            if exclude_history_id is not None and int(r['HISTORY_ID']) == int(exclude_history_id):
+                continue
             part, sub = _blank_to_none(r['PARTITION_NAME']), _blank_to_none(r['SUBPARTITION_NAME'])
             if segments_overlap(partition_name, subpartition_name, part, sub):
+                rollback = _blank_to_none(r.get('ROLLBACK_STATUS')) == ROLLBACK_ROW_STATUS
                 return {'history_id': int(r['HISTORY_ID']), 'status': r['OPERATION_STATUS'],
-                        'label': _segment_label(owner, table_name, part, sub)}
+                        'label': _segment_label(owner, table_name, part, sub),
+                        'operation': 'ROLLBACK' if rollback else 'COMPRESSION'}
         return None
+
+    # A rollback's own history row (rollback_compression), open while its
+    # NOCOMPRESS MOVE runs: marked ROLLBACK_STATUS = :rb_marker
+    # (central_queries.ROLLBACK_ROW_STATUS), never rollback-able itself, and
+    # without sizes, so no savings figure can come from it. COMPRESSION_CLAUSE
+    # labels it ("ROLLBACK of history_id n") in the scheduler monitor.
+    _ROLLBACK_ROW_INSERT_SQL = """
+        INSERT INTO t_compression_history (
+            database_id, owner, object_name, object_type,
+            partition_name, subpartition_name, compression_type_applied,
+            compression_clause, execution_mode, parallel_degree,
+            operation_status, start_time, executed_by,
+            rollback_possible, rollback_status, original_ddl
+        ) VALUES (
+            :db, :owner, :tbl, :otype,
+            :part, :sub, 'NONE',
+            :clause, :mode, :dop,
+            'IN_PROGRESS', SYSTIMESTAMP, :executed_by,
+            'N', :rb_marker, :ddl
+        )
+        RETURNING history_id INTO :new_id"""
 
     @staticmethod
     def _record_rollback(history_id: Optional[int], rolled_back: bool,
@@ -3125,18 +3215,32 @@ MOVE {compression_clause}
 
         With ``history_id`` the row is re-checked first (it must still be a
         SUCCESS for this exact object) and the outcome is recorded on it.
-        Nothing is moved while a QUEUED / IN_PROGRESS compression row overlaps
-        the segment (the same segment, the whole table, or its parent partition
-        or subpartitions; see segments_overlap): that is refused with
+        Nothing is moved while a QUEUED / IN_PROGRESS row overlaps the segment
+        (the same segment, the whole table, or its parent partition or
+        subpartitions; see segments_overlap): that is refused with
         {'success': False, 'blocked': True, 'error': reason}.
 
+        While it runs, the rollback holds an IN_PROGRESS history row of its own
+        for the segment (_ROLLBACK_ROW_INSERT_SQL; marked ROLLBACK_STATUS =
+        central_queries.ROLLBACK_ROW_STATUS), so nothing overlapping is claimed
+        from the queue, run directly or rolled back meanwhile: the scheduler's
+        claim check, execute_compression, UNQ_HISTORY_OPEN_SEGMENT and reconcile
+        (which treats it like a direct run; this process registers it as live)
+        all respect that row. Overlap is checked again once the row is written;
+        a row that appeared in between closes ours as FAILED ("Not run: blocked
+        by ..."). Afterwards the row is closed SUCCESS or FAILED with the error.
+        It records no sizes, and savings reports skip it.
+
         Returns:
-            dict with success, message / error, and index_failures (list).
+            dict with success, message / error, index_failures (list) and
+            rollback_history_id (the rollback's own row, once written).
         """
         from hcc_advisor.utils.central_connector import CentralConnector
+        from hcc_advisor.utils.central_queries import ROLLBACK_ROW_STATUS
 
         partition_name = _blank_to_none(partition_name)
         subpartition_name = _blank_to_none(subpartition_name)
+        oracle_version = target_ddl_info(database_id).get('oracle_version')
 
         # SECURITY (CWE-89): generate_ddl validates every identifier, refuses
         # Oracle-maintained schemas and bounds the parallel degree. The target's
@@ -3144,8 +3248,7 @@ MOVE {compression_clause}
         try:
             ddl = TargetQueries.generate_ddl(
                 owner, table_name, 'NONE', partition_name, subpartition_name,
-                parallel_degree=parallel_degree,
-                oracle_version=target_ddl_info(database_id).get('oracle_version'),
+                parallel_degree=parallel_degree, oracle_version=oracle_version,
             ).rstrip().rstrip(';')
             dop = _validate_parallel_degree(parallel_degree)
         except ValueError as e:
@@ -3186,13 +3289,92 @@ MOVE {compression_clause}
             return {'success': False,
                     'error': f"Could not check the job queue for {target}, not rolled back: {e}"}
         if blocker:
-            state = 'running' if blocker['status'] == 'IN_PROGRESS' else 'queued'
             return {'success': False, 'blocked': True,
-                    'error': (f"Cannot roll back {target}: a compression of {blocker['label']} "
-                              f"is {state} (history_id {blocker['history_id']}) and would "
-                              f"overlap it. Roll back once that job has finished (see the "
-                              f"Scheduler page).")}
+                    'error': _rollback_blocked_error(target, blocker)}
 
+        # The rollback's own open row: from here on the segment is busy for
+        # the queue, direct runs and other rollbacks.
+        row = {
+            'db': database_id, 'owner': owner, 'tbl': table_name,
+            'otype': object_level(partition_name, subpartition_name),
+            'part': partition_name, 'sub': subpartition_name,
+            'clause': (f"ROLLBACK of history_id {int(history_id)}" if history_id is not None
+                       else "ROLLBACK to NOCOMPRESS"),
+            'mode': _execution_mode(oracle_version, partition_name, subpartition_name),
+            'dop': dop, 'executed_by': _acting_user(),
+            'rb_marker': ROLLBACK_ROW_STATUS, 'ddl': ddl,
+        }
+        insert_error = None
+        try:
+            # Strict mode: a rejected insert is reported below, not as the
+            # connector's raw ORA-00001 banner.
+            row_id = CentralConnector.execute_dml_returning(
+                TargetQueries._ROLLBACK_ROW_INSERT_SQL, row, raise_on_error=True)
+        except Exception as e:
+            row_id = None
+            if not _is_open_segment_conflict(e):
+                insert_error = e
+                log_error(e, "TargetQueries.rollback_compression", {'segment': target})
+        if not row_id:
+            if insert_error is None:
+                # UNQ_HISTORY_OPEN_SEGMENT (or no id back): the segment was
+                # queued or started by another session since the check above.
+                try:
+                    blocker = TargetQueries._overlapping_open_row(
+                        database_id, owner, table_name, partition_name, subpartition_name)
+                except Exception:
+                    blocker = None
+                if blocker:
+                    return {'success': False, 'blocked': True,
+                            'error': _rollback_blocked_error(target, blocker)}
+            return {'success': False,
+                    'error': f"Could not record the rollback of {target} in the compression "
+                             f"history, so it was not rolled back"
+                             + (f": {insert_error}" if insert_error else "")}
+
+        # The reconciler must not reap this row while this call is running.
+        _set_active(_ACTIVE_HISTORY_IDS, row_id, True)
+        try:
+            return TargetQueries._run_rollback(
+                database_id, owner, table_name, partition_name, subpartition_name,
+                ddl, dop, target, history_id, int(row_id))
+        finally:
+            _set_active(_ACTIVE_HISTORY_IDS, row_id, False)
+
+    @staticmethod
+    def _run_rollback(database_id, owner, table_name, partition_name, subpartition_name,
+                      ddl, dop, target, history_id, row_id) -> Dict[str, Any]:
+        """rollback_compression once its own IN_PROGRESS row (row_id) is written:
+        re-check overlap, run the NOCOMPRESS MOVE, rebuild the segment's unusable
+        index structures, close row_id and record the outcome on history_id."""
+        import time as _time
+        from hcc_advisor.utils.central_connector import CentralConnector
+
+        def _close(status, message=None, duration=None):
+            if TargetQueries._close_job_row(database_id, row_id, status, message,
+                                            duration=duration) != 1:
+                log_warning(f"Rollback of {target}: its history row {row_id} was not closed as "
+                            f"{status} (reconcile closes it once it is stale)")
+
+        # Overlapping rows written since the pre-check: the unique index only
+        # covers the exact segment. If two overlapping operations race, each
+        # sees the other's row and neither moves.
+        try:
+            blocker = TargetQueries._overlapping_open_row(
+                database_id, owner, table_name, partition_name, subpartition_name,
+                exclude_history_id=row_id)
+        except Exception as e:
+            _close('FAILED', f"Rollback not run: could not re-check the job queue ({e})")
+            return {'success': False, 'rollback_history_id': row_id,
+                    'error': f"Could not check the job queue for {target}, not rolled back: {e}"}
+        if blocker:
+            _close('FAILED', f"Rollback not run: blocked by {blocker['label']} (history_id "
+                             f"{blocker['history_id']}, {blocker['status']}), which was queued or "
+                             f"started at the same time")
+            return {'success': False, 'blocked': True, 'rollback_history_id': row_id,
+                    'error': _rollback_blocked_error(target, blocker)}
+
+        t0 = _time.perf_counter()
         try:
             ok = TargetConnector.execute_plsql(
                 database_id, f"BEGIN EXECUTE IMMEDIATE q'[{ddl}]'; END;"
@@ -3202,12 +3384,15 @@ MOVE {compression_clause}
             ok, err = False, str(e)
         if not ok:
             log_warning(f"Rollback of {target} failed: {err}")
+            _close('FAILED', f"Rollback failed: {err}", round(_time.perf_counter() - t0, 1))
             TargetQueries._record_rollback(history_id, False, 'FAILED', f"Rollback failed: {err}")
-            return {'success': False, 'error': f"Rollback of {target} failed: {err}"}
+            return {'success': False, 'rollback_history_id': row_id,
+                    'error': f"Rollback of {target} failed: {err}"}
 
         # Rebuild the index structures the MOVE left UNUSABLE (scoped to the segment).
         idx_rebuilt, idx_failed = TargetQueries._rebuild_unusable_indexes(
             database_id, owner, table_name, partition_name, subpartition_name, dop, target)
+        duration = round(_time.perf_counter() - t0, 1)
 
         try:
             CentralConnector.execute_dml("""
@@ -3227,11 +3412,14 @@ MOVE {compression_clause}
             msg += f", {idx_rebuilt} index structure(s) rebuilt"
         if idx_failed:
             msg += f"; {len(idx_failed)} index rebuild(s) failed: {', '.join(idx_failed)}"
-            TargetQueries._record_rollback(history_id, True, 'ROLLED_BACK_INDEX_ERRORS',
-                                           f"Rollback: index rebuild failed for {', '.join(idx_failed)}")
+            note = f"Rollback: index rebuild failed for {', '.join(idx_failed)}"
+            _close('SUCCESS', note, duration)
+            TargetQueries._record_rollback(history_id, True, 'ROLLED_BACK_INDEX_ERRORS', note)
         else:
+            _close('SUCCESS', None, duration)
             TargetQueries._record_rollback(history_id, True, 'ROLLED_BACK')
-        return {'success': True, 'message': msg, 'index_failures': idx_failed}
+        return {'success': True, 'message': msg, 'index_failures': idx_failed,
+                'rollback_history_id': row_id}
 
     # ============================================================================
     # AWR/ASH INTEGRATION FOR HOTNESS (requires Diagnostics Pack license)
@@ -4035,6 +4223,80 @@ MOVE {compression_clause}
         return _safe_int(_blank_to_none(df.iloc[0]['SIZE_BYTES']))
 
     @staticmethod
+    def _compression_job_action(ddl: str, owner: str, table_name: str,
+                                partition_name: Optional[str], subpartition_name: Optional[str],
+                                parallel_degree: int) -> str:
+        """PL/SQL action of a scheduler compression job: the MOVE, then the
+        rebuild of the index structures that MOVE left UNUSABLE, found by the
+        same query as _rebuild_unusable_indexes (_UNUSABLE_INDEXES_TEMPLATE, run
+        by the job right after its MOVE): the moved segment's local index
+        (sub)partitions matched by position, unusable global indexes and global
+        index partitions, never LOB / IOT-top indexes. Unusable structures of
+        other segments are left alone. After an ONLINE MOVE nothing is unusable
+        and the loop does nothing.
+
+        The outcome reaches the history row through the scheduler's run log
+        (reconcile_operations): a failed MOVE fails the job; a failed rebuild
+        does not stop the others, but the job then ends with ORA-20001 naming
+        the structures that stay UNUSABLE.
+
+        SECURITY (CWE-89): the segment names are validated identifiers
+        (generate_ddl built `ddl` from them) and the DOP a bounded integer;
+        index names are read by the job at run time and quoted with
+        DBMS_ASSERT.ENQUOTE_NAME. Raises ValueError on an unsafe value. The
+        action is whitespace-compacted: JOB_ACTION holds 4000 bytes at most.
+        """
+        def _literal(value, kind):
+            value = _blank_to_none(value)
+            if value is None:
+                return 'NULL'
+            return f"'{_validate_identifier(str(value).upper(), kind)}'"
+
+        dop = _validate_parallel_degree(parallel_degree)
+        sub = _blank_to_none(subpartition_name)
+        # a subpartition MOVE leaves the parent's local index partitions alone
+        part = None if sub else _blank_to_none(partition_name)
+        indexes = TargetQueries._UNUSABLE_INDEXES_TEMPLATE.format(
+            o='v_owner', t='v_table', p='v_partition', sp='v_subpartition')
+        action = f"""
+            DECLARE
+                v_owner        VARCHAR2(128) := {_literal(owner, 'owner')};
+                v_table        VARCHAR2(128) := {_literal(table_name, 'table name')};
+                v_partition    VARCHAR2(128) := {_literal(part, 'partition name')};
+                v_subpartition VARCHAR2(128) := {_literal(sub, 'subpartition name')};
+                v_failed       PLS_INTEGER := 0;
+                v_list         VARCHAR2(1000);
+            BEGIN
+                EXECUTE IMMEDIATE '{ddl.replace("'", "''")}';
+                FOR idx IN ({indexes}) LOOP
+                    BEGIN
+                        EXECUTE IMMEDIATE 'ALTER INDEX '
+                            || DBMS_ASSERT.ENQUOTE_NAME(idx.index_owner, FALSE) || '.'
+                            || DBMS_ASSERT.ENQUOTE_NAME(idx.index_name, FALSE)
+                            || CASE WHEN idx.segment_name IS NULL THEN ' REBUILD'
+                                    ELSE ' REBUILD ' || TRIM(idx.rebuild_level) || ' '
+                                         || DBMS_ASSERT.ENQUOTE_NAME(idx.segment_name, FALSE) END
+                            || ' ONLINE PARALLEL {dop}';
+                    EXCEPTION
+                        WHEN OTHERS THEN
+                            v_failed := v_failed + 1;
+                            v_list := SUBSTRB(v_list || CASE WHEN v_list IS NOT NULL THEN '; ' END
+                                || idx.index_owner || '.' || idx.index_name || ' '
+                                || idx.segment_name || ' (' || SUBSTR(SQLERRM, 1, 200) || ')',
+                                1, 1000);
+                    END;
+                END LOOP;
+                IF v_failed > 0 THEN
+                    RAISE_APPLICATION_ERROR(-20001, SUBSTRB('MOVE completed, but ' || v_failed
+                        || ' index rebuild(s) failed and stay UNUSABLE: ' || v_list, 1, 2000));
+                END IF;
+            END;
+        """
+        # Safe to compact: the only string literal with newlines or runs of
+        # spaces is the MOVE DDL, where they are plain SQL whitespace.
+        return " ".join(action.split())
+
+    @staticmethod
     def submit_queued_job(item: Dict, target_info: Optional[Dict[str, Optional[str]]] = None) -> Dict[str, Any]:
         """Claim one QUEUED row and submit it as a DBMS_SCHEDULER job.
 
@@ -4132,21 +4394,8 @@ MOVE {compression_clause}
         # "Before" size of this job's own segment, taken before the job can start.
         orig_size = TargetQueries._segment_size_bytes(did, owner, table, part, sub)
 
-        idx_owner, idx_table = str(owner).upper(), str(table).upper()
-        action = f"""
-            DECLARE v_n NUMBER := 0;
-            BEGIN
-                EXECUTE IMMEDIATE '{ddl.replace("'", "''")}';
-                FOR idx IN (SELECT owner, index_name FROM all_indexes
-                            WHERE table_owner = '{idx_owner}' AND table_name = '{idx_table}'
-                              AND status = 'UNUSABLE')
-                LOOP
-                    EXECUTE IMMEDIATE 'ALTER INDEX ' || idx.owner || '.' || idx.index_name
-                                      || ' REBUILD ONLINE PARALLEL {dop}';
-                    v_n := v_n + 1;
-                END LOOP;
-            END;
-        """
+        # The MOVE, then the rebuild of what it left UNUSABLE on this segment only.
+        action = TargetQueries._compression_job_action(ddl, owner, table, part, sub, dop)
         # Every interpolated value is a validated identifier or an allowlisted
         # compression type (generate_ddl above); COMMENTS holds 240 bytes at most.
         comments = f"HCC Advisor: {_history_compression_type(comp)} on {label}"[:200]
@@ -4463,9 +4712,10 @@ MOVE {compression_clause}
             FAILED "job not found (never created, dropped or purged)".
           If any of these lookups fails, no scheduler row is touched: an
           unreachable target must not read as "job not found".
-        Synchronous rows (execute_compression): not owned by a live thread of
-        this app, older than sync_stale_hours, and no active target session
-        running a MOVE of the table -> FAILED "outcome unknown".
+        Synchronous rows (execute_compression, and a rollback_compression's
+        own row): not owned by a live thread of this app, older than
+        sync_stale_hours, and no active target session running a MOVE of the
+        table -> FAILED "outcome unknown".
         Advisor runs: RUNNING, older than run_stale_hours, not owned by a live
         analysis thread of this app -> FAILED.
 
@@ -4478,6 +4728,7 @@ MOVE {compression_clause}
              'advisor_runs_failed': n, 'errors': [str]}
         """
         from hcc_advisor.utils.central_connector import CentralConnector
+        from hcc_advisor.utils.central_queries import ROLLBACK_ROW_STATUS
 
         grace = TargetQueries.JOB_NOT_FOUND_GRACE_MINUTES if job_grace_minutes is None else job_grace_minutes
         sync_hours = TargetQueries.SYNC_STALE_HOURS if sync_stale_hours is None else sync_stale_hours
@@ -4504,6 +4755,7 @@ MOVE {compression_clause}
             open_df = CentralConnector.execute_query("""
                 SELECT history_id, owner, object_name, partition_name, subpartition_name,
                        compression_type_applied, compression_clause, original_size_bytes,
+                       rollback_status,
                        ROUND((SYSDATE - CAST(start_time AS DATE)) * 1440, 1) AS age_minutes
                 FROM t_compression_history
                 WHERE database_id = :db AND operation_status = 'IN_PROGRESS'
@@ -4593,7 +4845,7 @@ MOVE {compression_clause}
                                f"dropped, or its run log was purged); outcome unknown - check the "
                                f"segment's compression before resubmitting")
 
-        # --- synchronous executions (execute_compression) ---
+        # --- synchronous executions (execute_compression, rollback_compression) ---
         active_ids = _active_snapshot(_ACTIVE_HISTORY_IDS)
         for row in sync_rows:
             hid = int(row['HISTORY_ID'])
@@ -4610,6 +4862,14 @@ MOVE {compression_clause}
                 log_warning(f"Reconcile db_id={database_id}: session check failed: {e}")
                 note = " (target sessions could not be checked)"
             age_text = f"{age_hours:.0f}h" if age_hours != float('inf') else "an unknown time"
+            if _blank_to_none(row.get('ROLLBACK_STATUS')) == ROLLBACK_ROW_STATUS:
+                # A rollback's own row. The compression it undoes keeps its row
+                # (still SUCCESS unless the rollback got as far as recording it).
+                _fail(row, f"Interrupted: no result recorded {age_text} after the rollback "
+                           f"(NOCOMPRESS move) started and no target session is running it{note} "
+                           f"- the app was probably restarted mid-MOVE. Outcome unknown: check "
+                           f"the segment's compression before rolling back again.")
+                continue
             _fail(row, f"Interrupted: no result recorded {age_text} after the synchronous "
                        f"compression started and no target session is running it{note} - the app "
                        f"was probably restarted mid-MOVE. Outcome unknown: check the segment's "
