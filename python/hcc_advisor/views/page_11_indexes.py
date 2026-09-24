@@ -7,7 +7,9 @@ import streamlit as st
 import pandas as pd
 import random
 from datetime import datetime
-from hcc_advisor.utils.target_queries import TargetQueries
+from hcc_advisor.utils.target_queries import (
+    TargetQueries, _validate_identifier, _validate_parallel_degree, is_protected_schema,
+)
 from hcc_advisor.utils.target_connector import TargetConnector
 from hcc_advisor.utils.central_connector import CentralConnector
 from hcc_advisor.utils.logger import log_error
@@ -158,7 +160,11 @@ def show_indexes_page():
                 for _, row in selected.iterrows():
                     idx_owner = row['index_owner']
                     idx_name = row['index_name']
-                    row_dop = int(row.get('dop', max_dop) or max_dop)
+                    # Validated (and bounded) by _submit_rebuild_job; only an
+                    # emptied DOP cell falls back to the default.
+                    row_dop = row.get('dop')
+                    if row_dop is None or pd.isna(row_dop):
+                        row_dop = max_dop
 
                     idx_partitioned = row.get('partitioned', 'NO')
                     result = _submit_rebuild_job(db_id, idx_owner, idx_name, row_dop,
@@ -232,39 +238,60 @@ def _get_indexes(db_id: int, schema: str = None, include_valid: bool = False) ->
         return pd.DataFrame()
 
 
-def _submit_rebuild_job(db_id: int, index_owner: str, index_name: str,
-                        dop: int = 4, partitioned: str = 'NO') -> dict:
-    ts = datetime.now().strftime('%m%d%H%M%S') + f"{random.randint(0,999):03d}"
-    job_name = f"IDXR_{index_name[:25]}_{ts}"
+def _rebuild_job_action(index_owner: str, index_name: str, dop, partitioned: str = 'NO') -> str:
+    """PL/SQL job action that rebuilds one index (or its unusable partitions).
+
+    SECURITY (CWE-89): the index owner/name (from all_indexes) and the DOP (an
+    editable grid cell) are interpolated into EXECUTE IMMEDIATE and into the
+    q'[...]' job_action literal, so they are validated first. Raises ValueError.
+    """
+    index_owner = _validate_identifier(index_owner, "index owner")
+    index_name = _validate_identifier(index_name, "index name")
+    if is_protected_schema(index_owner):
+        raise ValueError(f"Refusing to rebuild {index_owner}.{index_name}: "
+                         f"{index_owner} is an Oracle-maintained schema")
+    dop = _validate_parallel_degree(dop)
 
     if partitioned == 'YES':
         # Partitioned index: must rebuild each partition individually (ORA-14086)
-        action = f"""
+        return f"""
             BEGIN
                 FOR p IN (SELECT partition_name FROM all_ind_partitions
                           WHERE index_owner = '{index_owner}' AND index_name = '{index_name}'
                             AND status = 'UNUSABLE')
                 LOOP
                     EXECUTE IMMEDIATE 'ALTER INDEX {index_owner}.{index_name} REBUILD PARTITION '
-                                      || p.partition_name || ' ONLINE PARALLEL {dop}';
+                                      || DBMS_ASSERT.ENQUOTE_NAME(p.partition_name, FALSE)
+                                      || ' ONLINE PARALLEL {dop}';
                 END LOOP;
                 FOR sp IN (SELECT partition_name, subpartition_name FROM all_ind_subpartitions
                            WHERE index_owner = '{index_owner}' AND index_name = '{index_name}'
                              AND status = 'UNUSABLE')
                 LOOP
                     EXECUTE IMMEDIATE 'ALTER INDEX {index_owner}.{index_name} REBUILD SUBPARTITION '
-                                      || sp.subpartition_name || ' ONLINE PARALLEL {dop}';
+                                      || DBMS_ASSERT.ENQUOTE_NAME(sp.subpartition_name, FALSE)
+                                      || ' ONLINE PARALLEL {dop}';
                 END LOOP;
                 EXECUTE IMMEDIATE 'ALTER INDEX {index_owner}.{index_name} NOPARALLEL';
             END;
         """
-    else:
-        action = f"""
+    return f"""
             BEGIN
                 EXECUTE IMMEDIATE 'ALTER INDEX {index_owner}.{index_name} REBUILD ONLINE PARALLEL {dop}';
                 EXECUTE IMMEDIATE 'ALTER INDEX {index_owner}.{index_name} NOPARALLEL';
             END;
         """
+
+
+def _submit_rebuild_job(db_id: int, index_owner: str, index_name: str,
+                        dop: int = 4, partitioned: str = 'NO') -> dict:
+    try:
+        action = _rebuild_job_action(index_owner, index_name, dop, partitioned)
+    except ValueError as e:
+        return {'success': False, 'error': f"Not submitted: {e}"}
+
+    ts = datetime.now().strftime('%m%d%H%M%S') + f"{random.randint(0,999):03d}"
+    job_name = f"IDXR_{index_name[:25]}_{ts}"
 
     create_job = f"""
         BEGIN

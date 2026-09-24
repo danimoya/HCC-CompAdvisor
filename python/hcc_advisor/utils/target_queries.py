@@ -31,11 +31,24 @@ def _validate_identifier(value: str, kind: str = "identifier") -> str:
     Accepts only the standard unquoted-identifier shape: starts with a letter,
     followed by letters/digits/_/$/# (max 128 chars). Rejects whitespace, quotes,
     dots, brackets and anything else that could break out of the DDL/q'[...]'
-    literal. Raises ValueError on anything unsafe.
+    literal. Raises ValueError on anything unsafe. Uses fullmatch: with match,
+    the trailing ``$`` also matches before a final newline ("NAME\\n").
     """
-    if value is None or not isinstance(value, str) or not _ORACLE_IDENTIFIER_RE.match(value):
+    if value is None or not isinstance(value, str) or not _ORACLE_IDENTIFIER_RE.fullmatch(value):
         raise ValueError(f"Invalid Oracle {kind}: {value!r}")
     return value
+
+
+def _validate_parallel_degree(value) -> int:
+    """Coerce a parallel degree to an int in 1..128 (it is interpolated into
+    DDL as PARALLEL n). Raises ValueError on anything else, including NaN."""
+    try:
+        dop = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid parallel_degree: {value!r}")
+    if not 1 <= dop <= 128:
+        raise ValueError(f"parallel_degree out of range (1-128): {dop}")
+    return dop
 
 
 # Oracle-maintained schemas whose tables the advisor must never MOVE/compress
@@ -132,6 +145,42 @@ def canonical_compression(value) -> str:
         return 'NONE'
     key = str(value).strip().upper()
     return _COMPRESSION_CANON.get(key, key)
+
+
+def _blank_to_none(value) -> Optional[str]:
+    """None for None/NaN/blank/'None' (how pandas and old rows hand back a
+    missing partition name), otherwise the value unchanged."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, str) and value.strip() in ('', 'None', 'nan'):
+        return None
+    return value
+
+
+# History rows written by the table MOVE path; only these can be undone by
+# rollback_compression (INDEX/LOB rows would need a different DDL).
+_ROLLBACK_OBJECT_TYPES = frozenset({'TABLE', 'PARTITION', 'SUBPARTITION'})
+
+
+def rollback_block_reason(operation_status, rollback_status=None,
+                          object_type=None, compression_type=None) -> Optional[str]:
+    """Why a T_COMPRESSION_HISTORY row cannot be rolled back, or None if it can.
+
+    Shared by the History page (disables the button and shows the reason) and
+    rollback_compression (refuses a stale or duplicate request server-side).
+    """
+    status = str(_blank_to_none(operation_status) or '').upper()
+    if status == 'ROLLED_BACK' or str(_blank_to_none(rollback_status) or '').upper() == 'ROLLED_BACK':
+        return "it has already been rolled back"
+    if status != 'SUCCESS':
+        return f"its status is {status or 'unknown'} (only SUCCESS compressions can be rolled back)"
+    object_type = _blank_to_none(object_type)
+    if object_type is not None and str(object_type).upper() not in _ROLLBACK_OBJECT_TYPES:
+        return f"{object_type} rows cannot be rolled back (tables, partitions and subpartitions only)"
+    compression_type = _blank_to_none(compression_type)
+    if compression_type is not None and canonical_compression(compression_type) == 'NONE':
+        return "the operation applied NOCOMPRESS, so there is nothing to roll back"
+    return None
 
 
 class TargetQueries:
@@ -1863,12 +1912,7 @@ class TargetQueries:
             partition_name = _validate_identifier(partition_name, "partition name")
         if subpartition_name is not None:
             subpartition_name = _validate_identifier(subpartition_name, "subpartition name")
-        try:
-            parallel_degree = int(parallel_degree)
-        except (TypeError, ValueError):
-            raise ValueError(f"Invalid parallel_degree: {parallel_degree!r}")
-        if not 1 <= parallel_degree <= 128:
-            raise ValueError(f"parallel_degree out of range (1-128): {parallel_degree}")
+        parallel_degree = _validate_parallel_degree(parallel_degree)
 
         if subpartition_name:
             ddl = f"""ALTER TABLE {owner}.{table_name}
@@ -2583,70 +2627,227 @@ ONLINE PARALLEL {parallel_degree};"""
     # COMPRESSION ROLLBACK
     # ============================================================================
 
+    # Unusable index structures left behind by moving ONE table segment. A
+    # (sub)partition rollback rebuilds only that segment's LOCAL index
+    # (sub)partitions, matched by position because system-generated names differ
+    # between a table and its local index, plus every unusable GLOBAL index
+    # structure (a partition MOVE invalidates those as a whole). For a table-level
+    # rollback (:p and :sp NULL) only non-partitioned and GLOBAL partitioned
+    # indexes can exist. Binds: :o owner, :t table, :p partition, :sp subpartition.
+    _ROLLBACK_UNUSABLE_INDEXES_SQL = """
+        SELECT i.owner AS index_owner, i.index_name,
+               'INDEX' AS rebuild_level, CAST(NULL AS VARCHAR2(128)) AS segment_name
+          FROM all_indexes i
+         WHERE i.table_owner = :o AND i.table_name = :t
+           AND i.index_type NOT IN ('LOB', 'IOT - TOP')
+           AND i.partitioned = 'NO' AND i.status = 'UNUSABLE'
+        UNION ALL
+        SELECT ip.index_owner, ip.index_name, 'PARTITION', ip.partition_name
+          FROM all_indexes i
+          JOIN all_part_indexes pi
+            ON pi.owner = i.owner AND pi.index_name = i.index_name
+          JOIN all_ind_partitions ip
+            ON ip.index_owner = i.owner AND ip.index_name = i.index_name
+         WHERE i.table_owner = :o AND i.table_name = :t
+           AND i.index_type NOT IN ('LOB', 'IOT - TOP')
+           AND ip.status = 'UNUSABLE'
+           AND (pi.locality = 'GLOBAL'
+                OR ip.partition_position = (
+                    SELECT tp.partition_position FROM all_tab_partitions tp
+                     WHERE tp.table_owner = :o AND tp.table_name = :t
+                       AND tp.partition_name = :p))
+        UNION ALL
+        SELECT isp.index_owner, isp.index_name, 'SUBPARTITION', isp.subpartition_name
+          FROM all_indexes i
+          JOIN all_ind_partitions ip
+            ON ip.index_owner = i.owner AND ip.index_name = i.index_name
+          JOIN all_ind_subpartitions isp
+            ON isp.index_owner = ip.index_owner AND isp.index_name = ip.index_name
+           AND isp.partition_name = ip.partition_name
+         WHERE i.table_owner = :o AND i.table_name = :t
+           AND i.index_type NOT IN ('LOB', 'IOT - TOP')
+           AND isp.status = 'UNUSABLE'
+           AND (ip.partition_position, isp.subpartition_position) IN (
+                SELECT tp.partition_position, tsp.subpartition_position
+                  FROM all_tab_subpartitions tsp
+                  JOIN all_tab_partitions tp
+                    ON tp.table_owner = tsp.table_owner AND tp.table_name = tsp.table_name
+                   AND tp.partition_name = tsp.partition_name
+                 WHERE tsp.table_owner = :o AND tsp.table_name = :t
+                   AND tsp.subpartition_name = :sp)
+    """
+
+    @staticmethod
+    def _index_rebuild_statement(index_row, parallel_degree: int) -> str:
+        """ALTER INDEX ... REBUILD statement for one _ROLLBACK_UNUSABLE_INDEXES_SQL
+        row. Raises ValueError on an unsafe identifier or unknown rebuild level."""
+        # SECURITY (CWE-89): index identifiers come from the data dictionary
+        # (second-order) and are interpolated into EXECUTE IMMEDIATE.
+        idx = (f"{_validate_identifier(index_row['INDEX_OWNER'], 'index owner')}."
+               f"{_validate_identifier(index_row['INDEX_NAME'], 'index name')}")
+        dop = _validate_parallel_degree(parallel_degree)
+        level = str(index_row['REBUILD_LEVEL']).strip().upper()
+        if level == 'INDEX':
+            return f"ALTER INDEX {idx} REBUILD ONLINE PARALLEL {dop}"
+        if level in ('PARTITION', 'SUBPARTITION'):
+            seg = _validate_identifier(index_row['SEGMENT_NAME'], f"index {level.lower()} name")
+            return f"ALTER INDEX {idx} REBUILD {level} {seg} ONLINE PARALLEL {dop}"
+        raise ValueError(f"Unknown index rebuild level: {level!r}")
+
+    @staticmethod
+    def _record_rollback(history_id: Optional[int], rolled_back: bool,
+                         rollback_status: str, message: Optional[str] = None) -> None:
+        """Record a rollback outcome on the T_COMPRESSION_HISTORY row (by id).
+
+        A rolled-back row moves to OPERATION_STATUS 'ROLLED_BACK' (allowed by
+        CHK_HISTORY_OPERATION_STATUS) so it stops counting as achieved savings; a
+        failed attempt leaves it SUCCESS (the segment is still compressed) and
+        retryable. The detail goes to ROLLBACK_STATUS / ERROR_MESSAGE.
+        """
+        if history_id is None:
+            return
+        from hcc_advisor.utils.central_connector import CentralConnector
+        try:
+            CentralConnector.execute_dml("""
+                UPDATE t_compression_history
+                   SET operation_status = CASE WHEN :rolled_back = 1
+                                               THEN 'ROLLED_BACK' ELSE operation_status END,
+                       rollback_possible = CASE WHEN :rolled_back = 1
+                                                THEN 'N' ELSE rollback_possible END,
+                       rollback_status = :rb_status,
+                       error_message = CASE WHEN :msg IS NOT NULL THEN :msg
+                                            WHEN error_message LIKE 'Rollback%' THEN NULL
+                                            ELSE error_message END
+                 WHERE history_id = :hid
+            """, {
+                'rolled_back': 1 if rolled_back else 0, 'rb_status': rollback_status[:30],
+                'msg': message[:4000] if message else None, 'hid': int(history_id),
+            })
+        except Exception as e:
+            log_error(e, "TargetQueries._record_rollback", {'history_id': history_id})
+
     @staticmethod
     def rollback_compression(
         database_id: int, owner: str, table_name: str,
-        partition_name: Optional[str] = None, parallel_degree: int = 4
+        partition_name: Optional[str] = None, parallel_degree: int = 4,
+        subpartition_name: Optional[str] = None, history_id: Optional[int] = None
     ) -> Dict[str, Any]:
-        """Rollback compression by moving table to NOCOMPRESS."""
+        """Roll back a compression by moving the compressed segment to NOCOMPRESS.
+
+        Only the segment the history row compressed is moved: MOVE SUBPARTITION /
+        MOVE PARTITION for a (sub)partition row, never the whole table. Afterwards
+        only that segment's unusable local index (sub)partitions and any unusable
+        global indexes are rebuilt. T_COMPRESSION_HISTORY does not record the
+        compression the object had before, so the rollback target is NOCOMPRESS.
+
+        With ``history_id`` the row is re-checked first (it must still be a
+        SUCCESS for this exact object) and the outcome is recorded on it.
+
+        Returns:
+            dict with success, message / error, and index_failures (list).
+        """
         from hcc_advisor.utils.central_connector import CentralConnector
 
-        ddl = f"ALTER TABLE {owner}.{table_name}"
-        if partition_name:
-            ddl += f" MOVE PARTITION {partition_name} NOCOMPRESS ONLINE PARALLEL {parallel_degree}"
-        else:
-            ddl += f" MOVE NOCOMPRESS ONLINE PARALLEL {parallel_degree}"
+        partition_name = _blank_to_none(partition_name)
+        subpartition_name = _blank_to_none(subpartition_name)
+
+        # SECURITY (CWE-89): generate_ddl validates every identifier, refuses
+        # Oracle-maintained schemas and bounds the parallel degree.
+        try:
+            ddl = TargetQueries.generate_ddl(
+                owner, table_name, 'NONE', partition_name, subpartition_name,
+                parallel_degree=parallel_degree
+            ).rstrip().rstrip(';')
+            dop = _validate_parallel_degree(parallel_degree)
+        except ValueError as e:
+            return {'success': False, 'error': str(e)}
+
+        target = f"{owner}.{table_name}"
+        if subpartition_name:
+            target += f" subpartition {subpartition_name}"
+        elif partition_name:
+            target += f" partition {partition_name}"
+
+        if history_id is not None:
+            hist = CentralConnector.execute_query("""
+                SELECT operation_status, rollback_status, object_type, compression_type_applied
+                  FROM t_compression_history
+                 WHERE history_id = :hid AND database_id = :db
+                   AND owner = :o AND object_name = :t
+                   AND NVL(partition_name, '~') = NVL(:p, '~')
+                   AND NVL(subpartition_name, '~') = NVL(:sp, '~')
+            """, {'hid': int(history_id), 'db': database_id, 'o': owner, 't': table_name,
+                  'p': partition_name, 'sp': subpartition_name})
+            if hist.empty:
+                return {'success': False,
+                        'error': f"History row {history_id} not found for {target}"}
+            h = hist.iloc[0]
+            reason = rollback_block_reason(h['OPERATION_STATUS'], h['ROLLBACK_STATUS'],
+                                           h['OBJECT_TYPE'], h['COMPRESSION_TYPE_APPLIED'])
+            if reason:
+                return {'success': False, 'error': f"Cannot roll back {target}: {reason}"}
 
         try:
             ok = TargetConnector.execute_plsql(
                 database_id, f"BEGIN EXECUTE IMMEDIATE q'[{ddl}]'; END;"
             )
-            if ok:
-                # Rebuild unusable indexes
-                idx_q = """
-                    SELECT owner, index_name FROM all_indexes
-                    WHERE table_owner = :o AND table_name = :t AND status = 'UNUSABLE'
-                """
-                idx_df = TargetConnector.execute_query(database_id, idx_q,
-                                                       {'o': owner, 't': table_name})
-                idx_count = 0
-                if not idx_df.empty:
-                    for _, r in idx_df.iterrows():
-                        try:
-                            TargetConnector.execute_plsql(database_id,
-                                f"BEGIN EXECUTE IMMEDIATE 'ALTER INDEX {r['OWNER']}.{r['INDEX_NAME']} REBUILD ONLINE PARALLEL {parallel_degree}'; END;")
-                            idx_count += 1
-                        except Exception:
-                            pass
-
-                # Update history
-                try:
-                    CentralConnector.execute_dml("""
-                        UPDATE t_compression_history
-                        SET rollback_status = 'ROLLED_BACK'
-                        WHERE database_id = :db AND owner = :o AND object_name = :t
-                          AND operation_status = 'SUCCESS'
-                          AND NVL(partition_name, '~') = NVL(:p, '~')
-                          AND rollback_status IS NULL
-                          AND ROWNUM = 1
-                    """, {'db': database_id, 'o': owner, 't': table_name, 'p': partition_name})
-
-                    CentralConnector.execute_dml("""
-                        UPDATE t_compression_analysis
-                        SET current_compression = 'NONE'
-                        WHERE database_id = :db AND owner = :o AND object_name = :t
-                          AND NVL(partition_name, '~') = NVL(:p, '~')
-                    """, {'db': database_id, 'o': owner, 't': table_name, 'p': partition_name})
-                except Exception:
-                    pass
-
-                msg = f"Rolled back to NOCOMPRESS"
-                if idx_count:
-                    msg += f", {idx_count} indexes rebuilt"
-                return {'success': True, 'message': msg}
-            return {'success': False, 'error': 'DDL execution failed'}
+            err = None if ok else 'DDL execution failed'
         except Exception as e:
-            return {'success': False, 'error': str(e)}
+            ok, err = False, str(e)
+        if not ok:
+            log_warning(f"Rollback of {target} failed: {err}")
+            TargetQueries._record_rollback(history_id, False, 'FAILED', f"Rollback failed: {err}")
+            return {'success': False, 'error': f"Rollback of {target} failed: {err}"}
+
+        # Rebuild the index structures the MOVE left UNUSABLE (scoped to the segment).
+        idx_rebuilt, idx_failed = 0, []
+        try:
+            idx_df = TargetConnector.execute_query(
+                database_id, TargetQueries._ROLLBACK_UNUSABLE_INDEXES_SQL,
+                {'o': owner, 't': table_name,
+                 # a subpartition MOVE leaves the parent's local partitions alone
+                 'p': None if subpartition_name else partition_name,
+                 'sp': subpartition_name})
+        except Exception as e:
+            log_warning(f"Could not list unusable indexes for {target}: {e}")
+            idx_df = pd.DataFrame()
+        for _, r in idx_df.iterrows():
+            label = f"{r['INDEX_OWNER']}.{r['INDEX_NAME']}"
+            if _blank_to_none(r['SEGMENT_NAME']):
+                label += f" {str(r['REBUILD_LEVEL']).lower()} {r['SEGMENT_NAME']}"
+            try:
+                stmt = TargetQueries._index_rebuild_statement(r, dop)
+                if TargetConnector.execute_plsql(
+                        database_id, f"BEGIN EXECUTE IMMEDIATE '{stmt}'; END;"):
+                    idx_rebuilt += 1
+                    continue
+            except Exception as e:
+                log_warning(f"Failed to rebuild index {label}: {e}")
+            idx_failed.append(label)
+
+        try:
+            CentralConnector.execute_dml("""
+                UPDATE t_compression_analysis
+                SET current_compression = 'NONE'
+                WHERE database_id = :db AND owner = :o AND object_name = :t
+                  AND ((:sp IS NOT NULL AND subpartition_name = :sp)
+                       OR (:sp IS NULL AND subpartition_name IS NULL
+                           AND NVL(partition_name, '~') = NVL(:p, '~')))
+            """, {'db': database_id, 'o': owner, 't': table_name,
+                  'p': partition_name, 'sp': subpartition_name})
+        except Exception:
+            pass
+
+        msg = f"Rolled back {target} to NOCOMPRESS"
+        if idx_rebuilt:
+            msg += f", {idx_rebuilt} index structure(s) rebuilt"
+        if idx_failed:
+            msg += f"; {len(idx_failed)} index rebuild(s) failed: {', '.join(idx_failed)}"
+            TargetQueries._record_rollback(history_id, True, 'ROLLED_BACK_INDEX_ERRORS',
+                                           f"Rollback: index rebuild failed for {', '.join(idx_failed)}")
+        else:
+            TargetQueries._record_rollback(history_id, True, 'ROLLED_BACK')
+        return {'success': True, 'message': msg, 'index_failures': idx_failed}
 
     # ============================================================================
     # AWR/ASH INTEGRATION FOR HOTNESS (requires Diagnostics Pack license)
