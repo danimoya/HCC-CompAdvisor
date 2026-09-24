@@ -911,7 +911,9 @@ class CentralQueries:
             params['database_id'] = database_id
 
         try:
-            return CentralConnector.execute_query(query, params if params else None)
+            # Strict, so a missing view (ORA-00942) reaches the fallback below
+            return CentralConnector.execute_query(query, params if params else None,
+                                                  raise_on_error=True)
         except Exception as e:
             # Fallback to direct query if view doesn't exist
             log_debug(f"v_compression_candidates view not available, using fallback: {e}")
@@ -940,7 +942,9 @@ class CentralQueries:
             params['database_id'] = database_id
 
         try:
-            return CentralConnector.execute_query(query, params if params else None)
+            # Strict, so a missing view (ORA-00942) reaches the fallback below
+            return CentralConnector.execute_query(query, params if params else None,
+                                                  raise_on_error=True)
         except Exception as e:
             # Fallback query
             log_debug(f"v_hot_objects view not available, using fallback: {e}")
@@ -979,7 +983,9 @@ class CentralQueries:
             params['database_id'] = database_id
 
         try:
-            return CentralConnector.execute_query(query, params if params else None)
+            # Strict, so a missing view (ORA-00942) reaches the fallback below
+            return CentralConnector.execute_query(query, params if params else None,
+                                                  raise_on_error=True)
         except Exception as e:
             # Fallback query
             log_debug(f"v_cold_objects view not available, using fallback: {e}")
@@ -1129,7 +1135,9 @@ class CentralQueries:
             params['database_id'] = database_id
 
         try:
-            return CentralConnector.execute_query(query, params if params else None)
+            # Strict, so a missing view (ORA-00942) reaches the fallback below
+            return CentralConnector.execute_query(query, params if params else None,
+                                                  raise_on_error=True)
         except Exception as e:
             # Fallback to aggregated query
             log_debug(f"v_compression_effectiveness view not available, using fallback: {e}")
@@ -1360,8 +1368,14 @@ class CentralQueries:
                 )
             """
 
+        # The INSERT has no :strategy_id placeholder, and python-oracledb rejects
+        # an unused named bind (DPY-4008): a new strategy's strategy_id=None
+        # made every create fail.
+        binds = strategy_data if strategy_id else {
+            k: v for k, v in strategy_data.items() if k != 'strategy_id'}
+
         try:
-            rows_affected = CentralConnector.execute_dml(query, strategy_data)
+            rows_affected = CentralConnector.execute_dml(query, binds)
             if rows_affected:
                 action = "updated" if strategy_id else "created"
                 return True, f"Strategy {action} successfully"
@@ -1510,8 +1524,11 @@ class CentralQueries:
                 )
             """
 
+        # No :rule_id in the INSERT: drop a new rule's rule_id=None (DPY-4008).
+        binds = rule_data if rule_id else {k: v for k, v in rule_data.items() if k != 'rule_id'}
+
         try:
-            rows_affected = CentralConnector.execute_dml(query, rule_data)
+            rows_affected = CentralConnector.execute_dml(query, binds)
             if rows_affected:
                 action = "updated" if rule_id else "created"
                 return True, f"Rule {action} successfully"

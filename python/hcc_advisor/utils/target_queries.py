@@ -2403,6 +2403,8 @@ MOVE {compression_clause}
         Returns:
             DataFrame with column statistics
         """
+        # ALL_TAB_COL_STATISTICS has no COLUMN_ID: ordering by it failed every
+        # call with ORA-00904.
         query = """
             SELECT
                 column_name,
@@ -2420,7 +2422,7 @@ MOVE {compression_clause}
             FROM all_tab_col_statistics
             WHERE owner = :owner
               AND table_name = :table_name
-            ORDER BY column_id NULLS LAST, column_name
+            ORDER BY column_name
         """
 
         try:
@@ -2648,10 +2650,12 @@ MOVE {compression_clause}
                   AND advisable_compression IS NOT NULL
             """
 
+            # Strict, so a target without the table (ORA-00942) falls back
+            # quietly instead of showing an error banner first
             df = TargetConnector.execute_query(database_id, query, {
                 'owner': owner.upper(),
                 'table_name': table_name.upper()
-            })
+            }, raise_on_error=True)
 
             if not df.empty:
                 return df
