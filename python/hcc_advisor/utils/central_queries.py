@@ -2628,6 +2628,212 @@ class CentralQueries:
             st.error(f"Failed to compare databases: {e}")
             return pd.DataFrame()
 
+    # ============================================================================
+    # ADMIN: OPERATION-HISTORY PURGE ("start from scratch")
+    # ============================================================================
+
+    # Historical-operation tables, ordered child -> parent so every DELETE runs
+    # before the rows it references disappear:
+    #   T_COMPRESSION_HISTORY.ANALYSIS_ID -> T_COMPRESSION_ANALYSIS (ON DELETE SET NULL)
+    #   T_{,INDEX_,LOB_}COMPRESSION_ANALYSIS.ADVISOR_RUN_ID -> T_ADVISOR_RUN (CASCADE)
+    # T_COMPRESSION_HISTORY also stores the scheduler's persisted job queue
+    # (OPERATION_STATUS='QUEUED') and in-flight job tracking ('IN_PROGRESS').
+    # Names are fixed constants, never user input, so interpolating them is safe.
+    PURGE_HISTORY_TABLES: Tuple[str, ...] = (
+        'T_COMPRESSION_HISTORY',
+        'T_LOB_COMPRESSION_ANALYSIS',
+        'T_INDEX_COMPRESSION_ANALYSIS',
+        'T_COMPRESSION_ANALYSIS',
+        'T_ADVISOR_RUN',
+    )
+
+    # Configuration a history purge must never delete from.
+    PURGE_PRESERVED_TABLES: Dict[str, str] = {
+        'T_TARGET_DATABASES': 'Registered database connections and credentials '
+                              '(only LAST_ANALYSIS_DATE is cleared)',
+        'T_COMPRESSION_STRATEGIES': 'Compression strategies',
+        'T_STRATEGY_RULES': 'Strategy rules',
+        'T_SCHEMA_METADATA': 'Schema version and app settings '
+                             '(Ollama, webhook, AWR acknowledgement)',
+        'T_PATCH_HISTORY': 'Applied SQL patch log',
+    }
+
+    # Result key reporting how many targets had LAST_ANALYSIS_DATE cleared.
+    PURGE_TARGET_RESET_KEY = 'T_TARGET_DATABASES.LAST_ANALYSIS_DATE'
+
+    @staticmethod
+    def _purge_scope(database_id: Optional[int]) -> Tuple[str, Dict[str, Any]]:
+        """Predicate + binds restricting a purge to one target ('' = all).
+
+        Uses `is None` (not truthiness) so an unexpected falsy id can never
+        widen a single-database purge into a purge of every database.
+        """
+        if database_id is None:
+            return "", {}
+        return "database_id = :database_id", {'database_id': int(database_id)}
+
+    @staticmethod
+    def get_history_purge_preview(database_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """
+        Report what purge_operation_history() would remove for the given scope.
+
+        Args:
+            database_id: One target database, or None for all of them
+
+        Returns:
+            dict with 'counts' ({table: rows}, in purge order),
+            'targets_to_reset' (targets with LAST_ANALYSIS_DATE set) and
+            'active' ({'queued', 'in_progress', 'running_runs'}); or None if
+            the counts could not be read (callers must then not offer a purge).
+        """
+        pred, params = CentralQueries._purge_scope(database_id)
+        and_pred = f" AND {pred}" if pred else ""
+        where_pred = f" WHERE {pred}" if pred else ""
+
+        parts = [
+            f"SELECT '{t}' AS item, COUNT(*) AS cnt FROM {t.lower()}{where_pred}"
+            for t in CentralQueries.PURGE_HISTORY_TABLES
+        ]
+        parts += [
+            "SELECT 'ACTIVE_QUEUED', COUNT(*) FROM t_compression_history "
+            f"WHERE operation_status = 'QUEUED'{and_pred}",
+            "SELECT 'ACTIVE_IN_PROGRESS', COUNT(*) FROM t_compression_history "
+            f"WHERE operation_status = 'IN_PROGRESS'{and_pred}",
+            "SELECT 'ACTIVE_RUNNING_RUNS', COUNT(*) FROM t_advisor_run "
+            f"WHERE run_status = 'RUNNING'{and_pred}",
+            "SELECT 'TARGETS_TO_RESET', COUNT(*) FROM t_target_databases "
+            f"WHERE last_analysis_date IS NOT NULL{and_pred}",
+        ]
+        query = "\nUNION ALL\n".join(parts)
+
+        try:
+            df = CentralConnector.execute_query(query, params if params else None)
+            if df is None or df.empty:
+                return None
+            values = {str(r['ITEM']).strip(): int(r['CNT'] or 0) for _, r in df.iterrows()}
+            expected = set(CentralQueries.PURGE_HISTORY_TABLES) | {
+                'ACTIVE_QUEUED', 'ACTIVE_IN_PROGRESS', 'ACTIVE_RUNNING_RUNS', 'TARGETS_TO_RESET'
+            }
+            if not expected.issubset(values):
+                return None
+            return {
+                'counts': {t: values[t] for t in CentralQueries.PURGE_HISTORY_TABLES},
+                'targets_to_reset': values['TARGETS_TO_RESET'],
+                'active': {
+                    'queued': values['ACTIVE_QUEUED'],
+                    'in_progress': values['ACTIVE_IN_PROGRESS'],
+                    'running_runs': values['ACTIVE_RUNNING_RUNS'],
+                },
+            }
+        except Exception as e:
+            log_error(e, "get_history_purge_preview", {'database_id': database_id})
+            return None
+
+    @staticmethod
+    def purge_operation_history(
+        database_id: Optional[int] = None,
+        include_active: bool = False,
+        acting_user: Optional[str] = None,
+    ) -> Tuple[bool, str, Dict[str, int]]:
+        """
+        Delete all historical operations (advisor runs, table/index/LOB analysis
+        results, compression execution history and the persisted scheduler
+        queue) while keeping database connections, strategies, settings and
+        patch history. Used to start from scratch, e.g. before pointing the app
+        at a new set of databases.
+
+        Every statement runs on ONE connection in ONE transaction with a single
+        COMMIT at the end and a ROLLBACK on any error, so the purge is
+        all-or-nothing. DELETE is used deliberately: TRUNCATE is DDL, commits
+        per table and fails on parents referenced by enabled foreign keys.
+
+        Args:
+            database_id: Restrict the purge to one target database. None purges
+                every target, including deactivated (soft-deleted) ones.
+            include_active: Also delete QUEUED / IN_PROGRESS history rows and
+                RUNNING advisor runs. When False (default) the purge is refused
+                if any exist; this is re-checked inside the transaction.
+            acting_user: Admin performing the purge (written to the app log).
+
+        Returns:
+            Tuple of (success, message, deleted) where deleted maps each purged
+            table, plus PURGE_TARGET_RESET_KEY, to its affected row count.
+        """
+        pred, params = CentralQueries._purge_scope(database_id)
+        and_pred = f" AND {pred}" if pred else ""
+        where_pred = f" WHERE {pred}" if pred else ""
+        scope_label = (f"database_id={params['database_id']}" if params
+                       else "all target databases")
+        actor = acting_user or 'unknown'
+        deleted: Dict[str, int] = {}
+
+        def _run(cursor, statement: str) -> int:
+            if params:
+                cursor.execute(statement, params)
+            else:
+                cursor.execute(statement)
+            return cursor.rowcount
+
+        try:
+            with CentralConnector.get_connection() as conn:
+                cursor = conn.cursor()
+                try:
+                    if not include_active:
+                        _run(cursor, f"""
+                            SELECT
+                                (SELECT COUNT(*) FROM t_compression_history
+                                  WHERE operation_status IN ('QUEUED', 'IN_PROGRESS'){and_pred})
+                              + (SELECT COUNT(*) FROM t_advisor_run
+                                  WHERE run_status = 'RUNNING'{and_pred})
+                            FROM dual
+                        """)
+                        row = cursor.fetchone()
+                        active = int(row[0] or 0) if row else 0
+                        if active:
+                            conn.rollback()
+                            msg = (f"Purge refused: {active} queued/running operation(s) "
+                                   f"exist for {scope_label}. Wait for them to finish or "
+                                   f"explicitly include active operations.")
+                            log_warning(msg, acting_user=actor)
+                            return False, msg, {}
+
+                    for table in CentralQueries.PURGE_HISTORY_TABLES:
+                        deleted[table] = _run(cursor, f"DELETE FROM {table.lower()}{where_pred}")
+
+                    deleted[CentralQueries.PURGE_TARGET_RESET_KEY] = _run(
+                        cursor,
+                        "UPDATE t_target_databases SET last_analysis_date = NULL "
+                        f"WHERE last_analysis_date IS NOT NULL{and_pred}"
+                    )
+
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+                finally:
+                    cursor.close()
+        except Exception as e:
+            log_error(e, "purge_operation_history", {
+                'database_id': database_id,
+                'include_active': include_active,
+                'acting_user': actor,
+            })
+            return False, f"Purge failed and was rolled back; nothing was deleted: {e}", {}
+
+        # LAST_ANALYSIS_DATE is part of the cached registry row.
+        CentralQueries.invalidate_target_databases_cache()
+
+        total = sum(deleted[t] for t in CentralQueries.PURGE_HISTORY_TABLES)
+        log_info(
+            f"Operation history purged by admin '{actor}' ({scope_label}): "
+            f"{total} row(s) deleted",
+            acting_user=actor,
+            database_id=database_id,
+            include_active=include_active,
+            deleted=deleted,
+        )
+        return True, f"Deleted {total:,} historical row(s) for {scope_label}.", deleted
+
 
 # Create singleton accessor function
 @st.cache_resource
