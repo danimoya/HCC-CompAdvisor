@@ -547,12 +547,31 @@ class TestCentralQueriesSurfaceErrors:
         assert ok is True and new_id == 42
         assert not any('query error' in m for m in _error_messages(registry.st))
 
-    def test_update_password_failure_is_not_success(self, registry):
-        registry.fail_on('SET password_encrypted', "ORA-01031: insufficient privileges")
+    def test_update_failure_is_not_success_and_nothing_is_half_applied(self, registry):
+        registry.fail_on('UPDATE t_target_databases', "ORA-01031: insufficient privileges")
         ok, msg = CentralQueries.update_target_database(3, _new_target())
-        assert ok is False and msg.startswith('Failed to update password') and 'ORA-01031' in msg
-        # The main UPDATE never ran after the password update failed
-        assert sum(1 for sql, _ in registry.executed if sql.startswith('UPDATE t_target_databases')) == 1
+        assert ok is False and msg.startswith('Failed to update target database') and 'ORA-01031' in msg
+        # The new password and the other fields are written by one statement,
+        # so a failure can't leave the password changed on its own
+        updates = [sql for sql, _ in registry.executed if sql.startswith('UPDATE t_target_databases')]
+        assert len(updates) == 1 and 'password_encrypted = :password_encrypted' in updates[0]
+        assert registry.commits == 0
+        # Strict mode: the error reached the caller instead of the connector's st.error
+        assert not any('DML error' in m for m in _error_messages(registry.st))
+
+    def test_update_without_new_password_keeps_the_stored_one(self, registry):
+        data = _new_target()
+        del data['password_encrypted']
+        ok, _msg = CentralQueries.update_target_database(3, data)
+        assert ok is True
+        (sql, params), = [(s, p) for s, p in registry.executed if s.startswith('UPDATE t_target_databases')]
+        assert 'password_encrypted' not in sql and 'password_encrypted' not in params
+
+    def test_update_unknown_target_is_not_success(self, registry):
+        registry.handler = lambda sql, params: (
+            {'rowcount': 0} if sql.strip().startswith('UPDATE t_target_databases') else None)
+        ok, msg = CentralQueries.update_target_database(99, _new_target())
+        assert ok is False and 'not found' in msg
 
     def test_set_default_strategy_clear_failure_is_not_success(self, registry, monkeypatch):
         monkeypatch.setattr('hcc_advisor.utils.central_queries.log_error', MagicMock())
