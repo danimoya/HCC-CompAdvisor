@@ -1,6 +1,6 @@
 /*******************************************************************************
  * HCC Compression Advisor - Centralized Server Schema (Oracle 23c Free & Exadata)
- * Version: 2.0.0
+ * Version: 3.0.0
  * Date: 2026-02-24
  *
  * DESCRIPTION:
@@ -908,7 +908,9 @@ CREATE TABLE T_SCHEMA_METADATA (
     UPDATED_AT  TIMESTAMP DEFAULT SYSTIMESTAMP
 );
 
-INSERT INTO T_SCHEMA_METADATA (KEY, VALUE) VALUES ('schema_version', '2.0.0');
+-- Must equal hcc_advisor.__version__ (checked by python/tests/unit/test_schema_version.py).
+-- The Python installer also stamps __version__ after running this script.
+INSERT INTO T_SCHEMA_METADATA (KEY, VALUE) VALUES ('schema_version', '3.0.0');
 INSERT INTO T_SCHEMA_METADATA (KEY, VALUE) VALUES ('installed_at', TO_CHAR(SYSTIMESTAMP, 'YYYY-MM-DD HH24:MI:SS'));
 COMMIT;
 

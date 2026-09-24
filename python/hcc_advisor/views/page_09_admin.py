@@ -6,12 +6,16 @@ SQL Patches, system maintenance, and administration tools
 import urllib.request
 import streamlit as st
 import pandas as pd
-from pathlib import Path
 from hcc_advisor.utils.central_connector import CentralConnector
 from hcc_advisor.utils.central_queries import CentralQueries
-from hcc_advisor.utils.logger import log_warning, log_error
+from hcc_advisor.utils.logger import log_warning
 from hcc_advisor.config import config
 from hcc_advisor.auth import AuthManager, ROLE_ADMIN
+# Patch detection/recording is shared with the deployment page's Upgrade.
+from hcc_advisor.utils.sql_patches import (
+    record_patch as _record_patch,
+    find_patches_dir, patches_dir_problem, list_patch_dirs, scan_patches,
+)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -58,159 +62,35 @@ def show_admin_page():
         show_data_reset()
 
 
-def _ensure_patch_history_table():
-    """Create T_PATCH_HISTORY if it doesn't exist. Returns True if table exists."""
-    try:
-        df = CentralConnector.execute_query(
-            "SELECT 1 FROM user_tables WHERE table_name = 'T_PATCH_HISTORY'"
-        )
-        if not df.empty:
-            return True
-    except Exception as e:
-        log_warning(f"_ensure_patch_history_table: existence check failed: {e}")
-
-    try:
-        CentralConnector.execute_plsql("""
-            BEGIN
-                EXECUTE IMMEDIATE '
-                    CREATE TABLE T_PATCH_HISTORY (
-                        patch_id      NUMBER GENERATED ALWAYS AS IDENTITY,
-                        patch_name    VARCHAR2(200) NOT NULL,
-                        applied_date  TIMESTAMP DEFAULT SYSTIMESTAMP,
-                        applied_by    VARCHAR2(100) DEFAULT USER,
-                        status        VARCHAR2(20),
-                        error_message VARCHAR2(4000),
-                        CONSTRAINT PK_PATCH_HISTORY PRIMARY KEY (patch_id)
-                    )
-                ';
-            END;
-        """)
-        return True
-    except Exception as e:
-        log_error(e, "_ensure_patch_history_table: CREATE TABLE T_PATCH_HISTORY failed")
-        return False
-
-
-def _check_patch_applied(check_sql: str) -> bool:
-    """Run a check.sql query — returns True if result > 0."""
-    try:
-        df = CentralConnector.execute_query(check_sql.strip())
-        if not df.empty:
-            return int(df.iloc[0]['RESULT'] or 0) > 0
-    except Exception as e:
-        log_warning(f"_check_patch_applied: check.sql query failed: {e}")
-    return False
-
-
-def _record_patch(patch_name: str, status: str = 'SUCCESS', error: str = None):
-    """Insert a record into T_PATCH_HISTORY."""
-    try:
-        if error:
-            CentralConnector.execute_dml(
-                "INSERT INTO t_patch_history (patch_name, status, error_message) VALUES (:n, :s, :e)",
-                {'n': patch_name, 's': status, 'e': str(error)[:4000]}
-            )
-        else:
-            CentralConnector.execute_dml(
-                "INSERT INTO t_patch_history (patch_name, status) VALUES (:n, :s)",
-                {'n': patch_name, 's': status}
-            )
-    except Exception as e:
-        # A failed insert here means the audit row (esp. a FAILED patch) is lost —
-        # surface it rather than swallowing silently.
-        log_error(e, "_record_patch", {'patch_name': patch_name, 'status': status})
-
-
 def show_sql_patches():
     """Show SQL patch management with auto-detection via check.sql queries."""
 
     st.subheader("SQL Patch Management")
     st.markdown("Apply versioned SQL patches to the central database without redeploying.")
 
-    # Find patches directory. Order: package layout (bundled/mounted into the
-    # container at hcc_advisor/sql/patches), dev layout (repo_root/sql/patches),
-    # then legacy absolute fallbacks.
-    here = Path(__file__).resolve()
-    candidates = [
-        here.parent.parent / 'sql' / 'patches',   # /app/hcc_advisor/sql/patches (container bind mount)
-        here.parents[3] / 'sql' / 'patches',       # repo_root/sql/patches (dev)
-        here.parents[2] / 'sql' / 'patches',       # legacy dev fallback
-        Path('/app/sql/patches'),                   # legacy container fallback
-    ]
-    patches_dir = None
-    for c in candidates:
-        if c.exists():
-            patches_dir = c
-            break
-
+    patches_dir = find_patches_dir()
     if patches_dir is None:
         st.warning("Patches directory not found. Expected at `sql/patches/` relative to the project root.")
         return
 
-    # Safety guardrail: the patch SQL is executed verbatim against the central DB,
-    # so the patch source must be a trusted, read-only directory. Refuse to run
-    # patches from a group/world-writable location, which would let any local
-    # process tamper with patch.sql and turn this admin panel into an
-    # arbitrary-SQL-execution primitive. The intended deployment mounts
-    # sql/patches read-only (`:ro`), which is not group/world-writable.
-    try:
-        import stat
-        mode = patches_dir.stat().st_mode
-        if mode & (stat.S_IWGRP | stat.S_IWOTH):
-            st.error(
-                "Refusing to load patches: the patches directory "
-                f"`{patches_dir}` is group/world-writable. Patch SQL must come "
-                "from a trusted, read-only location. Re-mount it read-only "
-                "(`:ro`) and ensure it is not writable by other users."
-            )
-            return
-    except OSError:
-        st.error(f"Could not verify permissions on patches directory `{patches_dir}`.")
+    # Safety guardrail: refuse a group/world-writable patch source.
+    problem = patches_dir_problem(patches_dir)
+    if problem:
+        st.error(problem)
         return
 
-    patch_dirs = sorted([d for d in patches_dir.iterdir() if d.is_dir()], key=lambda d: d.name)
+    patch_dirs = list_patch_dirs(patches_dir)
     if not patch_dirs:
         st.info("No patch directories found.")
         return
 
-    # Ensure T_PATCH_HISTORY exists
-    has_history_table = _ensure_patch_history_table()
-
-    # Load recorded patches from DB
-    recorded = {}
-    if has_history_table:
-        try:
-            df = CentralConnector.execute_query("""
-                SELECT patch_name, status,
-                       TO_CHAR(applied_date, 'YYYY-MM-DD HH24:MI:SS') as applied_date,
-                       applied_by
-                FROM t_patch_history ORDER BY applied_date DESC
-            """)
-            if not df.empty:
-                for _, r in df.iterrows():
-                    name = r['PATCH_NAME']
-                    if name not in recorded:
-                        recorded[name] = {
-                            'status': r['STATUS'], 'date': r['APPLIED_DATE'],
-                            'by': r.get('APPLIED_BY', '')
-                        }
-        except Exception as e:
-            log_warning(f"show_sql_patches: could not load recorded patch history: {e}")
-
-    # Run check.sql for each patch to detect actual DB state
-    detected = {}
-    auto_marked = 0
-    for pdir in patch_dirs:
-        check_path = pdir / 'check.sql'
-        if check_path.exists():
-            check_sql = check_path.read_text().strip()
-            if check_sql:
-                detected[pdir.name] = _check_patch_applied(check_sql)
-                # Auto-mark: if detected as applied but not recorded, record it
-                if detected[pdir.name] and pdir.name not in recorded and has_history_table:
-                    _record_patch(pdir.name, 'SUCCESS')
-                    recorded[pdir.name] = {'status': 'SUCCESS', 'date': 'auto-detected', 'by': 'system'}
-                    auto_marked += 1
+    # Ensure T_PATCH_HISTORY, load it, and run check.sql for each patch to
+    # detect actual DB state (detected-but-unrecorded patches are auto-marked).
+    scan = scan_patches(patch_dirs)
+    has_history_table = scan.has_history_table
+    recorded = scan.recorded
+    detected = scan.detected
+    auto_marked = scan.auto_marked
 
     if auto_marked > 0:
         st.toast(f"{auto_marked} patch(es) auto-detected as applied and recorded")

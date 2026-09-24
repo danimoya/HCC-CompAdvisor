@@ -7,11 +7,34 @@ Handles first-run setup, schema install, re-install, upgrade, and cleanup.
 import streamlit as st
 import oracledb
 from pathlib import Path
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, List, Tuple
 from cryptography.fernet import Fernet
 
 from hcc_advisor import __version__
 from hcc_advisor.config import Config, config
+from hcc_advisor.utils import sql_patches
+from hcc_advisor.utils.schema_version import (
+    DEPLOYED_CHECK_SQL, STATUS_CURRENT, STATUS_MISSING, STATUS_NEWER, STATUS_OUTDATED,
+    ensure_schema_metadata_table, schema_status, stamp_schema_version,
+    version_is_behind, version_notice,
+)
+
+
+# Tables created by sql/central/01_central_schema.sql (children before parents).
+_SCHEMA_TABLES = (
+    'T_COMPRESSION_HISTORY', 'T_LOB_COMPRESSION_ANALYSIS',
+    'T_INDEX_COMPRESSION_ANALYSIS', 'T_COMPRESSION_ANALYSIS',
+    'T_ADVISOR_RUN', 'T_STRATEGY_RULES', 'T_COMPRESSION_STRATEGIES',
+    'T_TARGET_DATABASES', 'T_SCHEMA_METADATA',
+)
+# Re-install / Cleanup drop the schema tables plus T_PATCH_HISTORY, which the
+# SQL patch system creates on demand (not the schema script).
+_DROP_TABLES = _SCHEMA_TABLES + ('T_PATCH_HISTORY',)
+_DROP_SEQUENCES = ('SEQ_EXECUTION_ID',)
+
+# Phrases the user must type before a destructive action runs.
+_REINSTALL_CONFIRM_PHRASE = "REINSTALL"
+_CLEANUP_CONFIRM_PHRASE = "UNINSTALL"
 
 
 # ---------------------------------------------------------------------------
@@ -31,11 +54,27 @@ def _get_sql_dir() -> Path:
     return pkg_sql  # fallback
 
 
+def _connect(host: str, port: int, service: str, user: str, password: str):
+    """Direct connection with a connect timeout (fail fast on a wrong host)."""
+    return oracledb.connect(user=user, password=password, dsn=f"{host}:{port}/{service}",
+                            tcp_connect_timeout=config.CENTRAL_CONNECT_TIMEOUT)
+
+
+def _confirmation_matches(typed: Optional[str], phrase: str) -> bool:
+    """Exact (case-sensitive, surrounding whitespace ignored) phrase match."""
+    return (typed or '').strip() == phrase
+
+
+def _confirm_phrase(phrase: str, key: str) -> bool:
+    """Render a typed-confirmation input; True once `phrase` is typed exactly."""
+    typed = st.text_input(f"Type **{phrase}** and press Enter to confirm", key=key)
+    return _confirmation_matches(typed, phrase)
+
+
 def _test_connection(host: str, port: int, service: str, user: str, password: str) -> Tuple[bool, str]:
     """Test Oracle connection and return (success, message)."""
     try:
-        dsn = f"{host}:{port}/{service}"
-        conn = oracledb.connect(user=user, password=password, dsn=dsn)
+        conn = _connect(host, port, service, user, password)
         cur = conn.cursor()
         cur.execute("SELECT BANNER FROM V$VERSION WHERE ROWNUM = 1")
         row = cur.fetchone()
@@ -53,8 +92,7 @@ def _check_privileges(host: str, port: int, service: str, user: str, password: s
                  'CREATE PROCEDURE', 'CREATE VIEW', 'CREATE TRIGGER', 'CREATE TYPE']
     results = []
     try:
-        dsn = f"{host}:{port}/{service}"
-        conn = oracledb.connect(user=user, password=password, dsn=dsn)
+        conn = _connect(host, port, service, user, password)
         cur = conn.cursor()
         for priv in required:
             cur.execute(
@@ -79,11 +117,10 @@ def _check_privileges(host: str, port: int, service: str, user: str, password: s
 
 def _get_schema_state(host: str, port: int, service: str, user: str, password: str) -> Dict:
     """Inspect the schema: installed tables, version, install date."""
-    state = {'connected': False, 'tables_found': 0, 'total_tables': 9,
-             'version': None, 'installed_at': None, 'banner': None}
+    state = {'connected': False, 'tables_found': 0, 'total_tables': len(_SCHEMA_TABLES),
+             'deployed': False, 'version': None, 'installed_at': None, 'banner': None}
     try:
-        dsn = f"{host}:{port}/{service}"
-        conn = oracledb.connect(user=user, password=password, dsn=dsn)
+        conn = _connect(host, port, service, user, password)
         state['connected'] = True
 
         cur = conn.cursor()
@@ -92,15 +129,13 @@ def _get_schema_state(host: str, port: int, service: str, user: str, password: s
         state['banner'] = row[0] if row else "Unknown"
 
         # Count known tables
-        expected = [
-            'T_TARGET_DATABASES', 'T_COMPRESSION_STRATEGIES', 'T_STRATEGY_RULES',
-            'T_ADVISOR_RUN', 'T_COMPRESSION_ANALYSIS', 'T_COMPRESSION_HISTORY',
-            'T_INDEX_COMPRESSION_ANALYSIS', 'T_LOB_COMPRESSION_ANALYSIS',
-            'T_SCHEMA_METADATA'
-        ]
-        placeholders = ', '.join([f"'{t}'" for t in expected])
+        placeholders = ', '.join([f"'{t}'" for t in _SCHEMA_TABLES])
         cur.execute(f"SELECT COUNT(*) FROM user_tables WHERE table_name IN ({placeholders})")
         state['tables_found'] = cur.fetchone()[0]
+
+        # Same test as the app's startup check (Config.get_schema_info)
+        cur.execute(DEPLOYED_CHECK_SQL)
+        state['deployed'] = cur.fetchone()[0] > 0
 
         # Version
         cur.execute("SELECT value FROM t_schema_metadata WHERE key = 'schema_version'")
@@ -120,30 +155,25 @@ def _get_schema_state(host: str, port: int, service: str, user: str, password: s
 
 def _drop_all_hcc_objects(host: str, port: int, service: str, user: str, password: str) -> list:
     """Drop all HCC tables and sequences. Returns list of messages."""
-    tables = [
-        'T_COMPRESSION_HISTORY', 'T_LOB_COMPRESSION_ANALYSIS',
-        'T_INDEX_COMPRESSION_ANALYSIS', 'T_COMPRESSION_ANALYSIS',
-        'T_ADVISOR_RUN', 'T_STRATEGY_RULES', 'T_COMPRESSION_STRATEGIES',
-        'T_TARGET_DATABASES', 'T_SCHEMA_METADATA'
-    ]
-    sequences = ['SEQ_DATABASE_ID']
     messages = []
     try:
-        dsn = f"{host}:{port}/{service}"
-        conn = oracledb.connect(user=user, password=password, dsn=dsn)
+        conn = _connect(host, port, service, user, password)
         cur = conn.cursor()
-        for tbl in tables:
+        # Names are fixed constants, never user input.
+        for tbl in _DROP_TABLES:
             try:
                 cur.execute(f"DROP TABLE {tbl} CASCADE CONSTRAINTS PURGE")
                 messages.append(f"Dropped table {tbl}")
-            except oracledb.Error:
-                pass
-        for seq in sequences:
+            except oracledb.Error as e:
+                if 'ORA-00942' not in str(e):  # table does not exist: nothing to drop
+                    messages.append(f"Could not drop table {tbl}: {e}")
+        for seq in _DROP_SEQUENCES:
             try:
                 cur.execute(f"DROP SEQUENCE {seq}")
                 messages.append(f"Dropped sequence {seq}")
-            except oracledb.Error:
-                pass
+            except oracledb.Error as e:
+                if 'ORA-02289' not in str(e):  # sequence does not exist
+                    messages.append(f"Could not drop sequence {seq}: {e}")
         conn.commit()
         cur.close()
         conn.close()
@@ -154,29 +184,79 @@ def _drop_all_hcc_objects(host: str, port: int, service: str, user: str, passwor
 
 def _run_schema_install(host: str, port: int, service: str, user: str, password: str,
                         progress_callback=None) -> Tuple[int, int, list]:
-    """Execute central schema + seed SQL files via sql_executor."""
+    """Execute central schema + seed SQL files via sql_executor, then stamp the package version."""
     from hcc_advisor.utils.sql_executor import execute_sql_file
 
     sql_dir = _get_sql_dir()
     schema_file = sql_dir / '01_central_schema.sql'
     seed_file = sql_dir / '02_seed_strategies.sql'
 
-    dsn = f"{host}:{port}/{service}"
-    conn = oracledb.connect(user=user, password=password, dsn=dsn)
+    conn = _connect(host, port, service, user, password)
 
     total_ok = 0
     total_err = 0
     all_msgs = []
 
-    for sql_file in [schema_file, seed_file]:
-        if sql_file.exists():
-            ok, err, msgs = execute_sql_file(conn, sql_file, on_progress=progress_callback)
-            total_ok += ok
-            total_err += err
-            all_msgs.extend(msgs)
+    try:
+        for sql_file in [schema_file, seed_file]:
+            if sql_file.exists():
+                ok, err, msgs = execute_sql_file(conn, sql_file, on_progress=progress_callback)
+                total_ok += ok
+                total_err += err
+                all_msgs.extend(msgs)
 
-    conn.close()
+        # The schema script seeds schema_version too, but stamp __version__
+        # explicitly so a stale seed can never make a fresh install look
+        # outdated (which sent every session back to this page).
+        try:
+            stamp_schema_version(conn, __version__)
+            total_ok += 1
+            all_msgs.append(f"[OK] schema_version set to {__version__}")
+        except oracledb.Error as e:
+            total_err += 1
+            all_msgs.append(f"[ERROR] could not set schema_version to {__version__}: {e}")
+    finally:
+        conn.close()
     return total_ok, total_err, all_msgs
+
+
+def _get_pending_patches(host: str, port: int, service: str, user: str, password: str
+                         ) -> Tuple[Optional[List[str]], Optional[str]]:
+    """Names of the SQL patches Upgrade would apply, or (None, error message)."""
+    try:
+        patches_dir = sql_patches.resolve_patches_dir()
+        conn = _connect(host, port, service, user, password)
+    except (sql_patches.PatchError, oracledb.Error) as e:
+        return None, str(e)
+    try:
+        scan = sql_patches.scan_patches(sql_patches.list_patch_dirs(patches_dir), conn=conn)
+    finally:
+        conn.close()
+    return [d.name for d in scan.pending], None
+
+
+def _run_upgrade(host: str, port: int, service: str, user: str, password: str,
+                 schema_version: Optional[str], progress_callback=None
+                 ) -> Tuple[sql_patches.UpgradeResult, bool]:
+    """
+    Non-destructive upgrade: apply the pending SQL patches in order, then stamp
+    __version__ if every patch succeeded and the schema was behind.
+
+    Returns (patch results, version_stamped). Raises PatchError when the patch
+    directory is unusable and oracledb.Error on connection/stamp failure.
+    """
+    conn = _connect(host, port, service, user, password)
+    try:
+        # Patches (e.g. the 3.0.0 version bump) write T_SCHEMA_METADATA.
+        ensure_schema_metadata_table(conn)
+        outcome = sql_patches.apply_pending_patches(conn=conn, on_progress=progress_callback)
+        stamped = False
+        if outcome.ok and version_is_behind(schema_version, __version__):
+            stamp_schema_version(conn, __version__, upgraded=True)
+            stamped = True
+        return outcome, stamped
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +268,8 @@ def show_deployment_page(mode: str = 'setup'):
     Display the deployment/setup page.
 
     Args:
-        mode: 'setup' for first-run, 'upgrade' for schema version mismatch
+        mode: 'setup' for first-run, 'upgrade' when the schema is missing, its
+              version is unknown, or its MAJOR.MINOR is older than the package
     """
     # Page config may already have been set by app.py (which now sets it first so
     # the auth gate can render before this wizard). set_page_config can only be
@@ -257,25 +338,37 @@ def _show_existing_installation():
         st.markdown(f"**Tables:** {state['tables_found']}/{state['total_tables']} present")
         st.markdown(f"**Installed:** {state['installed_at'] or 'unknown'}")
 
-    # Status
-    if state['version'] and state['version'] == __version__:
+    # Status. Only an older MAJOR.MINOR (or unknown version) needs Upgrade.
+    status = schema_status(state['deployed'], state['version'], __version__)
+    notice = version_notice(status, state['version'], __version__)
+    if status == STATUS_CURRENT:
         st.info("Schema is up to date.")
-    elif state['version']:
-        st.warning(f"Schema version mismatch: DB has `{state['version']}`, package is `{__version__}`")
+    elif notice:
+        (st.warning if status == STATUS_NEWER else st.info)(notice)
+    elif status == STATUS_OUTDATED:
+        st.warning(f"Schema version `{state['version']}` is older than the package "
+                   f"(`{__version__}`). **Upgrade** applies the pending SQL patches "
+                   "and keeps your data.")
+    elif status == STATUS_MISSING and state['tables_found']:
+        st.warning("The HCC tables found predate schema 2.0.0 (no T_TARGET_DATABASES.DB_HOST) "
+                   "and cannot be upgraded in place. Use **Re-install Schema**.")
+    elif status == STATUS_MISSING:
+        st.warning("No HCC schema tables found. Use **Re-install Schema** to create the schema.")
     else:
-        st.warning("Schema metadata not found. Schema may need re-installation.")
+        st.warning("Schema version metadata not found. **Upgrade** applies any pending "
+                   "SQL patches and records the version; your data is kept.")
 
     st.markdown("---")
 
     col1, col2, col3, col4 = st.columns(4)
 
     with col1:
-        if st.button("Re-install Schema", type="secondary", use_container_width=True):
-            st.session_state.setup_action = 'reinstall'
+        if st.button("Upgrade (keeps data)", type="secondary", use_container_width=True):
+            st.session_state.setup_action = 'upgrade'
 
     with col2:
-        if st.button("Upgrade", type="secondary", use_container_width=True):
-            st.session_state.setup_action = 'upgrade'
+        if st.button("Re-install Schema (drops data)", type="secondary", use_container_width=True):
+            st.session_state.setup_action = 'reinstall'
 
     with col3:
         if st.button("Cleanup / Uninstall", type="secondary", use_container_width=True):
@@ -286,19 +379,25 @@ def _show_existing_installation():
             st.session_state.setup_complete = True
             st.rerun()
 
-    # Handle actions
+    creds = (config.CENTRAL_DB_HOST, config.CENTRAL_DB_PORT,
+             config.CENTRAL_DB_SERVICE, config.CENTRAL_DB_USER,
+             config.CENTRAL_DB_PASSWORD)
+
+    # Handle actions. Destructive ones (Re-install, Cleanup) run only after the
+    # confirmation phrase is typed; the disabled flag is a UI hint, the
+    # `clicked and confirmed` check is the safety check.
     action = st.session_state.get('setup_action')
 
     if action == 'reinstall':
         st.markdown("---")
-        st.warning("**Re-install** will DROP all HCC tables and recreate the schema. All data will be lost.")
-        if st.button("Confirm Re-install", type="primary"):
+        st.error("**Re-install** will DROP all HCC tables (analysis results, compression "
+                 "history, registered databases, strategies, patch history) and recreate "
+                 "the schema. All data will be lost. Use **Upgrade** to keep your data.")
+        confirmed = _confirm_phrase(_REINSTALL_CONFIRM_PHRASE, key='setup_reinstall_confirm')
+        clicked = st.button("Confirm Re-install", type="primary", disabled=not confirmed)
+        if clicked and confirmed:
             with st.spinner("Dropping existing objects..."):
-                drop_msgs = _drop_all_hcc_objects(
-                    config.CENTRAL_DB_HOST, config.CENTRAL_DB_PORT,
-                    config.CENTRAL_DB_SERVICE, config.CENTRAL_DB_USER,
-                    config.CENTRAL_DB_PASSWORD
-                )
+                drop_msgs = _drop_all_hcc_objects(*creds)
                 for msg in drop_msgs:
                     st.text(msg)
 
@@ -308,12 +407,7 @@ def _show_existing_installation():
                 if total > 0:
                     progress.progress(cur / total, text=msg)
 
-            ok, err, msgs = _run_schema_install(
-                config.CENTRAL_DB_HOST, config.CENTRAL_DB_PORT,
-                config.CENTRAL_DB_SERVICE, config.CENTRAL_DB_USER,
-                config.CENTRAL_DB_PASSWORD,
-                progress_callback=on_progress
-            )
+            ok, err, msgs = _run_schema_install(*creds, progress_callback=on_progress)
             progress.progress(1.0, text="Done!")
 
             if err == 0:
@@ -326,53 +420,68 @@ def _show_existing_installation():
                     st.text(msg)
 
             st.session_state.pop('setup_action', None)
+            st.session_state.pop('setup_reinstall_confirm', None)
 
     elif action == 'upgrade':
         st.markdown("---")
-        st.info("For v2.0.0, upgrade performs a full re-install (no migration scripts yet).")
-        if st.button("Confirm Upgrade (Re-install)", type="primary"):
-            with st.spinner("Dropping existing objects..."):
-                _drop_all_hcc_objects(
-                    config.CENTRAL_DB_HOST, config.CENTRAL_DB_PORT,
-                    config.CENTRAL_DB_SERVICE, config.CENTRAL_DB_USER,
-                    config.CENTRAL_DB_PASSWORD
-                )
-
-            progress = st.progress(0, text="Installing schema...")
-
-            def on_progress(cur, total, stype, msg):
-                if total > 0:
-                    progress.progress(cur / total, text=msg)
-
-            ok, err, msgs = _run_schema_install(
-                config.CENTRAL_DB_HOST, config.CENTRAL_DB_PORT,
-                config.CENTRAL_DB_SERVICE, config.CENTRAL_DB_USER,
-                config.CENTRAL_DB_PASSWORD,
-                progress_callback=on_progress
-            )
-            progress.progress(1.0, text="Done!")
-
-            if err == 0:
-                st.success(f"Schema upgraded successfully ({ok} statements)")
+        st.markdown(f"**Upgrade** applies the pending SQL patches from `sql/patches/` in "
+                    f"order, then records schema version `{__version__}`. Nothing is "
+                    "dropped and your data is kept. It stops at the first failing patch.")
+        if status == STATUS_NEWER:
+            st.error("The schema is newer than this package. Upgrade the HCC Advisor "
+                     "package instead.")
+        elif status == STATUS_MISSING:
+            st.error("No HCC schema found to upgrade. Use **Re-install Schema** to create it.")
+        else:
+            pending, problem = _get_pending_patches(*creds)
+            if problem:
+                st.error(f"Cannot upgrade: {problem}")
             else:
-                st.warning(f"Completed with {err} errors ({ok} successful)")
+                if pending:
+                    st.markdown(f"**{len(pending)} pending patch(es):** "
+                                + ", ".join(f"`{name}`" for name in pending))
+                else:
+                    st.info("No pending patches: only the schema version will be recorded.")
 
-            with st.expander("Execution Details"):
-                for msg in msgs:
-                    st.text(msg)
+                if st.button("Apply Upgrade", type="primary"):
+                    progress = st.progress(0, text="Applying patches...")
 
-            st.session_state.pop('setup_action', None)
+                    def on_patch(idx, total, name):
+                        if total > 0:
+                            progress.progress(idx / total, text=f"Applying {name}...")
+
+                    try:
+                        outcome, stamped = _run_upgrade(*creds, schema_version=state['version'],
+                                                        progress_callback=on_patch)
+                    except Exception as e:
+                        progress.empty()
+                        st.error(f"Upgrade failed: {e}")
+                    else:
+                        progress.progress(1.0, text="Done!")
+                        for r in outcome.results:
+                            if r.status == sql_patches.PATCH_APPLIED:
+                                st.text(f"[OK] {r.name} ({r.statements} statements)")
+                            else:
+                                st.text(f"[FAILED] {r.name}: {r.error}")
+                        if outcome.failed:
+                            st.error(f"Patch `{outcome.failed.name}` failed. Later patches were "
+                                     "not applied and the schema version was not changed. Fix "
+                                     "the cause and run Upgrade again.")
+                        else:
+                            msg = f"Upgrade complete: {len(outcome.results)} patch(es) applied"
+                            if stamped:
+                                msg += f", schema version set to `{__version__}`"
+                            st.success(msg + ". Click **Continue to Dashboard**.")
+                            st.session_state.pop('setup_action', None)
 
     elif action == 'cleanup':
         st.markdown("---")
         st.error("**Cleanup** will DROP all HCC tables and remove the .env configuration. This cannot be undone.")
-        if st.button("Confirm Cleanup", type="primary"):
+        confirmed = _confirm_phrase(_CLEANUP_CONFIRM_PHRASE, key='setup_cleanup_confirm')
+        clicked = st.button("Confirm Cleanup", type="primary", disabled=not confirmed)
+        if clicked and confirmed:
             with st.spinner("Dropping all HCC objects..."):
-                drop_msgs = _drop_all_hcc_objects(
-                    config.CENTRAL_DB_HOST, config.CENTRAL_DB_PORT,
-                    config.CENTRAL_DB_SERVICE, config.CENTRAL_DB_USER,
-                    config.CENTRAL_DB_PASSWORD
-                )
+                drop_msgs = _drop_all_hcc_objects(*creds)
                 for msg in drop_msgs:
                     st.text(msg)
 
@@ -384,6 +493,7 @@ def _show_existing_installation():
 
             st.success("Cleanup complete. Refresh to start fresh.")
             st.session_state.pop('setup_action', None)
+            st.session_state.pop('setup_cleanup_confirm', None)
 
     st.stop()
 
@@ -547,12 +657,17 @@ def _wizard_deploy():
     schema_state = conn.get('schema_state', {})
 
     if schema_state.get('version'):
-        st.warning(f"Existing schema v{schema_state['version']} detected. Deploying will re-install.")
-        if st.button("Drop existing and re-install"):
+        st.warning(f"Existing schema v{schema_state['version']} detected. **Drop existing and "
+                   "re-install** deletes all HCC tables and their data. To keep the data, "
+                   "choose **Skip**; an older schema can then be upgraded in place.")
+        confirmed = _confirm_phrase(_REINSTALL_CONFIRM_PHRASE, key='wizard_reinstall_confirm')
+        clicked = st.button("Drop existing and re-install", disabled=not confirmed)
+        if clicked and confirmed:
             with st.spinner("Dropping existing objects..."):
                 _drop_all_hcc_objects(conn['host'], conn['port'], conn['service'],
                                       conn['username'], conn['password'])
             st.session_state.setup_conn.pop('schema_state', None)
+            st.session_state.pop('wizard_reinstall_confirm', None)
             st.rerun()
         if st.button("Skip (keep existing schema)"):
             st.session_state.setup_step = 4
