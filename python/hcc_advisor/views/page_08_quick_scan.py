@@ -8,6 +8,7 @@ import pandas as pd
 from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.target_queries import TargetQueries
 from hcc_advisor.config import config
+from hcc_advisor.auth import AuthManager, ROLE_OPERATOR
 
 COMP_OPTIONS = ['NONE', 'OLTP', 'QUERY LOW', 'QUERY HIGH', 'ARCHIVE LOW', 'ARCHIVE HIGH']
 DOP_OPTIONS = list(range(1, 65))  # will be capped at runtime by CPU_COUNT/2
@@ -57,10 +58,12 @@ def show_quick_scan_page():
 
     schema_param = None if schema == "All Schemas" else schema
 
-    # Scan button
+    # Scan button (writes scan results to the central DB: operator role)
+    can_scan, scan_help = AuthManager.role_gate(ROLE_OPERATOR)
     col_scan, col_info = st.columns([1, 3])
     with col_scan:
-        if st.button("Scan Now", type="primary", use_container_width=True, key="qs_scan"):
+        if st.button("Scan Now", type="primary", use_container_width=True, key="qs_scan",
+                     disabled=not can_scan, help=scan_help) and AuthManager.require_role(ROLE_OPERATOR):
             with st.spinner("Scanning (hotness-only, no DBMS_COMPRESSION)..."):
                 results = TargetQueries.quick_scan(db_id, owner=schema_param)
                 st.session_state['qs_last_count'] = len(results)
@@ -69,6 +72,8 @@ def show_quick_scan_page():
         last = st.session_state.get('qs_last_count')
         if last is not None:
             st.success(f"Last scan: {last} objects analyzed")
+        if scan_help:
+            st.caption("View only: scanning and submitting jobs requires the operator role.")
 
     # Check completed jobs on refresh
     if refresh:
@@ -341,7 +346,9 @@ def _render_scan_tab(df, obj_type, db_id, max_queue, max_dop, running_set):
             if can_submit < n:
                 st.warning(f"Only {can_submit} of {n} can be submitted (queue: {running_count}/{max_queue})")
 
-            if st.button(f"Submit {can_submit} Job(s)", key=f"qs_submit_{obj_type}", type="primary"):
+            can_run, run_help = AuthManager.role_gate(ROLE_OPERATOR)
+            if st.button(f"Submit {can_submit} Job(s)", key=f"qs_submit_{obj_type}", type="primary",
+                         disabled=not can_run, help=run_help) and AuthManager.require_role(ROLE_OPERATOR):
                 submitted = 0
                 skipped_none = 0
                 for _, row in selected.head(can_submit).iterrows():
@@ -429,9 +436,11 @@ def _render_schemas_tab(db_id, max_queue, max_dop):
     with col1:
         confirm = st.checkbox("Confirm Bulk Submission", key="qs_bulk_confirm")
     with col2:
+        can_run, run_help = AuthManager.role_gate(ROLE_OPERATOR)
         if st.button(f"Submit All {len(all_candidates)} Candidates",
-                     disabled=not confirm, type="primary",
-                     key="qs_bulk_submit", use_container_width=True):
+                     disabled=not (confirm and can_run), type="primary",
+                     key="qs_bulk_submit", use_container_width=True,
+                     help=run_help) and AuthManager.require_role(ROLE_OPERATOR):
             result = _bulk_submit(all_candidates, db_id, max_queue, bulk_dop)
             st.success(
                 f"Submitted: {result['submitted']}, "

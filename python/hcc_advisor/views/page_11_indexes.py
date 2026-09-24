@@ -13,6 +13,7 @@ from hcc_advisor.utils.target_queries import (
 from hcc_advisor.utils.target_connector import TargetConnector
 from hcc_advisor.utils.central_connector import CentralConnector
 from hcc_advisor.utils.logger import log_error
+from hcc_advisor.auth import AuthManager, ROLE_OPERATOR
 
 
 def show_indexes_page():
@@ -150,12 +151,18 @@ def show_indexes_page():
         n = len(selected)
         st.info(f"{n} index(es) selected for rebuild")
 
+        # Rebuild jobs run DDL via DBMS_SCHEDULER on the target: operator role.
+        can_rebuild, rebuild_help = AuthManager.role_gate(ROLE_OPERATOR)
         col1, col2, col3 = st.columns([1, 1, 2])
         with col1:
             confirm = st.checkbox("Confirm Rebuild", key="idx_confirm")
+        with col3:
+            if rebuild_help:
+                st.caption(rebuild_help)
         with col2:
-            if st.button(f"Submit {n} Rebuild Job(s)", disabled=not confirm,
-                         type="primary", key="idx_submit", use_container_width=True):
+            if st.button(f"Submit {n} Rebuild Job(s)", disabled=not (confirm and can_rebuild),
+                         type="primary", key="idx_submit", use_container_width=True,
+                         help=rebuild_help) and AuthManager.require_role(ROLE_OPERATOR):
                 submitted = 0
                 for _, row in selected.iterrows():
                     idx_owner = row['index_owner']

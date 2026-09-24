@@ -9,7 +9,7 @@ import streamlit as st
 
 from hcc_advisor.config import config, Config
 from hcc_advisor import __version__
-from hcc_advisor.auth import AuthManager, render_logout_button
+from hcc_advisor.auth import AuthManager, ROLE_ADMIN, render_logout_button
 from hcc_advisor.utils.schema_version import (
     STATUS_NEWER, needs_upgrade, schema_status, version_notice,
 )
@@ -46,7 +46,8 @@ if not _needs_setup and config.CENTRAL_DB_PASSWORD:
                 _schema_status, version_notice(_schema_status, _schema['version'], __version__))
 
 if (_needs_setup or _needs_upgrade) and not st.session_state.get('setup_complete'):
-    # Gate the destructive deployment wizard behind authentication.
+    # Gate the destructive deployment wizard behind authentication, then the
+    # admin role (checked by show_deployment_page, which st.stop()s otherwise).
     AuthManager.require_authentication()  # renders login + st.stop() if anonymous
     from hcc_advisor.views.page_00_setup import show_deployment_page
     show_deployment_page(mode='setup' if _needs_setup else 'upgrade')
@@ -747,7 +748,10 @@ def show_dashboard():
                 if st.button("Refresh Logs", key="refresh_logs_btn", use_container_width=True):
                     st.rerun()
             with btn_col2:
-                if st.button("Clear Logs", key="clear_logs_btn", use_container_width=True, type="secondary"):
+                # Deleting the log files destroys the audit trail: admin only.
+                can_clear, clear_help = AuthManager.role_gate(ROLE_ADMIN)
+                if st.button("Clear Logs", key="clear_logs_btn", use_container_width=True, type="secondary",
+                             disabled=not can_clear, help=clear_help) and AuthManager.require_role(ROLE_ADMIN):
                     result = clear_logs()
                     st.toast(result)
                     st.rerun()

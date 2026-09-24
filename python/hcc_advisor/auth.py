@@ -5,7 +5,7 @@ Handles user authentication and session management
 
 import streamlit as st
 from datetime import datetime, timedelta
-from typing import Optional, List
+from typing import Optional, List, Tuple
 import hashlib
 import hmac
 import threading
@@ -293,6 +293,18 @@ class AuthManager:
                f"'{required_role}' role (you are '{AuthManager.get_role() or 'admin'}')."
         )
         return False
+
+    @staticmethod
+    def role_gate(required_role: str) -> Tuple[bool, Optional[str]]:
+        """(allowed, help_text) for a widget that performs a privileged action.
+
+        help_text is None when allowed, otherwise a short note for the widget's
+        `help=` or a caption. Disabling is only a UI hint: the click handler must
+        still re-check (`if st.button(..., disabled=not allowed) and
+        AuthManager.require_role(role):`) so a forced click does nothing.
+        """
+        allowed = AuthManager.has_role(required_role)
+        return allowed, None if allowed else f"Requires the {required_role} role."
 
     @staticmethod
     def require_authentication():

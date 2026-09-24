@@ -12,6 +12,7 @@ from typing import Optional
 from hcc_advisor.utils.central_queries import CentralQueries
 from hcc_advisor.utils.target_queries import TargetQueries, _blank_to_none, rollback_block_reason
 from hcc_advisor.config import config
+from hcc_advisor.auth import AuthManager, ROLE_OPERATOR
 
 
 def _rollback_object_label(row) -> str:
@@ -315,8 +316,13 @@ def show_history_page():
                 else:
                     st.warning(f"This will move only **{label}** to NOCOMPRESS and rebuild the "
                                f"indexes that move leaves unusable.")
+                # Rollback moves the segment on the target: operator role or above.
+                can_rollback, rollback_help = AuthManager.role_gate(ROLE_OPERATOR)
+                if rollback_help:
+                    st.caption(rollback_help)
                 if st.button("Rollback to NOCOMPRESS", key="rollback_btn", type="primary",
-                             disabled=block_reason is not None):
+                             disabled=block_reason is not None or not can_rollback,
+                             help=rollback_help) and AuthManager.require_role(ROLE_OPERATOR):
                     # Use the row's own database (the sidebar may be "All Databases")
                     # and its partition/subpartition so only that segment is moved.
                     with st.spinner("Rolling back..."):

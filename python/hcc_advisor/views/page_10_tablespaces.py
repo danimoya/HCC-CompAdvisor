@@ -11,6 +11,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from hcc_advisor.utils.target_queries import TargetQueries
 from hcc_advisor.utils.target_connector import TargetConnector
+from hcc_advisor.auth import AuthManager, ROLE_OPERATOR
 
 
 # Resize one datafile. The file name and size are binds concatenated inside the
@@ -137,12 +138,15 @@ def show_tablespaces_page():
 
     targets = st.session_state.get('ts_shrink_targets', [])
     if targets:
+        # Datafile RESIZE is DDL on the target: operator role or above.
+        can_shrink, shrink_help = AuthManager.role_gate(ROLE_OPERATOR)
         col1, col2, col3 = st.columns([1, 1, 1])
         with col1:
             confirm = st.checkbox("Confirm Shrink", key="ts_confirm")
         with col2:
-            if st.button("Execute Shrink", disabled=not confirm, type="primary",
-                         key="ts_execute", use_container_width=True):
+            if st.button("Execute Shrink", disabled=not (confirm and can_shrink), type="primary",
+                         key="ts_execute", use_container_width=True,
+                         help=shrink_help) and AuthManager.require_role(ROLE_OPERATOR):
                 results = []
                 for ts_name in targets:
                     with st.spinner(f"Shrinking {ts_name}..."):
@@ -150,6 +154,8 @@ def show_tablespaces_page():
                 st.session_state['ts_shrink_results'] = results
                 st.session_state.pop('ts_shrink_targets', None)
                 st.rerun()
+            if shrink_help:
+                st.caption(shrink_help)
 
     # Datafile details
     st.markdown("---")
