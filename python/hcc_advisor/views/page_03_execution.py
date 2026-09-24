@@ -48,6 +48,18 @@ def _db_label_for(db_id):
     return f"db_{db_id}"
 
 
+def _segment_names(row):
+    """(partition_name, subpartition_name) of a recommendation row, None for
+    NULL / NaN / blank. A subpartition row carries its parent partition too;
+    the subpartition is what gets moved."""
+    def _name(value):
+        if value is None or (not isinstance(value, str) and pd.isna(value)):
+            return None
+        value = str(value).strip()
+        return value if value and value not in ('None', 'nan') else None
+    return _name(row.get('partition_name')), _name(row.get('subpartition_name'))
+
+
 def _render_dry_run(operations_df: pd.DataFrame, db_label: str,
                     include_indexes: bool, download_key: str,
                     status_label: str = "Dry Run"):
@@ -257,13 +269,14 @@ def show_single_execution():
 
     owner = selected_row['table_owner']
     table_name = selected_row['table_name']
-    partition_name = selected_row.get('partition_name')
+    partition_name, subpartition_name = _segment_names(selected_row)
 
     # Same version/platform rules as execution (ONLINE only where supported,
-    # no HCC on STANDARD targets), so the preview matches what would run.
+    # no HCC on STANDARD targets), so the preview matches what would run:
+    # a subpartition row previews MOVE SUBPARTITION, not its parent partition.
     try:
         ddl = TargetQueries.generate_ddl(
-            owner, table_name, recommended_strategy, partition_name,
+            owner, table_name, recommended_strategy, partition_name, subpartition_name,
             parallel_degree=parallel_degree,
             **target_ddl_info(db_id)
         )
@@ -301,7 +314,8 @@ def show_single_execution():
                 'database_name': db_label,
                 'owner': str(owner).upper(),
                 'object_name': str(table_name).upper(),
-                'partition_name': partition_name if partition_name and pd.notna(partition_name) else None,
+                'partition_name': partition_name,
+                'subpartition_name': subpartition_name,
                 'compression_type_applied': recommended_strategy,
                 'parallel_degree': int(parallel_degree),
                 'operation_status': 'DRY_RUN',
@@ -317,7 +331,8 @@ def show_single_execution():
                 'owner': owner,
                 'table_name': table_name,
                 'compression_type': recommended_strategy,
-                'partition_name': partition_name if partition_name and pd.notna(partition_name) else None,
+                'partition_name': partition_name,
+                'subpartition_name': subpartition_name,
             }], db_id, parallel_degree)
         else:
             with st.spinner("Executing compression..."):
@@ -327,6 +342,7 @@ def show_single_execution():
                     table_name=table_name,
                     compression_type=recommended_strategy,
                     partition_name=partition_name,
+                    subpartition_name=subpartition_name,
                     dry_run=False,
                     parallel_degree=parallel_degree
                 )
@@ -497,14 +513,15 @@ def show_batch_execution():
                     match = df[df['recommendation_id'] == rec_id]
                     if not match.empty:
                         r = match.iloc[0]
-                        pn = r.get('partition_name')
+                        pn, spn = _segment_names(r)
                         rows.append({
                             'database_id': db_id,
                             'database_display': db_label,
                             'database_name': db_label,
                             'owner': str(r['table_owner']).upper(),
                             'object_name': str(r['table_name']).upper(),
-                            'partition_name': pn if pd.notna(pn) else None,
+                            'partition_name': pn,
+                            'subpartition_name': spn,
                             'compression_type_applied': r['recommended_strategy'],
                             'parallel_degree': int(batch_parallel),
                             'operation_status': 'DRY_RUN',
@@ -523,12 +540,13 @@ def show_batch_execution():
                     match = df[df['recommendation_id'] == rec_id]
                     if not match.empty:
                         row = match.iloc[0]
-                        pn = row.get('partition_name')
+                        pn, spn = _segment_names(row)
                         items.append({
                             'owner': row['table_owner'],
                             'table_name': row['table_name'],
                             'compression_type': row['recommended_strategy'],
-                            'partition_name': pn if pd.notna(pn) else None
+                            'partition_name': pn,
+                            'subpartition_name': spn,
                         })
 
                 if batch_background:

@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import streamlit_option_menu
 from streamlit.testing.v1 import AppTest
+from streamlit.testing.v1.element_tree import Selectbox
 
 import hcc_advisor
 from hcc_advisor import auth
@@ -25,6 +26,21 @@ TIMEOUT = 30  # seconds per AppTest run; app.py imports a lot on its first run
 
 def _target_databases(*args, **kwargs):
     return pd.DataFrame([{"DATABASE_ID": 1, "DATABASE_NAME": "DB1", "DISPLAY_NAME": "DB1"}])
+
+
+_SELECTBOX_INDEX = Selectbox.index
+
+
+def _selectbox_index(self):
+    """AppTest (1.31) sends a selectbox back by looking str(value) up in the
+    displayed options, which fails for a format_func'd selectbox such as the
+    sidebar target selector (options are database ids, labels are names).
+    A selection the test made (select / select_index) still goes that way; an
+    untouched one keeps the index the app rendered it with (its default)."""
+    try:
+        return _SELECTBOX_INDEX.fget(self)
+    except ValueError:
+        return self.proto.default
 
 
 def _overview_sources():
@@ -54,6 +70,7 @@ def app_shell(page: str, extra=()):
         (CentralConnector, "test_connection", MagicMock(return_value=True)),
         (CentralQueries, "get_target_databases", MagicMock(side_effect=_target_databases)),
         (streamlit_option_menu, "option_menu", MagicMock(return_value=page)),
+        (Selectbox, "index", property(_selectbox_index)),
         *_overview_sources(),
         *extra,
     ]

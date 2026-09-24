@@ -270,6 +270,14 @@ def _already_open_error(label: str, open_row: Dict[str, Any], outcome: str) -> s
             f"{open_row['status']}): {outcome} - see the Scheduler page")
 
 
+def _execution_mode(oracle_version, partition_name=None, subpartition_name=None) -> str:
+    """T_COMPRESSION_HISTORY.EXECUTION_MODE of a MOVE of this segment on a target
+    of this version: ONLINE where generate_ddl emits MOVE ... ONLINE, else OFFLINE
+    (UPDATE INDEXES or a plain MOVE, which block DML on the segment)."""
+    level = object_level(_blank_to_none(partition_name), _blank_to_none(subpartition_name))
+    return 'ONLINE' if supports_online_move(oracle_version, level) else 'OFFLINE'
+
+
 def _history_compression_type(value) -> str:
     """Compression type as stored in T_COMPRESSION_HISTORY: CHK_HISTORY_COMPRESSION_TYPE
     accepts 'QUERY HIGH' but not the 'QUERY_HIGH' spelling generate_ddl also takes."""
@@ -1768,17 +1776,20 @@ class TargetQueries:
         dry_run: bool = True,
         parallel_degree: int = 4,
         executed_by: Optional[str] = None,
-        target_info: Optional[Dict[str, Optional[str]]] = None
+        target_info: Optional[Dict[str, Optional[str]]] = None,
+        subpartition_name: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Execute compression for a specific table or partition on the target database.
+        Execute compression for a specific table, partition or subpartition on
+        the target database.
 
         Args:
             database_id: Target database identifier
             owner: Schema owner
             table_name: Table name
             compression_type: Target compression type
-            partition_name: Optional partition name
+            partition_name: Optional partition name (for a subpartition: its
+                parent partition, as the analysis row and the queue store it)
             dry_run: If True, only generate DDL without executing
             parallel_degree: Parallel execution degree
             executed_by: Audit user for the history row. Worker threads (batch
@@ -1786,6 +1797,9 @@ class TargetQueries:
                 the acting user in; defaults to _acting_user().
             target_info: target_ddl_info(database_id) when the caller already
                 has it (batch_execute resolves it once); looked up otherwise.
+            subpartition_name: Optional subpartition name: only that
+                subpartition is moved (MOVE SUBPARTITION), measured, checked
+                for an open row and recorded in the history.
 
         Returns:
             dict with execution result. An invalid name/type/DOP, or HCC on a
@@ -1797,15 +1811,15 @@ class TargetQueries:
             rejecting the insert); {'success': False, 'error'} when the row
             could not be checked or written.
         """
-        # Handle None/NaN partition name
-        if partition_name is not None and pd.isna(partition_name):
-            partition_name = None
+        # Handle None/NaN/blank partition and subpartition names
+        partition_name = _blank_to_none(partition_name)
+        subpartition_name = _blank_to_none(subpartition_name)
 
         if target_info is None:
             target_info = target_ddl_info(database_id)
         try:
             ddl = TargetQueries.generate_ddl(
-                owner, table_name, compression_type, partition_name,
+                owner, table_name, compression_type, partition_name, subpartition_name,
                 parallel_degree=parallel_degree,
                 oracle_version=target_info.get('oracle_version'),
                 platform_type=target_info.get('platform_type'),
@@ -1843,9 +1857,9 @@ class TargetQueries:
         except Exception:
             pass
 
-        # Get original size from target before compression
+        # Get original size from target before compression (the moved segment only)
         orig_size = 0
-        seg_q, seg_params = _segment_size_query(owner, table_name, partition_name)
+        seg_q, seg_params = _segment_size_query(owner, table_name, partition_name, subpartition_name)
         try:
             seg_df = TargetConnector.execute_query(database_id, seg_q, seg_params)
             if not seg_df.empty:
@@ -1857,9 +1871,10 @@ class TargetQueries:
         # or running is not moved a second time. UNQ_HISTORY_OPEN_SEGMENT makes
         # this race-free (the insert below is then rejected); without the
         # patch this check is the only guard.
-        label = _segment_label(owner, table_name, partition_name)
+        label = _segment_label(owner, table_name, partition_name, subpartition_name)
         try:
-            open_row = TargetQueries._open_segment_row(database_id, owner, table_name, partition_name)
+            open_row = TargetQueries._open_segment_row(database_id, owner, table_name,
+                                                       partition_name, subpartition_name)
         except Exception as e:
             return {'success': False,
                     'error': f"Could not check the history of {label}, not compressed: {e}"}
@@ -1872,13 +1887,14 @@ class TargetQueries:
         history_record = {
             'owner': owner,
             'object_name': table_name,
-            'object_type': 'PARTITION' if partition_name else 'TABLE',
+            'object_type': object_level(partition_name, subpartition_name),
             'partition_name': partition_name,
+            'subpartition_name': subpartition_name,
             'compression_type_applied': compression_type,
             'compression_clause': clause,
             'original_ddl': ddl_exec,
-            'execution_mode': ('ONLINE' if supports_online_move(
-                target_info.get('oracle_version'), object_level(partition_name)) else 'OFFLINE'),
+            'execution_mode': _execution_mode(target_info.get('oracle_version'),
+                                              partition_name, subpartition_name),
             'parallel_degree': parallel_degree,
             'original_size_bytes': orig_size,
             'operation_status': 'IN_PROGRESS',
@@ -1894,7 +1910,7 @@ class TargetQueries:
             # reconcile, to the savings reports and to rollback.
             try:
                 open_row = TargetQueries._open_segment_row(database_id, owner, table_name,
-                                                           partition_name)
+                                                           partition_name, subpartition_name)
             except Exception:
                 open_row = None
             if open_row:
@@ -1908,16 +1924,18 @@ class TargetQueries:
         try:
             return TargetQueries._run_compression_ddl(
                 database_id, owner, table_name, compression_type, partition_name,
-                parallel_degree, ddl_exec, orig_size, history_id, seg_q, seg_params)
+                parallel_degree, ddl_exec, orig_size, history_id, seg_q, seg_params,
+                subpartition_name=subpartition_name)
         finally:
             _set_active(_ACTIVE_HISTORY_IDS, history_id, False)
 
     @staticmethod
     def _run_compression_ddl(database_id, owner, table_name, compression_type, partition_name,
                              parallel_degree, ddl_exec, orig_size, history_id,
-                             seg_q, seg_params) -> Dict[str, Any]:
+                             seg_q, seg_params, subpartition_name=None) -> Dict[str, Any]:
         """execute_compression after its IN_PROGRESS history row is written:
-        run the MOVE, rebuild unusable indexes, record the outcome on the row."""
+        run the MOVE, rebuild the index structures of the moved segment that it
+        left unusable, record the outcome on the row."""
         import time as _time
         from hcc_advisor.utils.central_connector import CentralConnector
 
@@ -1938,52 +1956,18 @@ class TargetQueries:
             elapsed = _time.perf_counter() - t0
 
             if success:
-                # Rebuild unusable indexes after ALTER TABLE MOVE
-                idx_rebuilt = 0
-                idx_failed = 0
-                idx_time = 0
-                try:
-                    idx_q = """
-                        SELECT owner, index_name FROM all_indexes
-                        WHERE table_owner = :owner AND table_name = :table_name
-                          AND status = 'UNUSABLE'
-                    """
-                    idx_params = {'owner': owner, 'table_name': table_name}
-                    idx_df = TargetConnector.execute_query(database_id, idx_q, idx_params)
-                    if not idx_df.empty:
-                        it0 = _time.perf_counter()
-                        # parallel_degree is interpolated below; ensure it is a
-                        # bounded integer (defends the index-rebuild DDL too).
-                        try:
-                            _pd = int(parallel_degree)
-                        except (TypeError, ValueError):
-                            _pd = 4
-                        _pd = min(max(_pd, 1), 128)
-                        for _, idx_row in idx_df.iterrows():
-                            idx_owner = idx_row['OWNER']
-                            idx_name = idx_row['INDEX_NAME']
-                            try:
-                                # SECURITY (CWE-89): validate index identifiers
-                                # (second-order — they come from all_indexes) before
-                                # interpolating them into EXECUTE IMMEDIATE.
-                                _io = _validate_identifier(idx_owner, "index owner")
-                                _in = _validate_identifier(idx_name, "index name")
-                                rebuilt = TargetConnector.execute_plsql(
-                                    database_id,
-                                    f"BEGIN EXECUTE IMMEDIATE 'ALTER INDEX {_io}.{_in} REBUILD ONLINE PARALLEL {_pd}'; END;"
-                                )
-                            except Exception:
-                                rebuilt = False
-                            # execute_plsql reports a DB error by returning False:
-                            # only a True result is a rebuilt index.
-                            if rebuilt:
-                                idx_rebuilt += 1
-                            else:
-                                idx_failed += 1
-                                log_warning(f"Failed to rebuild index {idx_owner}.{idx_name}")
-                        idx_time = round(_time.perf_counter() - it0, 1)
-                except Exception:
-                    pass
+                # Rebuild what the MOVE left UNUSABLE, scoped to the moved
+                # segment: the table's non-partitioned and global index
+                # structures, plus that (sub)partition's local index
+                # (sub)partitions. ONLINE and UPDATE INDEXES moves keep them
+                # usable; a table MOVE before 12.2 does not.
+                it0 = _time.perf_counter()
+                idx_rebuilt, failed_labels = TargetQueries._rebuild_unusable_indexes(
+                    database_id, owner, table_name, partition_name, subpartition_name,
+                    parallel_degree,
+                    _segment_label(owner, table_name, partition_name, subpartition_name))
+                idx_failed = len(failed_labels)
+                idx_time = round(_time.perf_counter() - it0, 1) if idx_rebuilt or idx_failed else 0
 
                 # Get compressed size
                 comp_size = 0
@@ -2018,7 +2002,7 @@ class TargetQueries:
                     **hist_binds
                 })
 
-                # Update analysis row to reflect new compression state
+                # Update the moved segment's analysis row to its new state
                 try:
                     CentralConnector.execute_dml("""
                         UPDATE t_compression_analysis
@@ -2027,10 +2011,11 @@ class TargetQueries:
                         WHERE database_id = :db_id AND owner = :owner
                           AND object_name = :tbl
                           AND NVL(partition_name, '~') = NVL(:part, '~')
+                          AND NVL(subpartition_name, '~') = NVL(:sub, '~')
                     """, {
                         'comp_type': compression_type, 'comp_size': comp_size,
                         'db_id': database_id, 'owner': owner,
-                        'tbl': table_name, 'part': partition_name
+                        'tbl': table_name, 'part': partition_name, 'sub': subpartition_name
                     })
                 except Exception:
                     pass
@@ -2065,7 +2050,8 @@ class TargetQueries:
                 pass
             log_error(e, "TargetQueries.execute_compression", {
                 'database_id': database_id, 'owner': owner,
-                'table_name': table_name, 'compression_type': compression_type
+                'table_name': table_name, 'partition_name': partition_name,
+                'subpartition_name': subpartition_name, 'compression_type': compression_type
             })
             return {'error': str(e)}
 
@@ -2086,7 +2072,7 @@ class TargetQueries:
         Args:
             database_id: Target database identifier
             items: List of dicts, each with owner, table_name, compression_type,
-                   and optional partition_name
+                   and optional partition_name / subpartition_name
             dry_run: If True, only generate DDL without executing
             parallel_degree: Parallel execution degree per table (PARALLEL N in DDL)
             concurrency: Number of tables to compress simultaneously (a live
@@ -2107,6 +2093,7 @@ class TargetQueries:
                 'owner': item.get('owner'),
                 'table_name': item.get('table_name'),
                 'partition_name': item.get('partition_name'),
+                'subpartition_name': item.get('subpartition_name'),
                 'compression_type': item.get('compression_type'),
                 'result': res
             }
@@ -2121,7 +2108,8 @@ class TargetQueries:
                 dry_run=dry_run,
                 parallel_degree=parallel_degree,
                 executed_by=executed_by,
-                target_info=target_info
+                target_info=target_info,
+                subpartition_name=item.get('subpartition_name')
             )
             return _entry(item, res)
 
@@ -2955,12 +2943,13 @@ MOVE {compression_clause}
     # COMPRESSION ROLLBACK
     # ============================================================================
 
-    # Unusable index structures left behind by moving ONE table segment. A
-    # (sub)partition rollback rebuilds only that segment's LOCAL index
+    # Unusable index structures left behind by moving ONE table segment (a
+    # compression or its rollback, see _rebuild_unusable_indexes). A
+    # (sub)partition MOVE rebuilds only that segment's LOCAL index
     # (sub)partitions, matched by position because system-generated names differ
     # between a table and its local index, plus every unusable GLOBAL index
     # structure (a partition MOVE invalidates those as a whole). For a table-level
-    # rollback (:p and :sp NULL) only non-partitioned and GLOBAL partitioned
+    # MOVE (:p and :sp NULL) only non-partitioned and GLOBAL partitioned
     # indexes can exist. Binds: :o owner, :t table, :p partition, :sp subpartition.
     _ROLLBACK_UNUSABLE_INDEXES_SQL = """
         SELECT i.owner AS index_owner, i.index_name,
@@ -3023,6 +3012,71 @@ MOVE {compression_clause}
         raise ValueError(f"Unknown index rebuild level: {level!r}")
 
     @staticmethod
+    def _rebuild_unusable_indexes(database_id: int, owner: str, table_name: str,
+                                  partition_name: Optional[str], subpartition_name: Optional[str],
+                                  parallel_degree: int, target_label: str):
+        """Rebuild the index structures a MOVE of one segment left UNUSABLE
+        (_ROLLBACK_UNUSABLE_INDEXES_SQL: the table's non-partitioned and global
+        indexes, and that (sub)partition's local index (sub)partitions).
+        Shared by execute_compression and rollback_compression.
+
+        Returns:
+            (number rebuilt, labels of the structures that could not be rebuilt)
+        """
+        rebuilt, failed = 0, []
+        try:
+            idx_df = TargetConnector.execute_query(
+                database_id, TargetQueries._ROLLBACK_UNUSABLE_INDEXES_SQL,
+                {'o': owner, 't': table_name,
+                 # a subpartition MOVE leaves the parent's local partitions alone
+                 'p': None if subpartition_name else partition_name,
+                 'sp': subpartition_name})
+        except Exception as e:
+            log_warning(f"Could not list unusable indexes for {target_label}: {e}")
+            idx_df = pd.DataFrame()
+        for _, r in idx_df.iterrows():
+            label = f"{r['INDEX_OWNER']}.{r['INDEX_NAME']}"
+            if _blank_to_none(r['SEGMENT_NAME']):
+                label += f" {str(r['REBUILD_LEVEL']).lower()} {r['SEGMENT_NAME']}"
+            try:
+                stmt = TargetQueries._index_rebuild_statement(r, parallel_degree)
+                # execute_plsql reports a DB error by returning False: only a
+                # True result is a rebuilt index.
+                if TargetConnector.execute_plsql(
+                        database_id, f"BEGIN EXECUTE IMMEDIATE '{stmt}'; END;"):
+                    rebuilt += 1
+                    continue
+                log_warning(f"Failed to rebuild index {label}")
+            except Exception as e:
+                log_warning(f"Failed to rebuild index {label}: {e}")
+            failed.append(label)
+        return rebuilt, failed
+
+    @staticmethod
+    def _overlapping_open_row(database_id: int, owner: str, table_name: str,
+                              partition_name: Optional[str] = None,
+                              subpartition_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """{'history_id', 'status', 'label'} of a QUEUED / IN_PROGRESS row of this
+        table whose segment overlaps the given one (segments_overlap: the same
+        segment, the whole table, or a partition and its subpartitions), or
+        None. Raises on a database error."""
+        from hcc_advisor.utils.central_connector import CentralConnector
+
+        df = CentralConnector.execute_query("""
+            SELECT history_id, operation_status, partition_name, subpartition_name
+            FROM t_compression_history
+            WHERE database_id = :db AND owner = :o AND object_name = :t
+              AND operation_status IN ('QUEUED', 'IN_PROGRESS')
+            ORDER BY history_id
+        """, {'db': database_id, 'o': owner, 't': table_name}, raise_on_error=True)
+        for r in df.to_dict('records'):
+            part, sub = _blank_to_none(r['PARTITION_NAME']), _blank_to_none(r['SUBPARTITION_NAME'])
+            if segments_overlap(partition_name, subpartition_name, part, sub):
+                return {'history_id': int(r['HISTORY_ID']), 'status': r['OPERATION_STATUS'],
+                        'label': _segment_label(owner, table_name, part, sub)}
+        return None
+
+    @staticmethod
     def _record_rollback(history_id: Optional[int], rolled_back: bool,
                          rollback_status: str, message: Optional[str] = None) -> None:
         """Record a rollback outcome on the T_COMPRESSION_HISTORY row (by id).
@@ -3071,6 +3125,10 @@ MOVE {compression_clause}
 
         With ``history_id`` the row is re-checked first (it must still be a
         SUCCESS for this exact object) and the outcome is recorded on it.
+        Nothing is moved while a QUEUED / IN_PROGRESS compression row overlaps
+        the segment (the same segment, the whole table, or its parent partition
+        or subpartitions; see segments_overlap): that is refused with
+        {'success': False, 'blocked': True, 'error': reason}.
 
         Returns:
             dict with success, message / error, and index_failures (list).
@@ -3118,6 +3176,23 @@ MOVE {compression_clause}
             if reason:
                 return {'success': False, 'error': f"Cannot roll back {target}: {reason}"}
 
+        # Never MOVE a segment a queued or running compression job is about to
+        # move or is moving: the two MOVEs would collide, and the job's
+        # before/after sizes would measure the rollback.
+        try:
+            blocker = TargetQueries._overlapping_open_row(
+                database_id, owner, table_name, partition_name, subpartition_name)
+        except Exception as e:
+            return {'success': False,
+                    'error': f"Could not check the job queue for {target}, not rolled back: {e}"}
+        if blocker:
+            state = 'running' if blocker['status'] == 'IN_PROGRESS' else 'queued'
+            return {'success': False, 'blocked': True,
+                    'error': (f"Cannot roll back {target}: a compression of {blocker['label']} "
+                              f"is {state} (history_id {blocker['history_id']}) and would "
+                              f"overlap it. Roll back once that job has finished (see the "
+                              f"Scheduler page).")}
+
         try:
             ok = TargetConnector.execute_plsql(
                 database_id, f"BEGIN EXECUTE IMMEDIATE q'[{ddl}]'; END;"
@@ -3131,30 +3206,8 @@ MOVE {compression_clause}
             return {'success': False, 'error': f"Rollback of {target} failed: {err}"}
 
         # Rebuild the index structures the MOVE left UNUSABLE (scoped to the segment).
-        idx_rebuilt, idx_failed = 0, []
-        try:
-            idx_df = TargetConnector.execute_query(
-                database_id, TargetQueries._ROLLBACK_UNUSABLE_INDEXES_SQL,
-                {'o': owner, 't': table_name,
-                 # a subpartition MOVE leaves the parent's local partitions alone
-                 'p': None if subpartition_name else partition_name,
-                 'sp': subpartition_name})
-        except Exception as e:
-            log_warning(f"Could not list unusable indexes for {target}: {e}")
-            idx_df = pd.DataFrame()
-        for _, r in idx_df.iterrows():
-            label = f"{r['INDEX_OWNER']}.{r['INDEX_NAME']}"
-            if _blank_to_none(r['SEGMENT_NAME']):
-                label += f" {str(r['REBUILD_LEVEL']).lower()} {r['SEGMENT_NAME']}"
-            try:
-                stmt = TargetQueries._index_rebuild_statement(r, dop)
-                if TargetConnector.execute_plsql(
-                        database_id, f"BEGIN EXECUTE IMMEDIATE '{stmt}'; END;"):
-                    idx_rebuilt += 1
-                    continue
-            except Exception as e:
-                log_warning(f"Failed to rebuild index {label}: {e}")
-            idx_failed.append(label)
+        idx_rebuilt, idx_failed = TargetQueries._rebuild_unusable_indexes(
+            database_id, owner, table_name, partition_name, subpartition_name, dop, target)
 
         try:
             CentralConnector.execute_dml("""
@@ -3715,7 +3768,7 @@ MOVE {compression_clause}
         ) VALUES (
             :db, :owner, :tbl, :otype,
             :part, :sub, :comp,
-            'ONLINE', :dop, 'QUEUED', SYSTIMESTAMP, :executed_by
+            :mode, :dop, 'QUEUED', SYSTIMESTAMP, :executed_by
         )"""
 
     # DBA_SCHEDULER_JOBS states of a job that will still run (after a logged
@@ -3731,8 +3784,9 @@ MOVE {compression_clause}
         (None, reason). Names are upper-cased (unquoted identifiers) so the
         duplicate check compares like with like. The item is validated by
         generate_ddl against its target's version and platform (HCC off
-        Exadata is rejected); `targets` memoises target_ddl_info per database
-        for the caller's loop."""
+        Exadata is rejected), and its EXECUTION_MODE (ONLINE / OFFLINE) follows
+        from the same version and object level; `targets` memoises
+        target_ddl_info per database for the caller's loop."""
         def _name(value):
             value = _blank_to_none(value)
             return str(value).strip().upper() if value is not None else None
@@ -3764,6 +3818,7 @@ MOVE {compression_clause}
             'db': did, 'owner': owner, 'tbl': table,
             'otype': 'SUBPARTITION' if sub else 'PARTITION' if part else 'TABLE',
             'part': part, 'sub': sub, 'comp': _history_compression_type(comp),
+            'mode': _execution_mode(info.get('oracle_version'), part, sub),
             'dop': dop, 'executed_by': executed_by,
         }, None
 
@@ -4030,16 +4085,20 @@ MOVE {compression_clause}
         job_name = f"HCC_{str(table).upper()[:30]}_{hid}"
         out['job_name'] = job_name
 
-        # Atomic claim: only one drainer gets rowcount 1.
+        # Atomic claim: only one drainer gets rowcount 1. EXECUTION_MODE is set
+        # again from the DDL actually submitted: the target's recorded version
+        # may have changed since the item was queued.
         try:
             claimed = CentralConnector.execute_dml("""
                 UPDATE t_compression_history
                    SET operation_status = 'IN_PROGRESS', compression_clause = :job,
-                       original_ddl = :ddl, start_time = SYSTIMESTAMP,
-                       end_time = NULL, error_message = NULL
+                       original_ddl = :ddl, execution_mode = :mode,
+                       start_time = SYSTIMESTAMP, end_time = NULL, error_message = NULL
                  WHERE history_id = :hid AND database_id = :db
                    AND operation_status = 'QUEUED'
-            """, {'job': job_name, 'ddl': ddl, 'hid': hid, 'db': did}, raise_on_error=True)
+            """, {'job': job_name, 'ddl': ddl,
+                  'mode': _execution_mode(target_info.get('oracle_version'), part, sub),
+                  'hid': hid, 'db': did}, raise_on_error=True)
         except Exception as e:
             log_warning(f"Scheduler: claiming queue item {hid} failed: {e}")
             return {**out, 'status': 'RETRY', 'error': f"Could not claim {label}: {e}"}
@@ -4167,8 +4226,18 @@ MOVE {compression_clause}
             return {'success': False, 'duplicate': True,
                     'error': _already_open_error(label, open_row, "not submitted again")}
 
-        history_id = CentralConnector.execute_dml_returning(
-            TargetQueries._QUEUE_INSERT_SQL + "\n        RETURNING history_id INTO :new_id", row)
+        insert_error = None
+        try:
+            # Strict mode: a rejected insert is reported below, not as the
+            # connector's raw ORA-00001 banner.
+            history_id = CentralConnector.execute_dml_returning(
+                TargetQueries._QUEUE_INSERT_SQL + "\n        RETURNING history_id INTO :new_id", row,
+                raise_on_error=True)
+        except Exception as e:
+            history_id = None
+            if not _is_open_segment_conflict(e):
+                insert_error = e
+                log_error(e, "TargetQueries.submit_compression_job", {'segment': label})
         if not history_id:
             # Most likely UNQ_HISTORY_OPEN_SEGMENT: another session queued or
             # started this segment since the check above.
@@ -4179,7 +4248,9 @@ MOVE {compression_clause}
             if open_row:
                 return {'success': False, 'duplicate': True,
                         'error': _already_open_error(label, open_row, "not submitted again")}
-            return {'success': False, 'error': f"Could not record {label} in the queue"}
+            return {'success': False,
+                    'error': f"Could not record {label} in the queue"
+                             + (f": {insert_error}" if insert_error else "")}
 
         res = TargetQueries.submit_queued_job({
             'history_id': history_id, 'database_id': row['db'], 'owner': row['owner'],

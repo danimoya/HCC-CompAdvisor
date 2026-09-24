@@ -467,7 +467,8 @@ class CentralConnector:
         statement: str,
         params: Optional[Dict[str, Any]] = None,
         out_bind: str = 'new_id',
-        commit: bool = True
+        commit: bool = True,
+        raise_on_error: bool = False
     ) -> Optional[Any]:
         """
         Execute a single-row DML statement with a RETURNING ... INTO clause on
@@ -482,6 +483,8 @@ class CentralConnector:
             params: Input bind parameters (must not contain out_bind)
             out_bind: Name of the RETURNING INTO bind variable
             commit: Whether to commit transaction
+            raise_on_error: Re-raise database errors to the caller instead of
+                showing st.error and returning None
 
         Returns:
             The returned value (int for integral numbers), or None if no row
@@ -532,6 +535,8 @@ class CentralConnector:
                 capture_sql('central', 'DML', statement, params,
                             status='ERROR', error=str(e), duration_ms=(time.perf_counter() - _t0) * 1000)
             log_db_error(e, statement, params)
+            if raise_on_error:
+                raise
             st.error(f"Central database DML error: {describe_db_error(e)}")
             return None
 
