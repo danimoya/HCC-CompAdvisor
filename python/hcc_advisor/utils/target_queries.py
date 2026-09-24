@@ -18,6 +18,9 @@ from hcc_advisor.utils.hotness import (
     SOURCE_DML, SOURCE_SEGSTATS, SOURCE_AWR,
 )
 from hcc_advisor.utils.leaf_segments import leaf_segments
+from hcc_advisor.utils.oracle_capabilities import (
+    hcc_block_reason, move_modifier, normalize_platform, object_level, supports_online_move,
+)
 
 
 # SECURITY (CWE-89): Oracle DDL is built by interpolating identifiers into
@@ -313,6 +316,67 @@ def _segment_size_query(owner, table_name, partition_name=None, subpartition_nam
         sql += "    AND partition_name = :partition_name\n"
         binds['partition_name'] = segment
     return sql, binds
+
+
+# What generate_ddl needs to know about a target: its v$version banner and its
+# platform (STANDARD / EXADATA). None = unknown (see target_ddl_info).
+_UNKNOWN_TARGET = {'oracle_version': None, 'platform_type': None}
+_TARGET_INFO_LOGGED: set = set()
+
+
+def target_ddl_info(database_id) -> Dict[str, Optional[str]]:
+    """{'oracle_version', 'platform_type'} of a registered target, to pass to
+    generate_ddl / build_compression_script.
+
+    Read from the cached registry (CentralQueries.get_target_databases, no
+    query per call); a target missing from it (inactive) is read by id. A
+    registered target with no platform is STANDARD (the column default, and
+    what the analysis assumes). A target that cannot be looked up comes back
+    all-None: generate_ddl then assumes a modern Oracle version and cannot
+    check the platform (Oracle still refuses HCC off Exadata, ORA-64307).
+    Call it once per call site and database, not per row.
+    """
+    from hcc_advisor.utils.central_queries import CentralQueries
+
+    try:
+        did = int(database_id)
+    except (TypeError, ValueError):
+        return dict(_UNKNOWN_TARGET)
+    row = None
+    try:
+        reg = CentralQueries.get_target_databases()
+        if reg is not None and not reg.empty:
+            reg.columns = [str(c).lower() for c in reg.columns]
+            hit = reg[pd.to_numeric(reg['database_id'], errors='coerce') == did]
+            if not hit.empty:
+                row = hit.iloc[0].to_dict()
+    except Exception as e:
+        log_warning(f"Target registry lookup for db_id={did} failed: {e}")
+    if row is None:
+        try:
+            row = CentralQueries.get_target_database(did) or None
+        except Exception as e:
+            log_warning(f"Target lookup for db_id={did} failed: {e}")
+    if not row:
+        log_warning(f"Target db_id={did} not found in the registry: DDL assumes a modern "
+                    f"Oracle version and the platform is not checked")
+        return dict(_UNKNOWN_TARGET)
+    version = _blank_to_none(row.get('oracle_version'))
+    if version is None and did not in _TARGET_INFO_LOGGED:
+        _TARGET_INFO_LOGGED.add(did)
+        log_warning(f"No Oracle version recorded for db_id={did} (test the connection in "
+                    f"DB Connections): DDL assumes a modern release (ONLINE moves, 12.2+)")
+    return {'oracle_version': version,
+            'platform_type': normalize_platform(row.get('platform_type')) or 'STANDARD'}
+
+
+def _target_info_cached(database_id, cache: Optional[Dict] = None) -> Dict[str, Optional[str]]:
+    """target_ddl_info, memoised in `cache` (one dict per call site)."""
+    if cache is None:
+        return target_ddl_info(database_id)
+    if database_id not in cache:
+        cache[database_id] = target_ddl_info(database_id)
+    return cache[database_id]
 
 
 class TargetQueries:
@@ -1679,7 +1743,8 @@ class TargetQueries:
         partition_name: Optional[str] = None,
         dry_run: bool = True,
         parallel_degree: int = 4,
-        executed_by: Optional[str] = None
+        executed_by: Optional[str] = None,
+        target_info: Optional[Dict[str, Optional[str]]] = None
     ) -> Dict[str, Any]:
         """
         Execute compression for a specific table or partition on the target database.
@@ -1695,19 +1760,26 @@ class TargetQueries:
             executed_by: Audit user for the history row. Worker threads (batch
                 execution) have no Streamlit session, so their caller passes
                 the acting user in; defaults to _acting_user().
+            target_info: target_ddl_info(database_id) when the caller already
+                has it (batch_execute resolves it once); looked up otherwise.
 
         Returns:
-            dict with execution result. An invalid name/type/DOP (generate_ddl
-            ValueError) is returned as {'success': False, 'error': ...}.
+            dict with execution result. An invalid name/type/DOP, or HCC on a
+            non-Exadata target (generate_ddl ValueError) is returned as
+            {'success': False, 'error': ...}.
         """
         # Handle None/NaN partition name
         if partition_name is not None and pd.isna(partition_name):
             partition_name = None
 
+        if target_info is None:
+            target_info = target_ddl_info(database_id)
         try:
             ddl = TargetQueries.generate_ddl(
                 owner, table_name, compression_type, partition_name,
-                parallel_degree=parallel_degree
+                parallel_degree=parallel_degree,
+                oracle_version=target_info.get('oracle_version'),
+                platform_type=target_info.get('platform_type'),
             )
         except (ValueError, TypeError, AttributeError) as e:
             return {'success': False, 'error': str(e)}
@@ -1762,7 +1834,8 @@ class TargetQueries:
             'compression_type_applied': compression_type,
             'compression_clause': clause,
             'original_ddl': ddl_exec,
-            'execution_mode': 'ONLINE',
+            'execution_mode': ('ONLINE' if supports_online_move(
+                target_info.get('oracle_version'), object_level(partition_name)) else 'OFFLINE'),
             'parallel_degree': parallel_degree,
             'original_size_bytes': orig_size,
             'operation_status': 'IN_PROGRESS',
@@ -1979,8 +2052,10 @@ class TargetQueries:
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        # Worker threads have no Streamlit session: resolve the acting user here.
+        # Worker threads have no Streamlit session: resolve the acting user and
+        # the target's version/platform here, once for the whole batch.
         executed_by = _acting_user()
+        target_info = target_ddl_info(database_id)
 
         def _entry(item, res):
             return {
@@ -2000,7 +2075,8 @@ class TargetQueries:
                 partition_name=item.get('partition_name'),
                 dry_run=dry_run,
                 parallel_degree=parallel_degree,
-                executed_by=executed_by
+                executed_by=executed_by,
+                target_info=target_info
             )
             return _entry(item, res)
 
@@ -2042,7 +2118,9 @@ class TargetQueries:
         compression_type: str,
         partition_name: Optional[str] = None,
         subpartition_name: Optional[str] = None,
-        parallel_degree: int = 4
+        parallel_degree: int = 4,
+        oracle_version: Optional[str] = None,
+        platform_type: Optional[str] = None
     ) -> str:
         """
         Generate DDL statement for compression. Static utility - no database connection needed.
@@ -2054,9 +2132,19 @@ class TargetQueries:
             partition_name: Optional partition name
             subpartition_name: Optional subpartition name
             parallel_degree: Parallel execution degree
+            oracle_version: The target's version banner (T_TARGET_DATABASES.
+                ORACLE_VERSION; see target_ddl_info). Decides ONLINE vs
+                UPDATE INDEXES vs a plain MOVE (oracle_capabilities.move_modifier).
+                None: a modern release, i.e. ONLINE.
+            platform_type: STANDARD / EXADATA. HCC types are refused unless
+                EXADATA (oracle_capabilities.hcc_block_reason). None: unchecked.
 
         Returns:
             DDL statement string
+
+        Raises:
+            ValueError: unsafe name, unsupported type, Oracle-maintained schema,
+                DOP out of range, or HCC on a non-Exadata platform.
         """
         # Map compression type to DDL clause
         compression_clause_map = {
@@ -2082,6 +2170,9 @@ class TargetQueries:
         if key not in compression_clause_map:
             raise ValueError(f"Unsupported compression_type: {compression_type!r}")
         compression_clause = compression_clause_map[key]
+        hcc_reason = hcc_block_reason(key, platform_type)
+        if hcc_reason:
+            raise ValueError(hcc_reason)
 
         # SECURITY (CWE-89): validate every identifier and coerce the parallel
         # degree to a bounded integer before building the DDL.
@@ -2096,20 +2187,26 @@ class TargetQueries:
             subpartition_name = _validate_identifier(subpartition_name, "subpartition name")
         parallel_degree = _validate_parallel_degree(parallel_degree)
 
+        # ONLINE where the version allows it at this level, else UPDATE INDEXES
+        # for a (sub)partition, else a plain MOVE (the caller rebuilds the
+        # UNUSABLE indexes afterwards).
+        modifier = move_modifier(oracle_version, object_level(partition_name, subpartition_name))
+        tail = f"{modifier} PARALLEL {parallel_degree};" if modifier else f"PARALLEL {parallel_degree};"
+
         if subpartition_name:
             ddl = f"""ALTER TABLE {owner}.{table_name}
 MOVE SUBPARTITION {subpartition_name}
 {compression_clause}
-ONLINE PARALLEL {parallel_degree};"""
+{tail}"""
         elif partition_name:
             ddl = f"""ALTER TABLE {owner}.{table_name}
 MOVE PARTITION {partition_name}
 {compression_clause}
-ONLINE PARALLEL {parallel_degree};"""
+{tail}"""
         else:
             ddl = f"""ALTER TABLE {owner}.{table_name}
 MOVE {compression_clause}
-ONLINE PARALLEL {parallel_degree};"""
+{tail}"""
 
         return ddl
 
@@ -2934,11 +3031,13 @@ ONLINE PARALLEL {parallel_degree};"""
         subpartition_name = _blank_to_none(subpartition_name)
 
         # SECURITY (CWE-89): generate_ddl validates every identifier, refuses
-        # Oracle-maintained schemas and bounds the parallel degree.
+        # Oracle-maintained schemas and bounds the parallel degree. The target's
+        # version decides ONLINE (see oracle_capabilities.move_modifier).
         try:
             ddl = TargetQueries.generate_ddl(
                 owner, table_name, 'NONE', partition_name, subpartition_name,
-                parallel_degree=parallel_degree
+                parallel_degree=parallel_degree,
+                oracle_version=target_ddl_info(database_id).get('oracle_version'),
             ).rstrip().rstrip(';')
             dop = _validate_parallel_degree(parallel_degree)
         except ValueError as e:
@@ -3572,10 +3671,13 @@ ONLINE PARALLEL {parallel_degree};"""
     })
 
     @staticmethod
-    def _prepare_queue_row(item: Dict, executed_by: str):
+    def _prepare_queue_row(item: Dict, executed_by: str, targets: Optional[Dict] = None):
         """(binds for _QUEUE_INSERT_SQL, None) for a valid queue item, else
         (None, reason). Names are upper-cased (unquoted identifiers) so the
-        duplicate check compares like with like."""
+        duplicate check compares like with like. The item is validated by
+        generate_ddl against its target's version and platform (HCC off
+        Exadata is rejected); `targets` memoises target_ddl_info per database
+        for the caller's loop."""
         def _name(value):
             value = _blank_to_none(value)
             return str(value).strip().upper() if value is not None else None
@@ -3595,8 +3697,12 @@ ONLINE PARALLEL {parallel_degree};"""
         dop = _blank_to_none(item.get('dop', item.get('parallel_degree')))
         try:
             dop = _validate_parallel_degree(4 if dop is None else dop)
-            # Validates names, refuses Oracle-maintained schemas (ValueError).
-            TargetQueries.generate_ddl(owner, table, comp, part, sub, parallel_degree=dop)
+            # Validates names, refuses Oracle-maintained schemas and HCC on a
+            # non-Exadata target (ValueError).
+            info = _target_info_cached(did, targets)
+            TargetQueries.generate_ddl(owner, table, comp, part, sub, parallel_degree=dop,
+                                       oracle_version=info.get('oracle_version'),
+                                       platform_type=info.get('platform_type'))
         except (ValueError, TypeError, AttributeError) as e:
             return None, f"{label}: {e}"
         return {
@@ -3613,8 +3719,9 @@ ONLINE PARALLEL {parallel_degree};"""
         Rows already in the queue are never deleted or rewritten. A segment that
         already has a QUEUED or IN_PROGRESS row on its database is skipped as a
         duplicate; an item generate_ddl would reject (bad name, unsupported
-        type, Oracle-maintained schema, DOP out of range) is not queued. The new
-        rows of one call are inserted in one transaction.
+        type, HCC on a non-Exadata target, Oracle-maintained schema, DOP out of
+        range) is not queued. The new rows of one call are inserted in one
+        transaction.
 
         Args:
             items: dicts with database_id, owner, table_name (or object_name),
@@ -3631,8 +3738,9 @@ ONLINE PARALLEL {parallel_degree};"""
         out = {'added': 0, 'duplicates': 0, 'rejected': 0, 'errors': []}
         open_by_db: Dict[int, Optional[set]] = {}
         rows = []
+        targets: Dict[int, Dict] = {}   # target_ddl_info per database, for the validation
         for item in items or []:
-            row, err = TargetQueries._prepare_queue_row(item, executed_by)
+            row, err = TargetQueries._prepare_queue_row(item, executed_by, targets)
             if err:
                 out['rejected'] += 1
                 out['errors'].append(err)
@@ -3781,13 +3889,15 @@ ONLINE PARALLEL {parallel_degree};"""
         return _safe_int(_blank_to_none(df.iloc[0]['SIZE_BYTES']))
 
     @staticmethod
-    def submit_queued_job(item: Dict) -> Dict[str, Any]:
+    def submit_queued_job(item: Dict, target_info: Optional[Dict[str, Optional[str]]] = None) -> Dict[str, Any]:
         """Claim one QUEUED row and submit it as a DBMS_SCHEDULER job.
 
         Args:
             item: a get_queued_compression_jobs() entry (history_id, database_id,
                 owner, table_name, partition/subpartition, compression_type, dop,
                 start_time)
+            target_info: target_ddl_info(database_id) when the caller already
+                has it (the drain resolves it once per database)
 
         Returns:
             dict with 'status' and 'history_id', 'label', 'job_name', 'error':
@@ -3808,12 +3918,17 @@ ONLINE PARALLEL {parallel_degree};"""
         label = _segment_label(owner, table, part, sub)
         out = {'history_id': hid, 'database_id': did, 'label': label, 'job_name': None}
 
-        # An item that can never succeed goes straight to FAILED (never dropped).
+        # An item that can never succeed (including HCC queued for a
+        # non-Exadata target) goes straight to FAILED (never dropped).
+        if target_info is None:
+            target_info = target_ddl_info(did)
         try:
             dop = _blank_to_none(item.get('dop'))
             dop = _validate_parallel_degree(4 if dop is None else dop)
             ddl = TargetQueries.generate_ddl(
-                owner, table, comp, part, sub, parallel_degree=dop
+                owner, table, comp, part, sub, parallel_degree=dop,
+                oracle_version=target_info.get('oracle_version'),
+                platform_type=target_info.get('platform_type'),
             ).rstrip().rstrip(';')
         except (ValueError, TypeError, AttributeError) as e:
             n = TargetQueries._close_job_row(did, hid, 'FAILED', f"Not submitted: {e}",
@@ -3943,11 +4058,12 @@ ONLINE PARALLEL {parallel_degree};"""
         """
         from hcc_advisor.utils.central_connector import CentralConnector
 
+        targets: Dict[int, Dict] = {}
         row, err = TargetQueries._prepare_queue_row({
             'database_id': database_id, 'owner': owner, 'table_name': table_name,
             'partition_name': partition_name, 'subpartition_name': subpartition_name,
             'compression_type': compression_type, 'dop': parallel_degree,
-        }, executed_by or _acting_user())
+        }, executed_by or _acting_user(), targets)
         if err:
             return {'success': False, 'error': err}
         label = _segment_label(row['owner'], row['tbl'], row['part'], row['sub'])
@@ -3977,7 +4093,7 @@ ONLINE PARALLEL {parallel_degree};"""
             'table_name': row['tbl'], 'partition_name': row['part'],
             'subpartition_name': row['sub'], 'compression_type': row['comp'],
             'dop': row['dop'], 'start_time': None,
-        })
+        }, target_info=targets.get(row['db']))
         if res['status'] == 'SUBMITTED':
             return {'success': True, 'job_name': res['job_name'], 'history_id': history_id}
         if res['status'] in ('BLOCKED', 'RETRY', 'NOT_CLAIMED'):
@@ -4012,6 +4128,7 @@ ONLINE PARALLEL {parallel_degree};"""
             by_db.setdefault(item['database_id'], []).append(item)
 
         for did, items in by_db.items():
+            target_info = target_ddl_info(did)   # once per database, not per item
             try:
                 budget = max(1, TargetQueries.get_cpu_count(did) // 2)
                 free = max(0, budget - TargetQueries.get_running_total_dop(did))
@@ -4030,7 +4147,7 @@ ONLINE PARALLEL {parallel_degree};"""
                 if free < dop:
                     stats['waiting'] += 1
                     continue
-                res = TargetQueries.submit_queued_job(item)
+                res = TargetQueries.submit_queued_job(item, target_info=target_info)
                 status = res['status']
                 if status == 'SUBMITTED':
                     stats['submitted'] += 1

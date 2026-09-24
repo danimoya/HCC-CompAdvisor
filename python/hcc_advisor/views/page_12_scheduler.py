@@ -12,12 +12,15 @@ from hcc_advisor.utils.target_queries import (
     is_supported_compression_type,
     is_protected_schema,
     canonical_compression,
+    target_ddl_info,
 )
 from hcc_advisor.utils.sql_builder import (
     build_compression_script,
     build_compression_manifest,
     gather_dependent_indexes,
+    gather_target_info,
 )
+from hcc_advisor.utils.oracle_capabilities import HCC_NOT_SUPPORTED, hcc_block_reason
 from hcc_advisor.utils.logger import log_warning
 from hcc_advisor.auth import AuthManager, ROLE_OPERATOR
 from hcc_advisor.utils.ui_refresh import schedule_rerun
@@ -203,7 +206,8 @@ def _render_export_section(current_db_id):
 
     # Preview first 10
     preview_cols = ['database_display', 'owner', 'object_name', 'partition_name',
-                    'compression_type_applied', 'parallel_degree', 'operation_status']
+                    'subpartition_name', 'compression_type_applied', 'parallel_degree',
+                    'operation_status']
     available = [c for c in preview_cols if c in df.columns]
     st.dataframe(df[available].head(10), use_container_width=True, hide_index=True)
     if len(df) > 10:
@@ -224,13 +228,18 @@ def _render_export_section(current_db_id):
         include_indexes = st.checkbox(
             "Include index rebuild statements (queries target for dependent objects)",
             value=True, key="export_include_indexes",
-            help="Adds ALTER INDEX ... REBUILD for all indexes that would become UNUSABLE after MOVE"
+            help="Adds ALTER INDEX ... REBUILD after each MOVE that leaves indexes "
+                 "UNUSABLE (a table MOVE before Oracle 12.2). ONLINE moves keep "
+                 "indexes usable and get no rebuild."
         )
 
-        # Build SQL script (with index rebuild DDL if requested)
+        # Build SQL script (with index rebuild DDL if requested), each MOVE for
+        # its target's Oracle version and platform.
         with st.spinner("Generating SQL script..."):
-            index_map = gather_dependent_indexes(df) if include_indexes else {}
-            sql_script = build_compression_script(df, selected_status_label, selected_db, index_map)
+            targets = gather_target_info(df)
+            index_map = gather_dependent_indexes(df, targets) if include_indexes else {}
+            sql_script = build_compression_script(df, selected_status_label, selected_db,
+                                                  index_map, targets=targets)
 
         st.download_button(
             label=f"Download SQL Script ({len(df)} operations)",
@@ -252,6 +261,32 @@ def _render_export_section(current_db_id):
             type="primary",
             key="export_download_csv"
         )
+
+
+def _import_row_state(obj, chk, platform_type) -> str:
+    """Verification state of one imported manifest row; only READY rows are
+    queued. platform_type is the import target's (target_ddl_info)."""
+    planned = obj['compression_type']
+    current = chk.get('current_compress_for') or chk.get('current_compression') or 'NONE'
+    if not chk['exists']:
+        return 'MISSING'
+    if is_protected_schema(obj['owner']):
+        # Oracle-maintained schema (SYS, AUDSYS, ...): visible and alterable
+        # when the target is registered AS SYSDBA — never queue it.
+        return 'PROTECTED SCHEMA'
+    if not is_supported_compression_type(planned):
+        # Unsupported clause would raise in generate_ddl during drain and
+        # crash the page — never queue it.
+        return 'UNSUPPORTED COMPRESSION'
+    if hcc_block_reason(planned, platform_type):
+        # HCC on a non-Exadata target fails at run time with ORA-64307 (the
+        # same check generate_ddl applies on enqueue and submit).
+        return HCC_NOT_SUPPORTED
+    if canonical_compression(current) == canonical_compression(planned):
+        # Oracle reports OLTP as compress_for='ADVANCED'; normalize both
+        # sides so an already-compressed object isn't needlessly re-moved.
+        return 'ALREADY AT TARGET'
+    return 'READY'
 
 
 def _render_import_section(current_db_id):
@@ -345,28 +380,14 @@ def _render_import_section(current_db_id):
                  type="primary", use_container_width=True):
         with st.spinner(f"Checking {len(objects)} object(s) on {target_label}..."):
             checks = TargetQueries.check_objects_existence(target_db_id, objects)
+            platform_type = target_ddl_info(target_db_id).get('platform_type')
         rows = []
         verified = []
         for obj, chk in zip(objects, checks):
             planned = obj['compression_type']
             current = chk.get('current_compress_for') or chk.get('current_compression') or 'NONE'
             level = chk['object_level']
-            if not chk['exists']:
-                state = 'MISSING'
-            elif is_protected_schema(obj['owner']):
-                # Oracle-maintained schema (SYS, AUDSYS, ...): visible and alterable
-                # when the target is registered AS SYSDBA — never queue it.
-                state = 'PROTECTED SCHEMA'
-            elif not is_supported_compression_type(planned):
-                # Unsupported clause would raise in generate_ddl during drain and
-                # crash the page — never queue it.
-                state = 'UNSUPPORTED COMPRESSION'
-            elif canonical_compression(current) == canonical_compression(planned):
-                # Oracle reports OLTP as compress_for='ADVANCED'; normalize both
-                # sides so an already-compressed object isn't needlessly re-moved.
-                state = 'ALREADY AT TARGET'
-            else:
-                state = 'READY'
+            state = _import_row_state(obj, chk, platform_type)
             rows.append({
                 'Owner': obj['owner'],
                 'Object': obj['object_name'],
@@ -402,6 +423,12 @@ def _render_import_section(current_db_id):
         c1.metric("Ready to queue", n_ready)
         c2.metric("Already compressed", n_already)
         c3.metric("Missing", n_missing)
+        n_hcc = sum(1 for r in rows if r['State'] == HCC_NOT_SUPPORTED)
+        if n_hcc:
+            st.warning(f"{n_hcc} row(s) plan Hybrid Columnar Compression (QUERY/ARCHIVE), "
+                       f"which needs an EXADATA target; this target is not one, so they "
+                       f"are not queued (the MOVE would fail with ORA-64307). Re-plan them "
+                       f"as OLTP or BASIC, or import them into an Exadata target.")
 
         verified = st.session_state.get('import_verified_objects', [])
         if verified:
@@ -432,7 +459,7 @@ def _render_import_section(current_db_id):
         else:
             st.info("No objects are in a READY state to queue (all are missing, "
                     "already at the target compression, or carry an "
-                    "unsupported compression type).")
+                    "unsupported compression type, e.g. HCC on a non-Exadata target).")
 
 
 def _render_recurring_jobs(db_id):

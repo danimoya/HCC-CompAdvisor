@@ -164,6 +164,7 @@ def _render_export_section(db_id, df, default_dop):
     from hcc_advisor.utils.sql_builder import (
         build_compression_script,
         gather_dependent_indexes,
+        gather_target_info,
     )
 
     st.markdown("Export analyzed objects as a SQL script that can be executed "
@@ -236,6 +237,10 @@ def _render_export_section(db_id, df, default_dop):
         'owner': exp_df['table_owner'].astype(str).str.upper(),
         'object_name': exp_df['table_name'].astype(str).str.upper(),
         'partition_name': exp_df['partition_name'] if 'partition_name' in exp_df.columns else None,
+        # A subpartition row must export as MOVE SUBPARTITION, not as a MOVE of
+        # its parent partition.
+        'subpartition_name': (exp_df['subpartition_name']
+                              if 'subpartition_name' in exp_df.columns else None),
         'compression_type_applied': exp_df['recommended_strategy'],
         'parallel_degree': int(dop),
         'operation_status': exp_df['status'],
@@ -243,7 +248,7 @@ def _render_export_section(db_id, df, default_dop):
     })
 
     # Preview first 10
-    preview_cols = ['owner', 'object_name', 'partition_name',
+    preview_cols = ['owner', 'object_name', 'partition_name', 'subpartition_name',
                     'compression_type_applied', 'parallel_degree', 'operation_status']
     st.dataframe(script_df[preview_cols].head(10), use_container_width=True, hide_index=True)
     if len(script_df) > 10:
@@ -252,13 +257,18 @@ def _render_export_section(db_id, df, default_dop):
     include_indexes = st.checkbox(
         "Include index rebuild statements (queries target for dependent objects)",
         value=True, key="qs_export_include_indexes",
-        help="Adds ALTER INDEX ... REBUILD for all indexes that would become UNUSABLE after MOVE"
+        help="Adds ALTER INDEX ... REBUILD after each MOVE that leaves indexes "
+             "UNUSABLE (a table MOVE before Oracle 12.2). ONLINE moves keep "
+             "indexes usable and get no rebuild."
     )
 
+    # Each MOVE is built for the target's Oracle version and platform (HCC
+    # rows are skipped on a non-Exadata target).
     with st.spinner("Generating SQL script..."):
-        index_map = gather_dependent_indexes(script_df) if include_indexes else {}
+        targets = gather_target_info(script_df)
+        index_map = gather_dependent_indexes(script_df, targets) if include_indexes else {}
         sql_script = build_compression_script(
-            script_df, selected_status_label, db_label, index_map
+            script_df, selected_status_label, db_label, index_map, targets=targets
         )
 
     filename = (f"hcc_quickaction_{db_label.replace(' ', '_').lower()}_"

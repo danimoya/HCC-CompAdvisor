@@ -191,6 +191,10 @@ class CentralQueries:
     ) -> pd.DataFrame:
         """Get ALL jobs (no time restriction) for export as SQL script.
 
+        Rows carry partition_name and subpartition_name, so the script builder
+        emits MOVE SUBPARTITION for a subpartition job (not MOVE PARTITION of
+        its parent).
+
         Args:
             database_id: Filter by target database. None = all databases.
             status_filter: QUEUED, IN_PROGRESS, SUCCESS, FAILED, or None (all).
@@ -208,7 +212,7 @@ class CentralQueries:
             SELECT
                 d.database_name, d.display_name as database_display,
                 h.database_id, h.owner, h.object_name,
-                h.object_type, h.partition_name,
+                h.object_type, h.partition_name, h.subpartition_name,
                 h.compression_type_applied,
                 NVL(h.parallel_degree, 4) as parallel_degree,
                 h.operation_status,

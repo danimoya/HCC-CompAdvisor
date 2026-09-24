@@ -7,9 +7,14 @@ Kept framework-free (no Streamlit) so it's callable from any context.
 
 Input DataFrame for `build_compression_script` / `gather_dependent_indexes`:
     database_id, database_display, database_name,
-    owner, object_name, partition_name,
+    owner, object_name, partition_name, [subpartition_name],
     compression_type_applied, parallel_degree,
     operation_status, error_message
+
+Each MOVE follows its target's Oracle version and platform (`targets`, see
+gather_target_info and oracle_capabilities): ONLINE where supported, UPDATE
+INDEXES for an older (sub)partition move, a plain MOVE plus dependent-index
+REBUILDs for an older table move; HCC on a non-Exadata target is skipped.
 """
 
 import re
@@ -19,6 +24,10 @@ from typing import Optional
 import pandas as pd
 
 from hcc_advisor.utils.target_connector import TargetConnector
+from hcc_advisor.utils.oracle_capabilities import (
+    MOVE_ONLINE, MOVE_UPDATE_INDEXES, format_version, hcc_block_reason,
+    move_modifier, normalize_platform, object_level,
+)
 
 
 # SECURITY (CWE-89): identifiers (owner/table/partition/index) flow into generated
@@ -112,12 +121,55 @@ def _ind_partitions_for(did: int, ip_owners: list, ip_names: list) -> dict:
     return ind_partitions
 
 
-def gather_dependent_indexes(df: pd.DataFrame) -> dict:
+def _present(value) -> bool:
+    """True for a real (sub)partition name (not None / NaN / blank / 'None')."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return False
+    return str(value).strip() not in ('', 'None', 'nan')
+
+
+def _row_level(row) -> str:
+    """TABLE / PARTITION / SUBPARTITION of one operation row."""
+    return object_level(_present(row.get('partition_name')),
+                        _present(row.get('subpartition_name')))
+
+
+def gather_target_info(df: pd.DataFrame) -> dict:
+    """{database_id: {'oracle_version', 'platform_type'}} for every target in
+    df, from the target registry (target_ddl_info: one cached registry read,
+    not a query per row). Pass it to gather_dependent_indexes and
+    build_compression_script."""
+    from hcc_advisor.utils.target_queries import target_ddl_info
+
+    ids = set()
+    for col in df.columns:
+        if str(col).lower() != 'database_id':
+            continue
+        for value in df[col]:
+            try:
+                did = int(value)
+            except (TypeError, ValueError):
+                continue
+            if did:
+                ids.add(did)
+    return {did: target_ddl_info(did) for did in sorted(ids)}
+
+
+def _target_for(targets: Optional[dict], did: int) -> dict:
+    return (targets or {}).get(did) or {}
+
+
+def gather_dependent_indexes(df: pd.DataFrame, targets: Optional[dict] = None) -> dict:
     """Query target databases for indexes on each affected table.
 
     Returns a dict keyed by (database_id, owner, object_name) with
         {'indexes': [{'owner', 'name', 'partitioned'}],
          'ind_partitions': {(idx_owner, idx_name): [part_name, ...]}}
+
+    With `targets` (gather_target_info), only tables whose MOVE leaves their
+    indexes UNUSABLE on that target's version (a non-ONLINE table move) are
+    looked up: an ONLINE move, or a (sub)partition move with UPDATE INDEXES,
+    keeps every index usable, so the script rebuilds nothing for it.
 
     IN-lists are chunked (see chunk_list) so exporting a plan with more than
     1000 distinct tables/indexes no longer hits ORA-01795.
@@ -131,6 +183,9 @@ def gather_dependent_indexes(df: pd.DataFrame) -> dict:
         did = int(row.get('database_id') or 0)
         if did == 0:
             continue
+        if targets is not None and move_modifier(
+                _target_for(targets, did).get('oracle_version'), _row_level(row)):
+            continue   # ONLINE / UPDATE INDEXES: no index goes UNUSABLE
         key = (row['owner'], row['object_name'])
         by_db.setdefault(did, set()).add(key)
 
@@ -189,10 +244,22 @@ def build_compression_script(
     status_label: str,
     db_label: str,
     index_map: Optional[dict] = None,
+    targets: Optional[dict] = None,
 ) -> str:
-    """Build a SQL script from the exported operations."""
+    """Build a SQL script from the exported operations.
+
+    Args:
+        index_map: gather_dependent_indexes(df, targets); used only after a
+            MOVE that leaves indexes UNUSABLE (a non-ONLINE table move).
+        targets: {database_id: {'oracle_version', 'platform_type'}} from
+            gather_target_info; looked up from the registry when None. Each
+            MOVE is built for its target's version (ONLINE, UPDATE INDEXES or
+            a plain MOVE) and HCC rows for a non-Exadata target are skipped.
+    """
     if index_map is None:
         index_map = {}
+    if targets is None:
+        targets = gather_target_info(df)
 
     lines = [
         "-- HCC Compression Advisor - Exported Operations",
@@ -204,6 +271,13 @@ def build_compression_script(
         "-- ",
         "-- Run these ALTER TABLE MOVE statements to apply the compression",
         "-- recommendations. Review before executing in production.",
+        "-- ",
+        "-- Each MOVE is built for its target's Oracle version. An ONLINE move",
+        "-- (partitions: 12.1+, tables: 12.2+) and an older (sub)partition move",
+        "-- with UPDATE INDEXES keep every index usable, so no ALTER INDEX ...",
+        "-- REBUILD follows them (rebuilding would only double the runtime).",
+        "-- Before 12.2 a table MOVE cannot be ONLINE: it blocks DML and leaves",
+        "-- the table's indexes UNUSABLE, so their REBUILDs follow it.",
         "-- ",
         "",
         "SET SERVEROUTPUT ON;",
@@ -217,25 +291,39 @@ def build_compression_script(
         owner = row['owner']
         obj = row['object_name']
         part = row.get('partition_name')
+        sub = row.get('subpartition_name')
         comp_type = row.get('compression_type_applied') or 'OLTP'
         dop = int(row.get('parallel_degree') or 4)
         status = row.get('operation_status', '')
         err = row.get('error_message', '')
+        try:
+            did = int(row.get('database_id') or 0)
+        except (TypeError, ValueError):
+            did = 0
+        target = _target_for(targets, did)
 
         if db_name != current_db:
+            platform = normalize_platform(target.get('platform_type')) or 'unknown'
+            version = format_version(target.get('oracle_version'))
+            if version == 'unknown':
+                version = 'unknown (assuming 12.2+)'
             lines.append("")
             lines.append("-- ==================================================")
             lines.append(f"-- Database: {db_name}")
+            lines.append(f"-- Oracle version: {version}, platform: {platform}")
             lines.append("-- ==================================================")
             current_db = db_name
 
         # SECURITY (CWE-89): refuse to emit DDL for identifiers / compression
         # types that are not safe — comment them out instead of interpolating.
-        part_present = bool(part and str(part) != 'None')
+        part_present = _present(part)
+        sub_present = _present(sub)
+        segment = (f"{owner}.{obj}{('.' + str(part)) if part_present else ''}"
+                   f"{('.' + str(sub)) if sub_present else ''}")
         if not _is_valid_identifier(owner) or not _is_valid_identifier(obj) or \
-                (part_present and not _is_valid_identifier(part)):
-            lines.append(f"-- SKIPPED (invalid identifier): {owner}.{obj}"
-                         f"{('.' + str(part)) if part_present else ''}")
+                (part_present and not _is_valid_identifier(part)) or \
+                (sub_present and not _is_valid_identifier(sub)):
+            lines.append(f"-- SKIPPED (invalid identifier): {segment}")
             lines.append("")
             continue
         clause = _CLAUSE_MAP.get(str(comp_type).upper())
@@ -243,20 +331,39 @@ def build_compression_script(
             lines.append(f"-- SKIPPED (unsupported compression type {comp_type!r}): {owner}.{obj}")
             lines.append("")
             continue
+        hcc_reason = hcc_block_reason(comp_type, target.get('platform_type'))
+        if hcc_reason:
+            lines.append(f"-- SKIPPED {segment}: {hcc_reason}")
+            lines.append("")
+            continue
         dop = min(max(int(dop), 1), 128)
 
         status_marker = f" [{status}]"
         if status == 'FAILED' and err:
             status_marker += f" -- error: {str(err)[:100]}"
-        lines.append(f"-- {owner}.{obj}{'.' + part if part and str(part) != 'None' else ''}{status_marker}")
+        lines.append(f"-- {segment}{status_marker}")
 
-        is_partition_move = bool(part and str(part) != 'None')
-        if is_partition_move:
-            lines.append(f"ALTER TABLE {owner}.{obj} MOVE PARTITION {part} {clause} ONLINE PARALLEL {dop};")
+        level = object_level(part_present, sub_present)
+        modifier = move_modifier(target.get('oracle_version'), level)
+        if sub_present:
+            move = f"MOVE SUBPARTITION {sub}"
+        elif part_present:
+            move = f"MOVE PARTITION {part}"
         else:
-            lines.append(f"ALTER TABLE {owner}.{obj} MOVE {clause} ONLINE PARALLEL {dop};")
+            move = "MOVE"
+        lines.append(" ".join(x for x in (f"ALTER TABLE {owner}.{obj}", move, clause,
+                                          modifier, f"PARALLEL {dop};") if x))
 
-        did = int(row.get('database_id') or 0)
+        if modifier == MOVE_ONLINE:
+            lines.append("-- No index rebuild: the ONLINE move keeps the indexes usable")
+            lines.append("")
+            continue
+        if modifier == MOVE_UPDATE_INDEXES:
+            lines.append("-- No index rebuild: UPDATE INDEXES keeps the indexes usable")
+            lines.append("")
+            continue
+
+        # Table MOVE without ONLINE (before 12.2): every index goes UNUSABLE.
         key = (did, owner, obj)
         entry = index_map.get(key)
         if entry and entry.get('indexes'):
@@ -272,24 +379,21 @@ def build_compression_script(
                     continue
                 idx_full = f"{idx_owner}.{idx_name}"
 
-                if is_partition_move:
-                    if idx['partitioned'] == 'YES':
-                        lines.append(f"ALTER INDEX {idx_full} REBUILD PARTITION {part} ONLINE PARALLEL {dop};")
+                if idx['partitioned'] == 'YES':
+                    parts_list = ind_partitions.get((idx_owner, idx_name), [])
+                    if parts_list:
+                        for pn in parts_list:
+                            if not _is_valid_identifier(pn):
+                                lines.append(f"-- SKIPPED partition rebuild (invalid identifier): {idx_full}.{pn}")
+                                continue
+                            lines.append(f"ALTER INDEX {idx_full} REBUILD PARTITION {pn} ONLINE PARALLEL {dop};")
                     else:
-                        lines.append(f"ALTER INDEX {idx_full} REBUILD ONLINE PARALLEL {dop};")
+                        lines.append(f"-- WARNING: could not enumerate partitions for {idx_full}; rebuild manually")
                 else:
-                    if idx['partitioned'] == 'YES':
-                        parts_list = ind_partitions.get((idx_owner, idx_name), [])
-                        if parts_list:
-                            for pn in parts_list:
-                                if not _is_valid_identifier(pn):
-                                    lines.append(f"-- SKIPPED partition rebuild (invalid identifier): {idx_full}.{pn}")
-                                    continue
-                                lines.append(f"ALTER INDEX {idx_full} REBUILD PARTITION {pn} ONLINE PARALLEL {dop};")
-                        else:
-                            lines.append(f"-- WARNING: could not enumerate partitions for {idx_full}; rebuild manually")
-                    else:
-                        lines.append(f"ALTER INDEX {idx_full} REBUILD ONLINE PARALLEL {dop};")
+                    lines.append(f"ALTER INDEX {idx_full} REBUILD ONLINE PARALLEL {dop};")
+        elif not index_map:
+            lines.append(f"-- WARNING: this MOVE leaves the indexes of {owner}.{obj} UNUSABLE; "
+                         f"rebuild them afterwards (index rebuild statements not included)")
         else:
             lines.append(f"-- No dependent indexes found for {owner}.{obj} (or index info unavailable)")
         lines.append("")
