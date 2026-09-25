@@ -91,18 +91,36 @@ class TestCpuCountAndFlush:
 class TestSchemaDiscovery:
 
     def test_available_schemas(self, target):
-        target.on('from all_tables', result=df([{'OWNER': 'APP'}, {'OWNER': 'HR'}]))
+        # DBA_TABLES, like the scans and "Check Schema Size": ALL_TABLES would
+        # hide every schema the advisor account holds no object privilege on
+        target.on('from dba_tables', result=df([{'OWNER': 'APP'}, {'OWNER': 'HR'}]))
         assert TargetQueries.get_available_schemas(DB) == ['APP', 'HR']
-        # Oracle-maintained schemas are excluded (SYS sees every one of them)
-        assert "oracle_maintained = 'y'" in target.last.sql.lower()
+        sql = target.one('from dba_tables').sql
+        assert tq.excluded_schemas_sql('owner') in sql
+        assert 'oracle_maintained' not in sql.lower() and not target.find('from all_tables')
+
+    def test_schemas_fall_back_to_all_tables(self, target):
+        target.on('from dba_tables', result=RuntimeError('ORA-00942'))
+        target.on('from all_tables', result=df([{'OWNER': 'APP'}]))
+        assert TargetQueries.get_available_schemas(DB) == ['APP']
+        target.st.error.assert_not_called()
 
     def test_no_schemas(self, target):
         assert TargetQueries.get_available_schemas(DB) == []
 
     def test_schema_error_banner(self, target):
+        target.on('from dba_tables', result=RuntimeError('ORA-00942'))
         target.on('from all_tables', result=RuntimeError('ORA-01017'))
         assert TargetQueries.get_available_schemas(DB) == []
         assert 'ORA-01017' in target.st.error.call_args.args[0]
+
+    def test_exclusions_match_check_schema_size(self, target):
+        # Every page leaves out the same schemas, protected ones included
+        sql = tq.excluded_schemas_sql('t.owner')
+        for owner in tq._PROTECTED_SCHEMAS | {'SYSMAN', 'GSMUSER', 'APEX_040000'}:
+            assert f"'{owner}'" in sql
+        assert "t.owner NOT LIKE 'APEX_%'" in sql and "t.owner NOT LIKE 'FLOWS_%'" in sql
+        assert "'HR'" not in sql and "'ORACLE%'" not in sql
 
     def test_tables_for_schema(self, target):
         target.on('from all_tables', result=df([{'TABLE_NAME': 'T'}]))
@@ -305,6 +323,24 @@ class TestDiscovery:
         TargetQueries._discover_analysis_tables(DB)
         assert target.last.params == {}
 
+    def test_tables_read_from_dba_views(self, target):
+        target.on('avg_row_len', result=df([_table_row()]))
+        TargetQueries._discover_analysis_tables(DB, 'app')
+        sql = target.one('avg_row_len').sql.lower()
+        assert 'from dba_tables t' in sql and 'from dba_tab_columns c' in sql
+        assert 'all_tables' not in sql and 'all_tab_columns' not in sql
+        assert tq.excluded_schemas_sql('t.owner').lower() in sql
+        assert "nvl(t.dropped, 'no') = 'no'" in sql
+        assert f'>= {tq.MIN_ANALYSIS_TABLE_BYTES}' in sql
+
+    def test_tables_fall_back_to_all_views(self, target):
+        target.on('avg_row_len', 'from dba_tables', result=RuntimeError('ORA-00942'))
+        target.on('avg_row_len', 'from all_tables', result=df([_table_row()]))
+        tables = TargetQueries._discover_analysis_tables(DB, 'app')
+        assert [t['table_name'] for t in tables] == [_table_row()['TABLE_NAME']]
+        assert 'from all_tab_columns c' in target.last.sql.lower()
+        assert target.last.params == {'owner': 'APP'}
+
     @pytest.mark.parametrize('result', [pd.DataFrame(), RuntimeError('x')])
     def test_no_tables(self, target, result):
         target.on('avg_row_len', result=result)
@@ -342,7 +378,9 @@ class TestStatsAndHotnessSources:
         assert TargetQueries._get_batch_table_stats(DB, 'app') == {
             'APP.T': {'num_columns': 4, 'avg_null_pct': 0.25, 'avg_distinct': 0.0}}
         assert target.last.params == {'owner': 'APP'}
+        assert 'join dba_tables t' in target.last.sql.lower()
         target.on('dba_tab_col_statistics', result=RuntimeError('x'))
+        target.on('all_tab_col_statistics', result=RuntimeError('x'))
         assert TargetQueries._get_batch_table_stats(DB) == {}
 
     def test_dml_counters_fall_back_to_all_tab_modifications(self, target):

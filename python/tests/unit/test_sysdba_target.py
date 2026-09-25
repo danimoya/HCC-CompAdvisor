@@ -360,11 +360,17 @@ class TestSysGuards:
             assert TargetQueries._get_compression_ratios_ctas(1, 'HR', 'EMPLOYEES') == \
                 {'basic': 2.5, 'oltp': 2.1}
 
-    def test_schema_picker_hides_oracle_maintained(self):
+    def test_schema_picker_hides_oracle_schemas(self):
+        # SYS sees every internal schema in DBA_TABLES: the fixed exclusion
+        # list keeps them out. ALL_USERS.ORACLE_MAINTAINED is not used (it hid
+        # application schemas flagged that way and does not exist before 12c).
         with patch('hcc_advisor.utils.target_queries.TargetConnector.execute_query',
                    return_value=pd.DataFrame({'OWNER': ['HR']})) as query:
             assert TargetQueries.get_available_schemas(1) == ['HR']
-        assert "oracle_maintained = 'Y'" in query.call_args.args[1]
+        sql = query.call_args.args[1]
+        assert 'FROM dba_tables' in sql and 'oracle_maintained' not in sql.lower()
+        for owner in ('SYS', 'SYSTEM', 'AUDSYS', 'DVSYS', 'OJVMSYS', 'SYSMAN'):
+            assert f"'{owner}'" in sql
 
 
 # ============================================================================

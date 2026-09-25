@@ -6,7 +6,9 @@ Lightweight hotness-based analysis with DBMS_SCHEDULER job queue
 import streamlit as st
 import pandas as pd
 from hcc_advisor.utils.central_queries import CentralQueries
-from hcc_advisor.utils.target_queries import TargetQueries, segments_overlap
+from hcc_advisor.utils.target_queries import (
+    TargetQueries, segments_overlap, MIN_ANALYSIS_TABLE_BYTES,
+)
 from hcc_advisor.utils.leaf_segments import leaf_segment_mask
 from hcc_advisor.config import config
 from hcc_advisor.auth import AuthManager, ROLE_OPERATOR
@@ -68,11 +70,21 @@ def show_quick_scan_page():
             with st.spinner("Scanning (hotness-only, no DBMS_COMPRESSION)..."):
                 results = TargetQueries.quick_scan(db_id, owner=schema_param)
                 st.session_state['qs_last_count'] = len(results)
+                st.session_state['qs_last_scope'] = schema
                 st.rerun()
     with col_info:
         last = st.session_state.get('qs_last_count')
-        if last is not None:
+        if last:
             st.success(f"Last scan: {last} objects analyzed")
+        elif last == 0:
+            min_mb = MIN_ANALYSIS_TABLE_BYTES // 1048576
+            st.warning(
+                f"Last scan ({st.session_state.get('qs_last_scope', schema)}) found no eligible "
+                f"tables. Quick Action analyses heap tables of {min_mb} MB or more that are not "
+                "temporary, IOT, clustered or with LONG columns. If the schema has such tables, "
+                "check that the advisor account can read DBA_TABLES (SELECT ANY DICTIONARY or "
+                "SELECT_CATALOG_ROLE)."
+            )
         if scan_help:
             st.caption("View only: scanning and submitting jobs requires the operator role.")
 

@@ -9,7 +9,7 @@ import plotly.graph_objects as go
 import threading
 from datetime import datetime
 from hcc_advisor.utils.central_queries import CentralQueries
-from hcc_advisor.utils.target_queries import TargetQueries
+from hcc_advisor.utils.target_queries import TargetQueries, excluded_schemas_sql
 from hcc_advisor.utils.ui_refresh import schedule_rerun
 from hcc_advisor.config import config
 from hcc_advisor.auth import AuthManager, ROLE_OPERATOR
@@ -345,7 +345,8 @@ def show_schema_size():
     if st.button("Check Schema Size", use_container_width=True, type="primary", key="check_schema_size_btn"):
         from hcc_advisor.utils.target_connector import TargetConnector
 
-        query = """
+        # Same schema exclusions as the schema pickers and the scans
+        query = f"""
             SELECT
                 owner,
                 SUM(bytes)                          AS total_bytes,
@@ -356,21 +357,7 @@ def show_schema_size():
             FROM
                 dba_segments
             WHERE
-                owner NOT IN (
-                    'SYS', 'SYSTEM', 'OUTLN', 'DBSNMP', 'APPQOSSYS',
-                    'DBSFWUSER', 'GGSYS', 'ANONYMOUS', 'CTXSYS', 'DVSYS',
-                    'DVF', 'GSMADMIN_INTERNAL', 'MDSYS', 'OLAPSYS', 'ORDSYS',
-                    'ORDPLUGINS', 'ORDDATA', 'SI_INFORMTN_SCHEMA', 'XDB',
-                    'WMSYS', 'LBACSYS', 'OJVMSYS', 'AUDSYS', 'APEX_030200',
-                    'APEX_040000', 'FLOWS_FILES', 'APEX_PUBLIC_USER',
-                    'XS$NULL', 'SPATIAL_CSW_ADMIN_USR', 'SPATIAL_WFS_ADMIN_USR',
-                    'MDDATA', 'SYSBACKUP', 'SYSDG', 'SYSKM', 'SYSRAC',
-                    'REMOTE_SCHEDULER_AGENT', 'GSMUSER', 'GSMROOTUSER',
-                    'DIP', 'ORACLE_OCM', 'SYSMAN', 'MGMT_VIEW',
-                    'EXFSYS', 'TSMSYS', 'DMSYS'
-                )
-                AND owner NOT LIKE 'APEX_%'
-                AND owner NOT LIKE 'FLOWS_%'
+                {excluded_schemas_sql('owner')}
             GROUP BY
                 owner
             ORDER BY
