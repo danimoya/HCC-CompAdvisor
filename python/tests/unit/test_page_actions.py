@@ -381,6 +381,17 @@ class TestQuickScanActions:
         scan.assert_called_once_with(DB, owner=None)
         assert at.session_state['qs_last_count'] == 3
 
+    def test_scan_finding_nothing_explains_why(self, env):
+        env.patch(TargetQueries, 'quick_scan', MagicMock(return_value=[]))
+        at = ok(page('page_08_quick_scan', 'show_quick_scan_page', ROLE_OPERATOR).run())
+        at = ok(at.selectbox(key='qs_schema').select('HR').run())
+        at = ok(at.button(key='qs_scan').click().run())
+        at = ok(at.run())                  # st.rerun is mocked: render the new state
+        warning = ' '.join(w.value for w in at.warning)
+        assert 'Last scan (HR) found no eligible tables' in warning
+        assert 'DBA_TABLES' in warning
+        assert not any('objects analyzed' in s.value for s in at.success)
+
     def test_refresh_checks_completed_jobs(self, env):
         check = env.patch(TargetQueries, 'check_completed_jobs', MagicMock(return_value=[{}]))
         at = ok(page('page_08_quick_scan', 'show_quick_scan_page', ROLE_VIEWER).run())

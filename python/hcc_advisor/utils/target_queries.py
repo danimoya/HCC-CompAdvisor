@@ -74,6 +74,30 @@ _PROTECTED_SCHEMAS = frozenset({
 })
 
 
+# Schemas left out of the schema pickers, table discovery and the Analysis
+# page's "Check Schema Size": the protected set above plus other Oracle-supplied
+# accounts. One list, so every page offers the same schemas. The pickers used
+# to also drop every ALL_USERS.ORACLE_MAINTAINED = 'Y' user, which hid
+# application schemas flagged that way and failed outright before 12c (no such
+# column), so only this fixed list and the patterns below apply.
+_EXCLUDED_SCHEMAS = _PROTECTED_SCHEMAS | frozenset({
+    'APEX_030200', 'APEX_040000', 'GSMUSER', 'GSMROOTUSER', 'GSMCATUSER',
+    'SYSMAN', 'MGMT_VIEW', 'TSMSYS', 'DMSYS',
+})
+_EXCLUDED_SCHEMA_PATTERNS = ('APEX_%', 'FLOWS_%')
+
+
+# Smallest table (sum of its TABLE% segments) that analyses and Quick Action scan.
+MIN_ANALYSIS_TABLE_BYTES = 1048576
+
+
+def excluded_schemas_sql(column: str = 'owner') -> str:
+    """SQL condition that is true when `column` is not an excluded schema."""
+    names = ", ".join(f"'{s}'" for s in sorted(_EXCLUDED_SCHEMAS))
+    likes = "".join(f" AND {column} NOT LIKE '{p}'" for p in _EXCLUDED_SCHEMA_PATTERNS)
+    return f"{column} NOT IN ({names}){likes}"
+
+
 def is_protected_schema(owner) -> bool:
     """True if owner is an Oracle-maintained schema the advisor must not compress."""
     return bool(owner) and str(owner).strip().upper() in _PROTECTED_SCHEMAS
@@ -858,12 +882,35 @@ class TargetQueries:
     # ============================================================================
 
     @staticmethod
+    def _query_dba_then_all(database_id: int, build_query, params: Optional[Dict] = None,
+                            context: str = "query") -> pd.DataFrame:
+        """Run build_query('dba') and, if the DBA_ views cannot be read, build_query('all').
+
+        ALL_TABLES and friends only list the tables the advisor account holds a
+        privilege on (SELECT ANY DICTIONARY / SELECT_CATALOG_ROLE open the DBA_
+        views but add nothing to ALL_TABLES), so discovery reads the DBA_
+        views, as "Check Schema Size" does with DBA_SEGMENTS. The fallback
+        reports failures like any other query (st.error, empty DataFrame).
+        """
+        try:
+            return TargetConnector.execute_query(database_id, build_query('dba'), params,
+                                                 raise_on_error=True)
+        except Exception as e:
+            log_warning(f"[Target db_id={database_id}] {context}: DBA_ views not readable "
+                        f"({str(e)[:200]}); falling back to ALL_ views, which list only the "
+                        "tables the advisor account has privileges on")
+        return TargetConnector.execute_query(database_id, build_query('all'), params)
+
+    @staticmethod
     def _discover_analysis_tables(database_id: int, owner: Optional[str] = None) -> List[Dict]:
-        """Discover tables eligible for compression analysis on the target"""
+        """Discover tables eligible for compression analysis on the target:
+        heap tables of MIN_ANALYSIS_TABLE_BYTES or more outside the excluded
+        schemas, not temporary, IOT, clustered, dropped or with LONG columns."""
         owner_filter = "AND t.owner = :owner" if owner else ""
         params = {'owner': owner.upper()} if owner else {}
 
-        query = f"""
+        def query(views):
+            return f"""
             SELECT t.owner, t.table_name, t.num_rows, t.blocks,
                    t.avg_row_len,
                    t.last_analyzed,
@@ -872,7 +919,7 @@ class TargetQueries:
                    t.compression, t.compress_for,
                    NVL(s.total_bytes, 0) as size_bytes,
                    ROUND(NVL(s.total_bytes, 0) / 1024 / 1024, 2) as size_mb
-            FROM all_tables t
+            FROM {views}_tables t
             LEFT JOIN (
                 SELECT owner, segment_name, SUM(bytes) as total_bytes
                 FROM dba_segments WHERE segment_type LIKE 'TABLE%'
@@ -881,20 +928,11 @@ class TargetQueries:
             WHERE t.temporary = 'N'
               AND t.iot_type IS NULL
               AND t.cluster_name IS NULL
-              AND t.owner NOT IN (
-                  'SYS','SYSTEM','AUDSYS','OUTLN','DBSNMP','GSMADMIN_INTERNAL',
-                  'XDB','WMSYS','CTXSYS','MDSYS','ORDSYS','ORDDATA','OLAPSYS',
-                  'APPQOSSYS','DBSFWUSER','GGSYS','SPATIAL_CSW_ADMIN_USR',
-                  'SPATIAL_WFS_ADMIN_USR','ANONYMOUS','APEX_PUBLIC_USER',
-                  'DIP','FLOWS_FILES','MDDATA','ORACLE_OCM','XS$NULL',
-                  'REMOTE_SCHEDULER_AGENT','APEX_INSTANCE_ADMIN_USER'
-              )
-              AND t.owner NOT LIKE 'APEX_%'
-              AND t.owner NOT LIKE 'ORACLE%'
-              AND t.owner NOT LIKE 'FLOWS_%'
-              AND NVL(s.total_bytes, 0) > 1048576
+              AND NVL(t.dropped, 'NO') = 'NO'
+              AND {excluded_schemas_sql('t.owner')}
+              AND NVL(s.total_bytes, 0) >= {MIN_ANALYSIS_TABLE_BYTES}
               AND NOT EXISTS (
-                  SELECT 1 FROM all_tab_columns c
+                  SELECT 1 FROM {views}_tab_columns c
                   WHERE c.owner = t.owner AND c.table_name = t.table_name
                     AND c.data_type IN ('LONG', 'LONG RAW')
               )
@@ -903,7 +941,8 @@ class TargetQueries:
         """
 
         try:
-            df = TargetConnector.execute_query(database_id, query, params if params else None)
+            df = TargetQueries._query_dba_then_all(
+                database_id, query, params if params else None, "table discovery")
             if df.empty:
                 return []
             tables = []
@@ -1339,21 +1378,22 @@ class TargetQueries:
         owner_filter = "WHERE c.owner = :owner" if owner else ""
         params = {'owner': owner.upper()} if owner else None
 
-        query = f"""
+        def query(views):
+            return f"""
             SELECT c.owner, c.table_name,
                    COUNT(*)                                             AS num_columns,
                    ROUND(AVG(CASE WHEN c.num_nulls IS NOT NULL AND t.num_rows > 0
                                   THEN c.num_nulls / t.num_rows ELSE 0 END), 4)
                                                                         AS avg_null_pct,
                    ROUND(AVG(NVL(c.num_distinct, 0)), 0)               AS avg_distinct
-            FROM dba_tab_col_statistics c
-            JOIN all_tables t ON t.owner = c.owner AND t.table_name = c.table_name
+            FROM {views}_tab_col_statistics c
+            JOIN {views}_tables t ON t.owner = c.owner AND t.table_name = c.table_name
             {owner_filter}
             GROUP BY c.owner, c.table_name
         """
 
         try:
-            df = TargetConnector.execute_query(database_id, query, params)
+            df = TargetQueries._query_dba_then_all(database_id, query, params, "column statistics")
             result = {}
             if not df.empty:
                 for _, row in df.iterrows():
@@ -2373,29 +2413,27 @@ MOVE {compression_clause}
         """
         Get list of schemas with tables that can be analyzed on the target database.
 
+        Read from DBA_TABLES, like the table discovery of the scans and "Check
+        Schema Size" (DBA_SEGMENTS), so the pickers offer every schema those
+        see; ALL_TABLES (tables the advisor account has privileges on) is the
+        fallback when the DBA_ views cannot be read.
+
         Args:
             database_id: Target database identifier
 
         Returns:
             List of schema names
         """
-        query = """
+        def query(views):
+            return f"""
             SELECT DISTINCT owner
-            FROM all_tables
-            WHERE owner NOT IN (
-                'SYS', 'SYSTEM', 'OUTLN', 'DIP', 'ORACLE_OCM',
-                'DBSNMP', 'APPQOSSYS', 'WMSYS', 'EXFSYS', 'CTXSYS',
-                'XDB', 'ANONYMOUS', 'MDSYS', 'ORDDATA', 'ORDPLUGINS',
-                'SI_INFORMTN_SCHEMA', 'OLAPSYS', 'MDDATA', 'SPATIAL_WFS_ADMIN_USR',
-                'SPATIAL_CSW_ADMIN_USR', 'ORDSYS', 'LBACSYS', 'XS$NULL'
-            )
-            -- As SYS, ALL_TABLES exposes every internal schema (AUDSYS, DVSYS, ...)
-            AND owner NOT IN (SELECT username FROM all_users WHERE oracle_maintained = 'Y')
+            FROM {views}_tables
+            WHERE {excluded_schemas_sql('owner')}
             ORDER BY owner
         """
 
         try:
-            df = TargetConnector.execute_query(database_id, query)
+            df = TargetQueries._query_dba_then_all(database_id, query, context="schema list")
             if not df.empty:
                 return df['OWNER'].tolist()
         except Exception as e:
